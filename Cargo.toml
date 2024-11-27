@@ -1,5 +1,5 @@
 [package]
-name = "nrs-language-server"
+name = "nls"
 version = "0.1.0"
 edition = "2021"
 
@@ -20,5 +20,8 @@ oxc_index = "0.36.0"
 anyhow = "1.0.93"
 thiserror = "2.0.3"
 rust-lapper = "1.1.0"
+strum = "0.25"
+strum_macros = "0.25"
+toml = "0.5"
 
 

@@ -1,5 +1,5 @@
 use anyhow::Ok;
-use nrs_language_server::{
+use nls::{
     nrs_lang::{parse, ParserResult},
     semantic_analyze,
 };

@@ -2,13 +2,13 @@ use std::collections::HashMap;
 
 use dashmap::DashMap;
 use log::debug;
-use nrs_language_server::completion::completion;
-use nrs_language_server::nrs_lang::{
+use nls::completion::completion;
+use nls::nrs_lang::{
     parse, type_inference, Ast, ImCompleteSemanticToken, ParserResult,
 };
-use nrs_language_server::semantic_analyze::{analyze_program, IdentType, Semantic};
-use nrs_language_server::semantic_token::LEGEND_TYPE;
-use nrs_language_server::span::Span;
+use nls::semantic_analyze::{analyze_program, IdentType, Semantic};
+use nls::semantic_token::LEGEND_TYPE;
+use nls::span::Span;
 use ropey::Rope;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -25,6 +25,7 @@ struct Backend {
     semantic_token_map: DashMap<String, Vec<ImCompleteSemanticToken>>,
 }
 
+// backend 除了实现自身的方法，还实现了 LanguageServer trait 的方法
 #[tower_lsp::async_trait]
 impl LanguageServer for Backend {
     async fn initialize(&self, _: InitializeParams) -> Result<InitializeResult> {
@@ -139,24 +140,38 @@ impl LanguageServer for Backend {
         debug!("file closed!");
     }
 
+    // did open 中已经对 document 进行了处理，所以这里只需要从 semantic 中获取信息
     async fn goto_definition(
         &self,
         params: GotoDefinitionParams,
     ) -> Result<Option<GotoDefinitionResponse>> {
         let definition = || -> Option<GotoDefinitionResponse> {
+            // uri 标识当前文档的唯一标识
             let uri = params.text_document_position_params.text_document.uri;
+
+            // self 表示当前 backend, 通过 uri 标识快速获取对应的 semantic
             let semantic = self.semantic_map.get(uri.as_str())?;
+
             let rope = self.document_map.get(uri.as_str())?;
+
+            // 获取当前光标位置
             let position = params.text_document_position_params.position;
+
+            // 将光标位置转换为偏移量
             let offset = position_to_offset(position, &rope)?;
 
+            // 获取当前光标位置的符号
             let interval = semantic.ident_range.find(offset, offset + 1).next()?;
             let interval_val = interval.val;
+
             let range = match interval_val {
+                // 回到定义点
                 IdentType::Binding(symbol_id) => {
                     let span = &semantic.table.symbol_id_to_span[symbol_id];
                     Some(span.clone())
                 }
+
+                // 通过引用获取符号定义的位置
                 IdentType::Reference(reference_id) => {
                     let reference = semantic.table.reference_id_to_reference.get(reference_id)?;
                     let symbol_id = reference.symbol_id?;
@@ -165,6 +180,7 @@ impl LanguageServer for Backend {
                 }
             };
 
+            // 将源代码转换为 lsp 输出需要的位置格式
             range.and_then(|range| {
                 let start_position = offset_to_position(range.start, &rope)?;
                 let end_position = offset_to_position(range.end, &rope)?;
@@ -315,10 +331,10 @@ impl LanguageServer for Backend {
                     k.start,
                     k.end,
                     match v {
-                        nrs_language_server::nrs_lang::Value::Null => "null".to_string(),
-                        nrs_language_server::nrs_lang::Value::Bool(_) => "bool".to_string(),
-                        nrs_language_server::nrs_lang::Value::Num(_) => "number".to_string(),
-                        nrs_language_server::nrs_lang::Value::Str(_) => "string".to_string(),
+                        nls::nrs_lang::Value::Null => "null".to_string(),
+                        nls::nrs_lang::Value::Bool(_) => "bool".to_string(),
+                        nls::nrs_lang::Value::Num(_) => "number".to_string(),
+                        nls::nrs_lang::Value::Str(_) => "string".to_string(),
                     },
                 )
             })
@@ -365,7 +381,7 @@ impl LanguageServer for Backend {
             let mut ret = Vec::with_capacity(completions.len());
             for (_, item) in completions {
                 match item {
-                    nrs_language_server::completion::ImCompleteCompletionItem::Variable(var) => {
+                    nls::completion::ImCompleteCompletionItem::Variable(var) => {
                         ret.push(CompletionItem {
                             label: var.clone(),
                             insert_text: Some(var.clone()),
@@ -374,7 +390,7 @@ impl LanguageServer for Backend {
                             ..Default::default()
                         });
                     }
-                    nrs_language_server::completion::ImCompleteCompletionItem::Function(
+                    nls::completion::ImCompleteCompletionItem::Function(
                         name,
                         args,
                     ) => {
@@ -469,7 +485,7 @@ impl Notification for CustomNotification {
 }
 struct TextDocumentItem<'a> {
     uri: Url,
-    text: &'a str,
+    text: &'a str, // 'a 是声明周期引用，表示 str 的生命周期与 TextDocumentItem 的生命周期一致, 而不是 } 后就结束
     version: Option<i32>,
 }
 
@@ -479,11 +495,13 @@ impl Backend {
         let rope = ropey::Rope::from_str(params.text);
         self.document_map
             .insert(params.uri.to_string(), rope.clone());
+
         let ParserResult {
             ast,
             parse_errors,
             semantic_tokens,
         } = parse(params.text);
+
         let mut diagnostics = parse_errors
             .into_iter()
             .filter_map(|item| {
@@ -563,6 +581,7 @@ async fn main() {
     let stdin = tokio::io::stdin();
     let stdout = tokio::io::stdout();
 
+    // 实例化后的 backend 实现了 LanguageServer trait 以及 on change 方法。tower lsp 会调用这些方法
     let (service, socket) = LspService::build(|client| Backend {
         client,
         ast_map: DashMap::new(),
