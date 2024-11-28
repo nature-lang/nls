@@ -34,7 +34,7 @@ impl AnalyzerErrors {
 pub struct Type {
     pub kind: TypeKind,
     pub status: ReductionStatus,
-    pub origin_ident: Option<String>,
+    pub origin_ident: Option<String>, // type alias 原始标识符
     pub origin_type_kind: TypeKind,
 
     pub impl_ident: Option<String>,
@@ -61,7 +61,7 @@ impl Default for Type {
 }
 
 impl Type {
-      fn new(kind: TypeKind) -> Self {
+    pub fn new(kind: TypeKind) -> Self {
         Self {
             kind: kind.clone(),
             status: ReductionStatus::Done,
@@ -75,7 +75,7 @@ impl Type {
         }
     }
 
-    fn kind_in_heap(kind: &TypeKind) -> bool {
+    pub fn kind_in_heap(kind: &TypeKind) -> bool {
         matches!(
             kind,
             TypeKind::Union(_)
@@ -91,10 +91,8 @@ impl Type {
         )
     }
 
-    fn ptr_of(t: Type) -> Type {
-        let ptr_kind = TypeKind::Ptr(Box::new(TypePtr {
-            value_type: t.clone(),
-        }));
+    pub fn ptr_of(t: Type) -> Type {
+        let ptr_kind = TypeKind::Ptr(Box::new(TypePtr(t.clone())));
 
         let mut ptr_type = Type::new(ptr_kind);
         ptr_type.in_heap = false;
@@ -103,7 +101,6 @@ impl Type {
         return ptr_type;
     }
 }
-
 
 #[derive(Debug, Clone)]
 pub struct TypeVec {
@@ -143,6 +140,7 @@ pub struct TypeTuple {
 pub struct TypeStructProperty {
     pub type_: Type,
     pub key: String,
+    pub value: Option<Box<Expr>>,
 }
 
 #[derive(Debug, Clone)]
@@ -165,7 +163,17 @@ pub struct TypeFn {
 pub struct TypeAlias {
     pub import_as: Option<String>,
     pub ident: String,
-    pub args: Vec<Type>,
+    pub args: Option<Vec<Type>>,
+}
+
+impl TypeAlias {
+    pub fn default() -> Self {
+        Self {
+            import_as: None,
+            ident: String::new(),
+            args: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -174,9 +182,7 @@ pub struct TypeParam {
 }
 
 #[derive(Debug, Clone)]
-pub struct TypePtr {
-    pub value_type: Type,
-}
+pub struct TypePtr(pub Type);
 
 #[derive(Debug, Clone)]
 pub struct TypeUnion {
@@ -191,7 +197,6 @@ pub enum ReductionStatus {
     Doing = 2,
     Done = 3,
 }
-
 
 #[derive(Debug, Clone, Display)]
 #[repr(u8)]
@@ -383,6 +388,7 @@ pub enum AstNode {
     MacroTypeEq(MacroTypeEqExpr),
     MacroCoAsync(MacroCoAsyncExpr),
     MacroCall(MacroCallExpr),
+    MacroDefault(MacroDefaultExpr),
 
     New(NewExpr),
 
@@ -409,7 +415,7 @@ pub enum AstNode {
     VarDecl(VarDeclExpr), // 抽象复合类型，用于 fn 的参数或者 for 的 k,v
 
     // Statements
-    FakeStmt(FakeStmt),
+    Fake(FakeStmt),
 
     Break(BreakStmt),
     Continue(ContinueStmt),
@@ -434,11 +440,17 @@ pub enum AstNode {
     FnDef(AstFnDef),
 }
 
+impl AstNode {
+    pub fn can_assign(&self) -> bool {
+        matches!(self, AstNode::Ident(_) | AstNode::Access(_) | AstNode::Select(_) | AstNode::MapAccess(_) | AstNode::VecAccess(_) | AstNode::EnvAccess(_) | AstNode::StructSelect(_))
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Stmt {
     pub start: usize,
     pub end: usize,
-    pub value: AstNode,
+    pub node: AstNode,
 }
 
 #[derive(Debug, Clone)]
@@ -447,8 +459,34 @@ pub struct Expr {
     pub end: usize,
     pub type_: Type,
     pub target_type: Type,
-    pub value: Box<AstNode>,
+    pub node: AstNode,
 }
+
+// default
+impl Default for Expr {
+    fn default() -> Self {
+        Self {
+            start: 0,
+            end: 0,
+            type_: Type::default(),
+            target_type: Type::default(),
+            node: AstNode::None,
+        }
+    }
+}
+
+impl Expr {
+    pub fn ident(start: usize, end: usize, literal: String) -> Self {
+        Self {
+            start,
+            end,
+            type_: Type::default(),
+            target_type: Type::default(),
+            node: AstNode::Ident(IdentExpr { literal }),
+        }
+    }
+}
+
 
 #[derive(Debug, Clone)]
 pub struct FakeStmt {
@@ -460,7 +498,7 @@ pub struct ContinueStmt;
 
 #[derive(Debug, Clone)]
 pub struct BreakStmt {
-    pub expr: Option<Expr>,
+    pub expr: Option<Box<Expr>>,
 }
 
 #[derive(Debug, Clone)]
@@ -478,12 +516,12 @@ pub struct BinaryExpr {
 #[derive(Debug, Clone)]
 pub struct UnaryExpr {
     pub operator: ExprOp,
-    pub operand: Expr,
+    pub operand: Box<Expr>,
 }
 
 #[derive(Debug, Clone)]
 pub struct LiteralExpr {
-    pub kind: Type,
+    pub kind: TypeKind,
     pub value: String,
 }
 
@@ -498,24 +536,24 @@ pub struct VarDeclExpr {
 #[derive(Debug, Clone)]
 pub struct AstCall {
     pub return_type: Type,
-    pub left: Expr,
+    pub left: Box<Expr>,
     pub generics_args: Vec<Type>,
-    pub args: Vec<Expr>,
+    pub args: Vec<Box<Expr>>,
     pub spread: bool,
 }
 
 #[derive(Debug, Clone)]
-pub struct StructProperty {
+pub struct StructNewProperty {
     pub type_: Type,
     pub key: String,
-    pub value: Option<Box<Expr>>,
+    pub value: Box<Expr>,
 }
 
 // var a = new Type
 #[derive(Debug, Clone)]
 pub struct NewExpr {
     pub type_: Type,
-    pub properties: Vec<StructProperty>,
+    pub properties: Vec<StructNewProperty>,
 }
 
 #[derive(Debug, Clone)]
@@ -564,7 +602,7 @@ pub struct MacroCoAsyncExpr {
     pub closure_fn: Box<AstFnDef>,
     pub closure_fn_void: Box<AstFnDef>,
     pub origin_call: Box<AstCall>,
-    pub flag_expr: Box<Expr>,
+    pub flag_expr: Option<Box<Expr>>,
     pub return_type: Type,
 }
 
@@ -631,7 +669,7 @@ pub struct SelectExpr {
 pub struct StructSelectExpr {
     pub instance: Box<Expr>,
     pub key: String,
-    pub property: StructProperty,
+    pub property: StructNewProperty,
 }
 
 #[derive(Debug, Clone)]
@@ -679,7 +717,7 @@ pub struct TupleDestrExpr {
 pub struct StructNewExpr {
     pub ident: String,
     pub type_: Type,
-    pub properties: Vec<StructProperty>,
+    pub properties: Vec<StructNewProperty>,
 }
 
 #[derive(Debug, Clone)]
@@ -790,6 +828,18 @@ pub struct GenericsParam {
     pub constraints: TypeUnion,
 }
 
+impl GenericsParam {
+    pub fn new(ident: String) -> Self {
+        Self {
+            ident,
+            constraints: TypeUnion {
+                any: true,
+                elements: Vec::new(),
+            },
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct AstCatch {
     pub try_expr: Box<Expr>,
@@ -807,7 +857,7 @@ pub struct MatchCase {
 
 #[derive(Debug, Clone)]
 pub struct AstMatch {
-    pub subject: Box<Expr>,
+    pub subject: Option<Box<Expr>>,
     pub cases: Vec<MatchCase>,
 }
 
@@ -843,6 +893,43 @@ pub struct AstFnDef {
 
     pub start: usize,
     pub end: usize,
+}
+
+// ast fn def default
+impl Default for AstFnDef {
+    fn default() -> Self {
+        Self {
+            symbol_name: None,
+            closure_name: None,
+            return_type: Type::new(TypeKind::Void),
+            params: Vec::new(),
+            rest_param: false,
+            body: Vec::new(),
+            closure: None,
+            generics_hash_table: None,
+            generics_args_table: None,
+            generics_args_hash: None,
+            generics_params: None,
+            impl_type: Type::default(),
+            capture_exprs: Vec::new(),
+            be_capture_locals: Vec::new(),
+            type_: Type::default(),
+            generic_assign: None,
+            global_parent: None,
+            local_children: Vec::new(),
+            is_local: false,
+            is_tpl: false,
+            linkid: None,
+            is_generics: false,
+            is_co_async: false,
+            is_private: false,
+            break_target_types: Vec::new(),
+            fn_name: None,
+            rel_path: None,
+            start: 0,
+            end: 0,
+        }
+    }
 }
 
 // 辅助函数实现

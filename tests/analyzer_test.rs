@@ -56,7 +56,7 @@ fn test_lexer() {
 
     let mut i = 0;
     for (token, expected_type) in tokens.iter().zip(expected_types.iter()) {
-        assert_eq!(token.type_, *expected_type, "token type mismatch at index {}", i);
+        assert_eq!(token.token_type, *expected_type, "token type mismatch at index {}", i);
         i += 1;
     }
 }

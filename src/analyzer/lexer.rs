@@ -4,7 +4,7 @@ use strum_macros::Display;
 #[derive(Debug, Clone, PartialEq, Display)]
 pub enum TokenType {
     #[strum(serialize = "unknown")]
-    Unknown,
+    Unknown = 0,
     // 单字符标记
     #[strum(serialize = "(")]
     LeftParen,
@@ -221,8 +221,6 @@ pub enum TokenType {
     ReflectHash,
     #[strum(serialize = "as")]
     As,
-    #[strum(serialize = "boom")]
-    Boom,
     #[strum(serialize = "fn")]
     Fn,
     #[strum(serialize = "import")]
@@ -246,7 +244,7 @@ pub enum LeftAngleType {
 
 #[derive(Debug, Clone)]
 pub struct Token {
-    pub type_: TokenType,
+    pub token_type: TokenType,
     pub literal: String,
     pub line: usize,
     pub start: usize, // start index
@@ -258,7 +256,7 @@ impl Token {
     pub fn new(token_type: TokenType, literal: String, start: usize, end: usize, line: usize) -> Self {
         let length = literal.len();
         Self {
-            type_: token_type,
+            token_type,
             literal,
             line,
             start,
@@ -269,7 +267,7 @@ impl Token {
 
     pub fn is_complex_assign(&self) -> bool {
         matches!(
-            self.type_,
+            self.token_type,
             TokenType::PercentEqual
                 | TokenType::MinusEqual
                 | TokenType::PlusEqual
@@ -286,7 +284,7 @@ impl Token {
     pub fn debug(&self) -> String {
         format!(
             "Token {{ type: {:?}, literal: '{}', start: {}, end: {}, length: {} }}",
-            self.type_, self.literal, self.start, self.end, self.length
+            self.token_type, self.literal, self.start, self.end, self.length
         )
     }
 }
@@ -623,7 +621,7 @@ impl Lexer {
         // 检查 import xxx as * 的特殊情况
         if special_type == TokenType::Star && !tokens.is_empty() {
             if let Some(prev_token) = tokens.last() {
-                if prev_token.type_ == TokenType::As {
+                if prev_token.token_type == TokenType::As {
                     return Token::new(
                         TokenType::ImportStar,
                         self.gen_word(),
@@ -847,7 +845,7 @@ impl Lexer {
 
     fn need_stmt_end(&self, prev_token: &Token) -> bool {
         matches!(
-            prev_token.type_,
+            prev_token.token_type,
             TokenType::ImportStar
                 | TokenType::IntLiteral
                 | TokenType::StringLiteral
