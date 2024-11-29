@@ -6,10 +6,7 @@ pub enum ImCompleteCompletionItem {
     Function(String, Vec<String>),
 }
 /// return (need_to_continue_search, founded reference)
-pub fn completion(
-    ast: &[Spanned<Func>],
-    ident_offset: usize,
-) -> HashMap<String, ImCompleteCompletionItem> {
+pub fn completion(ast: &[Spanned<Func>], ident_offset: usize) -> HashMap<String, ImCompleteCompletionItem> {
     let mut map = HashMap::new();
     for (func, _) in ast.iter() {
         if func.name.1.end < ident_offset {
@@ -17,11 +14,7 @@ pub fn completion(
                 func.name.0.clone(),
                 ImCompleteCompletionItem::Function(
                     func.name.0.clone(),
-                    func.args
-                        .clone()
-                        .into_iter()
-                        .map(|(name, _)| name)
-                        .collect(),
+                    func.args.clone().into_iter().map(|(name, _)| name).collect(),
                 ),
             );
         }
@@ -32,10 +25,7 @@ pub fn completion(
         if func.span.end > ident_offset && func.span.start < ident_offset {
             // log::debug!("this is completion from body {}", name);
             func.args.iter().for_each(|(item, _)| {
-                map.insert(
-                    item.clone(),
-                    ImCompleteCompletionItem::Variable(item.clone()),
-                );
+                map.insert(item.clone(), ImCompleteCompletionItem::Variable(item.clone()));
             });
             get_completion_of(&func.body, &mut map, ident_offset);
         }
@@ -51,12 +41,10 @@ pub fn get_completion_of(
     match &expr.0 {
         Expr::Error => true,
         Expr::Value(_) => true,
-        Expr::Local(local) => !(ident_offset >= local.1.start && ident_offset < local.1.end),
+        Expr::Local(local) => !(ident_offset >= local.1.start && ident_offset < local.1.end), // 变量引用
         Expr::Let(name, lhs, rest, _name_span) => {
-            definition_map.insert(
-                name.clone(),
-                ImCompleteCompletionItem::Variable(name.clone()),
-            );
+            // 变量创建
+            definition_map.insert(name.clone(), ImCompleteCompletionItem::Variable(name.clone()));
             match get_completion_of(lhs, definition_map, ident_offset) {
                 true => get_completion_of(rest, definition_map, ident_offset),
                 false => false,

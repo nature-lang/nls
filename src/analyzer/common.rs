@@ -59,21 +59,21 @@ impl Type {
     pub fn kind_in_heap(kind: &TypeKind) -> bool {
         matches!(
             kind,
-            TypeKind::Union(_)
+            TypeKind::Union(..)
                 | TypeKind::String
-                | TypeKind::Vec(_)
-                | TypeKind::Map(_)
-                | TypeKind::Set(_)
-                | TypeKind::Tuple(_)
+                | TypeKind::Vec(..)
+                | TypeKind::Map(..)
+                | TypeKind::Set(..)
+                | TypeKind::Tuple(..)
                 | TypeKind::GcEnv
-                | TypeKind::Fn(_)
+                | TypeKind::Fn(..)
                 | TypeKind::CoroutineT
-                | TypeKind::Chan(_)
+                | TypeKind::Chan(..)
         )
     }
 
     pub fn ptr_of(t: Type) -> Type {
-        let ptr_kind = TypeKind::Ptr(Box::new(TypePtr(t.clone())));
+        let ptr_kind = TypeKind::Ptr(Box::new(t.clone()));
 
         let mut ptr_type = Type::new(ptr_kind);
         ptr_type.in_heap = false;
@@ -83,52 +83,12 @@ impl Type {
     }
 }
 
-#[derive(Debug, Clone)]
-pub struct TypeVec {
-    pub element_type: Type,
-}
-
-#[derive(Debug, Clone)]
-pub struct TypeChan {
-    pub element_type: Type,
-}
-
-#[derive(Debug, Clone)]
-pub struct TypeArray {
-    pub length: u64,
-    pub element_type: Type,
-}
-
-#[derive(Debug, Clone)]
-pub struct TypeMap {
-    pub key_type: Type,
-    pub value_type: Type,
-}
-
-#[derive(Debug, Clone)]
-pub struct TypeSet {
-    pub element_type: Type,
-}
-
-#[derive(Debug, Clone)]
-pub struct TypeTuple {
-    pub elements: Vec<Type>,
-    pub align: u8,
-}
-
 // type struct property don't concern the value of the property
 #[derive(Debug, Clone)]
 pub struct TypeStructProperty {
     pub type_: Type,
     pub key: String,
     pub value: Option<Box<Expr>>,
-}
-
-#[derive(Debug, Clone)]
-pub struct TypeStruct {
-    pub ident: String,
-    pub align: u8,
-    pub properties: Vec<TypeStructProperty>,
 }
 
 #[derive(Debug, Clone)]
@@ -155,20 +115,6 @@ impl TypeAlias {
             args: None,
         }
     }
-}
-
-#[derive(Debug, Clone)]
-pub struct TypeParam {
-    pub ident: String,
-}
-
-#[derive(Debug, Clone)]
-pub struct TypePtr(pub Type);
-
-#[derive(Debug, Clone)]
-pub struct TypeUnion {
-    pub any: bool,
-    pub elements: Vec<Type>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -223,52 +169,61 @@ pub enum TypeKind {
     #[strum(serialize = "string")]
     String,
     #[strum(serialize = "vec")]
-    Vec(Box<TypeVec>),
+    Vec(Box<Type>), // element type
+
     #[strum(serialize = "arr")]
-    Arr(Box<TypeArray>),
+    Arr(u64, Box<Type>), // (length, element_type)
+
     #[strum(serialize = "map")]
-    Map(Box<TypeMap>),
+    Map(Box<Type>, Box<Type>), // (key_type, value_type)
+
     #[strum(serialize = "set")]
-    Set(Box<TypeSet>),
+    Set(Box<Type>), // element type
+
     #[strum(serialize = "tup")]
-    Tuple(Box<TypeTuple>),
+    Tuple(Vec<Type>, u8), // (elements, align)
 
     #[strum(serialize = "chan")]
-    Chan(Box<TypeChan>),
+    Chan(Box<Type>), // element type
 
     #[strum(serialize = "coroutine_t")]
     CoroutineT,
 
     #[strum(serialize = "struct")]
-    Struct(Box<TypeStruct>),
+    Struct(String, u8, Vec<TypeStructProperty>), // (ident, align, properties)
 
     #[strum(serialize = "fn")]
     Fn(Box<TypeFn>),
 
     // 指针类型
     #[strum(serialize = "ptr")]
-    Ptr(Box<TypePtr>),
+    Ptr(Box<Type>), // value type
     #[strum(serialize = "raw_ptr")]
-    RawPtr(Box<TypePtr>),
+    RawPtr(Box<Type>), // value type
     #[strum(serialize = "void_ptr")]
     VoidPtr,
 
     // 编译时特殊临时类型
     #[strum(serialize = "fn_t")]
     FnT,
+
     #[strum(serialize = "all_t")]
     AllT,
+
     #[strum(serialize = "void")]
     Void,
 
     #[strum(serialize = "raw_string")]
     RawString,
+
     #[strum(serialize = "alias")]
     Alias(Box<TypeAlias>),
+
     #[strum(serialize = "param")]
-    Param(Box<TypeParam>),
+    Param(String), // ident
+
     #[strum(serialize = "union")]
-    Union(Box<TypeUnion>),
+    Union(bool, Vec<Type>), // (any, elements)
 
     // runtime GC 相关类型
     #[strum(serialize = "gc")]
@@ -354,76 +309,86 @@ pub enum ExprOp {
 #[derive(Debug, Clone)]
 pub enum AstNode {
     None,
-    Literal(LiteralExpr),
-    Binary(BinaryExpr),
-    Unary(UnaryExpr),
-    Ident(IdentExpr),
-    As(AsExpr),
-    Is(IsExpr),
-    MatchIs(MatchIsExpr),
+    Literal(TypeKind, String),            // (kind, value)
+    Binary(ExprOp, Box<Expr>, Box<Expr>), // (op, left, right)
+    Unary(ExprOp, Box<Expr>),             // (op, operand)
+    Ident(String),                        // ident
+    As(Type, Box<Expr>),                  // (target_type, src)
+    Is(Type, Box<Expr>),                  // (target_type, src)
+    MatchIs(Type),                        // (target_type)
 
     // marco
-    MacroSizeof(MacroSizeofExpr),
-    MacroUla(MacroUlaExpr),
-    MacroReflectHash(MacroReflectHashExpr),
-    MacroTypeEq(MacroTypeEqExpr),
+    MacroSizeof(Type),       // (target_type)
+    MacroUla(Box<Expr>),     // (src)
+    MacroReflectHash(Type),  // (target_type)
+    MacroTypeEq(Type, Type), // (left_type, right_type)
     MacroCoAsync(MacroCoAsyncExpr),
-    MacroCall(MacroCallExpr),
-    MacroDefault(MacroDefaultExpr),
+    MacroCall(String, Vec<MacroArg>), // (ident, args)
+    MacroDefault,
 
-    New(NewExpr),
+    New(Type, Vec<StructNewProperty>), // (type_, properties)
 
-    MapAccess(MapAccessExpr),
-    VecAccess(VecAccessExpr),
-    ArrayAccess(ArrayAccessExpr),
-    TupleAccess(TupleAccessExpr),
-    StructSelect(StructSelectExpr),
-    EnvAccess(EnvAccessExpr),
+    MapAccess(Type, Box<Expr>, Box<Expr>),              // (element_type, left, key)
+    VecAccess(Type, Box<Expr>, Box<Expr>),              // (element_type, left, index)
+    ArrayAccess(Type, Box<Expr>, Box<Expr>),            // (element_type, left, index)
+    TupleAccess(Type, Box<Expr>, u64),                  // (element_type, left, index)
+    StructSelect(Box<Expr>, String, StructNewProperty), // (instance, key, property)
+    EnvAccess(u8, String),                              // (index, unique_ident)
 
-    VecNew(VecNewExpr),
-    ArrayNew(ArrayNewExpr),
-    MapNew(MapNewExpr),
-    SetNew(SetNewExpr),
-    TupleNew(TupleNewExpr),
-    TupleDestr(TupleDestrExpr),
-    StructNew(StructNewExpr),
-    Try(TryExpr),
+    VecNew(Vec<Box<Expr>>, Option<Box<Expr>>, Option<Box<Expr>>), // (elements, len, cap)
+    ArrayNew(Vec<Box<Expr>>),                                     // elements
+    MapNew(Vec<MapElement>),                                      // elements
+    SetNew(Vec<Box<Expr>>),                                       //  elements
+    TupleNew(Vec<Box<Expr>>),                                     // elements
+    TupleDestr(Vec<Box<Expr>>),                                   // elements
+    StructNew(String, Type, Vec<StructNewProperty>),              // (ident, type_, properties)
+    Try(Box<Expr>, VarDeclExpr, Vec<Box<Stmt>>),                  // (try_expr, catch_err, catch_body)
 
     // 未推断出具体表达式类型
-    EmptyCurlyNew(EmptyCurlyNewExpr),
-    Access(AccessExpr),
-    Select(SelectExpr),
-    VarDecl(VarDeclExpr), // 抽象复合类型，用于 fn 的参数或者 for 的 k,v
+    EmptyCurlyNew,
+    Access(Box<Expr>, Box<Expr>),                // (left, key)
+    Select(Box<Expr>, String),                   // (left, key)
+    VarDecl(String, Type, bool, Option<String>), // (ident, type_, be_capture, heap_ident)
 
     // Statements
-    Fake(FakeStmt),
+    Fake(Box<Expr>), // (expr)
 
-    Break(BreakStmt),
-    Continue(ContinueStmt),
-    Import(ImportStmt),
-    VarDef(VarDefStmt),
-    VarTupleDestr(VarTupleDestrStmt),
-    Assign(AssignStmt),
-    Return(ReturnStmt),
-    If(IfStmt),
-    Throw(ThrowStmt),
-    TryCatch(TryCatchStmt),
-    Let(LetStmt),
-    ForIterator(ForIteratorStmt),
-    ForCond(ForCondStmt),
-    ForTradition(ForTraditionStmt),
-    TypeAlias(TypeAliasStmt),
+    Break(Option<Box<Expr>>), // (expr)
+    Continue,
+    Import(ImportStmt),                                    // 比较复杂直接保留
+    VarDef(VarDeclExpr, Box<Expr>),                        // (var_decl, right)
+    VarTupleDestr(Box<TupleDestrExpr>, Box<Expr>),         // (tuple_destr, right)
+    Assign(Box<Expr>, Box<Expr>),                          // (left, right)
+    Return(Option<Box<Expr>>),                             // (expr)
+    If(Box<Expr>, Vec<Box<Stmt>>, Option<Vec<Box<Stmt>>>), // (condition, consequent, alternate)
+    Throw(Box<Expr>),
+    TryCatch(Box<Expr>, VarDeclExpr, Vec<Box<Stmt>>), // (try_expr, catch_err, catch_body)
+    Let(Box<Expr>),                                   // (expr)
+    ForIterator(Box<Expr>, VarDeclExpr, Option<VarDeclExpr>, Vec<Box<Stmt>>), // (iterate, first, second, body)
+
+    ForCond(Box<Expr>, Vec<Box<Stmt>>),                            // (condition, body)
+    ForTradition(Box<Stmt>, Box<Expr>, Box<Stmt>, Vec<Box<Stmt>>), // (init, cond, update, body)
+    TypeAlias(String, Option<Vec<GenericsParam>>, Type),           // (ident, params, type_)
 
     // 既可以作为表达式，也可以作为语句
     Call(AstCall),
-    Catch(AstCatch),
-    Match(AstMatch),
+    Catch(Box<Expr>, VarDeclExpr, Vec<Box<Stmt>>), // (try_expr, catch_err, catch_body)
+    Match(Option<Box<Expr>>, Vec<MatchCase>),      // (subject, cases)
     FnDef(AstFnDef),
 }
 
 impl AstNode {
     pub fn can_assign(&self) -> bool {
-        matches!(self, AstNode::Ident(_) | AstNode::Access(_) | AstNode::Select(_) | AstNode::MapAccess(_) | AstNode::VecAccess(_) | AstNode::EnvAccess(_) | AstNode::StructSelect(_))
+        matches!(
+            self,
+            AstNode::Ident(..)
+                | AstNode::Access(..)
+                | AstNode::Select(..)
+                | AstNode::MapAccess(..)
+                | AstNode::VecAccess(..)
+                | AstNode::EnvAccess(..)
+                | AstNode::StructSelect(..)
+        )
     }
 }
 
@@ -463,47 +428,9 @@ impl Expr {
             end,
             type_: Type::default(),
             target_type: Type::default(),
-            node: AstNode::Ident(IdentExpr { literal }),
+            node: AstNode::Ident(literal),
         }
     }
-}
-
-
-#[derive(Debug, Clone)]
-pub struct FakeStmt {
-    pub expr: Box<Expr>,
-}
-
-#[derive(Debug, Clone)]
-pub struct ContinueStmt;
-
-#[derive(Debug, Clone)]
-pub struct BreakStmt {
-    pub expr: Option<Box<Expr>>,
-}
-
-#[derive(Debug, Clone)]
-pub struct IdentExpr {
-    pub literal: String,
-}
-
-#[derive(Debug, Clone)]
-pub struct BinaryExpr {
-    pub operator: ExprOp,
-    pub left: Box<Expr>,
-    pub right: Box<Expr>,
-}
-
-#[derive(Debug, Clone)]
-pub struct UnaryExpr {
-    pub operator: ExprOp,
-    pub operand: Box<Expr>,
-}
-
-#[derive(Debug, Clone)]
-pub struct LiteralExpr {
-    pub kind: TypeKind,
-    pub value: String,
 }
 
 #[derive(Debug, Clone)]
@@ -530,54 +457,6 @@ pub struct StructNewProperty {
     pub value: Box<Expr>,
 }
 
-// var a = new Type
-#[derive(Debug, Clone)]
-pub struct NewExpr {
-    pub type_: Type,
-    pub properties: Vec<StructNewProperty>,
-}
-
-#[derive(Debug, Clone)]
-pub struct AsExpr {
-    pub target_type: Type,
-    pub src: Box<Expr>,
-}
-
-#[derive(Debug, Clone)]
-pub struct IsExpr {
-    pub target_type: Type,
-    pub src: Box<Expr>,
-}
-
-#[derive(Debug, Clone)]
-pub struct MatchIsExpr {
-    pub target_type: Type,
-}
-
-#[derive(Debug, Clone)]
-pub struct MacroDefaultExpr;
-
-#[derive(Debug, Clone)]
-pub struct MacroSizeofExpr {
-    pub target_type: Type,
-}
-
-#[derive(Debug, Clone)]
-pub struct MacroUlaExpr {
-    pub src: Box<Expr>,
-}
-
-#[derive(Debug, Clone)]
-pub struct MacroTypeEqExpr {
-    pub left_type: Type,
-    pub right_type: Type,
-}
-
-#[derive(Debug, Clone)]
-pub struct MacroReflectHashExpr {
-    pub target_type: Type,
-}
-
 #[derive(Debug, Clone)]
 pub struct MacroCoAsyncExpr {
     pub closure_fn: Box<AstFnDef>,
@@ -595,122 +474,14 @@ pub enum MacroArg {
 }
 
 #[derive(Debug, Clone)]
-pub struct MacroCallExpr {
-    pub ident: String,
-    pub args: Vec<MacroArg>,
-}
-
-#[derive(Debug, Clone)]
-pub struct AccessExpr {
-    pub left: Box<Expr>,
-    pub key: Box<Expr>,
-}
-
-#[derive(Debug, Clone)]
-pub struct MapAccessExpr {
-    pub element_type: Type,
-    pub left: Box<Expr>,
-    pub key: Box<Expr>,
-}
-
-#[derive(Debug, Clone)]
-pub struct VecAccessExpr {
-    pub element_type: Type,
-    pub left: Box<Expr>,
-    pub index: Box<Expr>,
-}
-
-#[derive(Debug, Clone)]
-pub struct ArrayAccessExpr {
-    pub element_type: Type,
-    pub left: Box<Expr>,
-    pub index: Box<Expr>,
-}
-
-#[derive(Debug, Clone)]
-pub struct TupleAccessExpr {
-    pub element_type: Type,
-    pub left: Box<Expr>,
-    pub index: u64,
-}
-
-#[derive(Debug, Clone)]
-pub struct EnvAccessExpr {
-    pub index: u8,
-    pub unique_ident: String,
-}
-
-#[derive(Debug, Clone)]
-pub struct SelectExpr {
-    pub left: Box<Expr>,
-    pub key: String,
-}
-
-#[derive(Debug, Clone)]
-pub struct StructSelectExpr {
-    pub instance: Box<Expr>,
-    pub key: String,
-    pub property: StructNewProperty,
-}
-
-#[derive(Debug, Clone)]
-pub struct VecNewExpr {
-    pub elements: Vec<Box<Expr>>,
-    pub len: Option<Box<Expr>>,
-    pub cap: Option<Box<Expr>>,
-}
-
-#[derive(Debug, Clone)]
-pub struct ArrayNewExpr {
-    pub elements: Vec<Box<Expr>>,
-}
-
-#[derive(Debug, Clone)]
 pub struct MapElement {
     pub key: Box<Expr>,
     pub value: Box<Expr>,
 }
 
 #[derive(Debug, Clone)]
-pub struct MapNewExpr {
-    pub elements: Vec<MapElement>,
-}
-
-#[derive(Debug, Clone)]
-pub struct SetNewExpr {
-    pub elements: Vec<Box<Expr>>,
-}
-
-#[derive(Debug, Clone)]
-pub struct EmptyCurlyNewExpr;
-
-#[derive(Debug, Clone)]
-pub struct TupleNewExpr {
-    pub elements: Vec<Box<Expr>>,
-}
-
-#[derive(Debug, Clone)]
 pub struct TupleDestrExpr {
     pub elements: Vec<Box<Expr>>,
-}
-
-#[derive(Debug, Clone)]
-pub struct StructNewExpr {
-    pub ident: String,
-    pub type_: Type,
-    pub properties: Vec<StructNewProperty>,
-}
-
-#[derive(Debug, Clone)]
-pub struct TryExpr {
-    pub try_expr: Box<Expr>,
-    pub catch_err: VarDeclExpr,
-    pub catch_body: Vec<Box<Stmt>>,
-}
-
-#[derive(Debug, Clone)]
-pub struct BoomExpr {
-    pub expr: Box<Expr>,
 }
 
 // 语句实现
@@ -728,104 +499,18 @@ pub struct ImportStmt {
 }
 
 #[derive(Debug, Clone)]
-pub struct VarDefStmt {
-    pub var_decl: VarDeclExpr,
-    pub right: Box<Expr>,
-}
-
-#[derive(Debug, Clone)]
-pub struct VarTupleDestrStmt {
-    pub tuple_destr: Box<TupleDestrExpr>,
-    pub right: Box<Expr>,
-}
-
-#[derive(Debug, Clone)]
-pub struct AssignStmt {
-    pub left: Box<Expr>,
-    pub right: Box<Expr>,
-}
-
-#[derive(Debug, Clone)]
-pub struct ReturnStmt {
-    pub expr: Option<Box<Expr>>,
-}
-
-#[derive(Debug, Clone)]
-pub struct IfStmt {
-    pub condition: Box<Expr>,
-    pub consequent: Vec<Box<Stmt>>,
-    pub alternate: Option<Vec<Box<Stmt>>>,
-}
-
-#[derive(Debug, Clone)]
-pub struct ThrowStmt {
-    pub error: Box<Expr>,
-}
-
-#[derive(Debug, Clone)]
-pub struct TryCatchStmt {
-    pub try_body: Vec<Box<Stmt>>,
-    pub catch_err: VarDeclExpr,
-    pub catch_handle: Vec<Box<Stmt>>,
-}
-
-#[derive(Debug, Clone)]
-pub struct LetStmt {
-    pub expr: Box<Expr>,
-}
-
-#[derive(Debug, Clone)]
-pub struct ForIteratorStmt {
-    pub iterate: Box<Expr>,
-    pub first: VarDeclExpr,
-    pub second: Option<VarDeclExpr>,
-    pub body: Vec<Box<Stmt>>,
-}
-
-#[derive(Debug, Clone)]
-pub struct ForCondStmt {
-    pub condition: Box<Expr>,
-    pub body: Vec<Box<Stmt>>,
-}
-
-#[derive(Debug, Clone)]
-pub struct ForTraditionStmt {
-    pub init: Box<Stmt>,
-    pub cond: Box<Expr>,
-    pub update: Box<Stmt>,
-    pub body: Vec<Box<Stmt>>,
-}
-
-#[derive(Debug, Clone)]
-pub struct TypeAliasStmt {
-    pub ident: String,
-    pub params: Option<Vec<GenericsParam>>,
-    pub type_: Type,
-}
-
-#[derive(Debug, Clone)]
 pub struct GenericsParam {
     pub ident: String,
-    pub constraints: TypeUnion,
+    pub constraints: (bool, Vec<Type>), // (any, elements)
 }
 
 impl GenericsParam {
     pub fn new(ident: String) -> Self {
         Self {
             ident,
-            constraints: TypeUnion {
-                any: true,
-                elements: Vec::new(),
-            },
+            constraints: (true, Vec::new()),
         }
     }
-}
-
-#[derive(Debug, Clone)]
-pub struct AstCatch {
-    pub try_expr: Box<Expr>,
-    pub catch_err: VarDeclExpr,
-    pub catch_body: Vec<Box<Stmt>>,
 }
 
 #[derive(Debug, Clone)]
@@ -834,12 +519,6 @@ pub struct MatchCase {
     pub is_default: bool,
     pub handle_expr: Option<Box<Expr>>,
     pub handle_body: Option<Vec<Box<Stmt>>>,
-}
-
-#[derive(Debug, Clone)]
-pub struct AstMatch {
-    pub subject: Option<Box<Expr>>,
-    pub cases: Vec<MatchCase>,
 }
 
 #[derive(Debug, Clone)]
@@ -910,12 +589,5 @@ impl Default for AstFnDef {
             start: 0,
             end: 0,
         }
-    }
-}
-
-// 辅助函数实现
-impl IdentExpr {
-    pub fn new(literal: String) -> Self {
-        Self { literal }
     }
 }

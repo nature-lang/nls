@@ -348,7 +348,7 @@ impl Lexer {
             "EOF".to_string(),
             self.offset,
             self.guard,
-            self.line,
+            self.line + 1,
         ));
 
         (tokens, self.errors.clone())

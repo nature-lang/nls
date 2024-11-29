@@ -1,6 +1,5 @@
 use nls::analyzer::lexer::{Lexer, TokenType};
 use nls::analyzer::syntax::*;
-use nls::analyzer::common::*;
 
 #[test]
 fn test_lexer() {
@@ -26,7 +25,6 @@ fn test_lexer() {
         TokenType::Equal,
         TokenType::IntLiteral, // 0
         TokenType::StmtEof,    // 语句结束
-
         TokenType::For,
         TokenType::IntLiteral, // 20
         TokenType::RightAngle, // >
@@ -44,14 +42,14 @@ fn test_lexer() {
         TokenType::IntLiteral, // 1
         TokenType::StmtEof,    // 语句结束
         TokenType::RightCurly,
-        TokenType::StmtEof,    // 语句结束
-        TokenType::Ident, // print
+        TokenType::StmtEof, // 语句结束
+        TokenType::Ident,   // print
         TokenType::LeftParen,
         TokenType::StringLiteral, // 'for end, i='
         TokenType::Comma,
         TokenType::Ident, // i
         TokenType::RightParen,
-        TokenType::Eof,     // 文件结束
+        TokenType::Eof, // 文件结束
     ];
 
     assert_eq!(tokens.len(), expected_types.len());
@@ -64,19 +62,32 @@ fn test_lexer() {
 }
 
 #[test]
-fn test_syntax() {
+fn test_lexer_error() {
     let source = r#"
+        for true 」 
+    "#;
+    let mut lexer = Lexer::new(source.to_string());
+    let (tokens, lexer_errors) = lexer.scan();
+    assert_eq!(lexer_errors.len(), 1, "Expected 1 lexer errors");
+    dbg!(&tokens);
+}
 
-    if b == 24 {{
+#[test]
+fn test_syntax() {
+    let source = r#"if b == 24 {
+        int a =
+    }
 
+    int foo = 3
     "#
     .to_string();
 
     let mut lexer = Lexer::new(source);
     let (tokens, lexer_errors) = lexer.scan();
     assert!(lexer_errors.is_empty(), "Expected no lexer errors");
+    dbg!(&tokens);
 
     let mut syntax = Syntax::new(tokens);
     let (_stmts, syntax_errors) = syntax.parser();
-    assert!(syntax_errors.is_empty(), "Expected no syntax errors");
+    assert_eq!(syntax_errors.len(), 1, "Expected 1 syntax errors");
 }

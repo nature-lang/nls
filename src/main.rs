@@ -464,12 +464,15 @@ struct TextDocumentItem<'a> {
 impl Backend {
     async fn on_change<'a>(&self, params: TextDocumentItem<'a>) {
         dbg!(&params.version);
+        debug!(r#"Text content:
+        {}
+        "#, params.text); 
 
         let rope = ropey::Rope::from_str(params.text);
         // uri 是文档的唯一标识
         self.document_map.insert(params.uri.to_string(), rope.clone());
 
-        let (lexer_tokens, _ast_stmts, analyzer_errors) = Analyzer::analyze(params.text.to_string());
+        let (lexer_tokens, _, analyzer_errors) = Analyzer::analyze(params.text.to_string());
         dbg!(&analyzer_errors);
 
         let diagnostics = analyzer_errors // 访问内部的 Vec<AnalyzerError>
