@@ -1,4 +1,4 @@
-use super::common::AnalyzerErrors;
+use super::common::AnalyzerError;
 use strum_macros::Display;
 
 #[derive(Debug, Clone, PartialEq, Display)]
@@ -298,7 +298,7 @@ pub struct Lexer {
     space_prev: char,
     space_next: char,
     line: usize,
-    errors: AnalyzerErrors,
+    errors: Vec<AnalyzerError>,
 }
 
 impl Lexer {
@@ -311,11 +311,11 @@ impl Lexer {
             space_prev: '\0',
             space_next: '\0',
             line: 1,
-            errors: AnalyzerErrors::new(),
+            errors: Vec::new(),
         }
     }
 
-    pub fn scan(&mut self) -> (Vec<Token>, AnalyzerErrors) {
+    pub fn scan(&mut self) -> (Vec<Token>, Vec<AnalyzerError>) {
         let mut tokens = Vec::new();
 
         while !self.at_eof() {
@@ -355,8 +355,7 @@ impl Lexer {
     }
 
     fn ident_advance(&mut self) -> String {
-        while !self.at_eof() && (self.is_alpha(self.peek_guard()) || self.is_number(self.peek_guard()))
-        {
+        while !self.at_eof() && (self.is_alpha(self.peek_guard()) || self.is_number(self.peek_guard())) {
             self.guard_advance();
         }
         self.gen_word()
@@ -443,11 +442,11 @@ impl Lexer {
                             while !self.multi_comment_end() {
                                 if self.at_eof() {
                                     // 直到完美结尾都没有找到注释闭合符号, 不需要做任何错误恢复，已经到达了文件的末尾
-                                    self.errors.push(
-                                        self.offset,
-                                        self.guard,
-                                        String::from("Unterminated comment"),
-                                    );
+                                    self.errors.push(AnalyzerError {
+                                        start: self.offset,
+                                        end: self.guard,
+                                        message: String::from("Unterminated comment"),
+                                    });
                                 }
 
                                 self.guard_advance();
@@ -613,10 +612,7 @@ impl Lexer {
 
         // 处理特殊字符
         let special_type = self.special_char();
-        assert!(
-            special_type != TokenType::Eof,
-            "special characters are not recognized"
-        );
+        assert!(special_type != TokenType::Eof, "special characters are not recognized");
 
         // 检查 import xxx as * 的特殊情况
         if special_type == TokenType::Star && !tokens.is_empty() {
@@ -695,8 +691,11 @@ impl Lexer {
                     if self.match_char('.') {
                         return TokenType::Ellipsis;
                     } else {
-                        self.errors
-                            .push(self.offset, self.guard, String::from("Expected '...'"));
+                        self.errors.push(AnalyzerError {
+                            start: self.offset,
+                            end: self.guard,
+                            message: String::from("Expected '...'"),
+                        });
 
                         return TokenType::Ellipsis;
                     }
@@ -767,18 +766,18 @@ impl Lexer {
                 }
             }
             _ => {
-                self.errors.push(
-                    self.offset,
-                    self.guard,
-                    String::from("Unexpected character"),
-                );
+                self.errors.push(AnalyzerError {
+                    start: self.offset,
+                    end: self.guard,
+                    message: String::from("Unexpected character"),
+                });
                 TokenType::Unknown
             }
         }
     }
 
     fn string_advance(&mut self, close_char: char) -> String {
-        // 跳过开始引号，但不计入 token 长度
+        // 跳过开始的 ""，但不计入 token 长度
         self.guard += 1;
         let escape_char = '\\';
         let mut result = String::new();
@@ -787,11 +786,11 @@ impl Lexer {
             let mut guard = self.peek_guard();
 
             if guard == '\n' {
-                self.errors.push(
-                    self.offset,
-                    self.guard,
-                    String::from("string cannot newline"),
-                );
+                self.errors.push(AnalyzerError {
+                    start: self.offset,
+                    end: self.guard,
+                    message: String::from("string not terminated"),
+                });
                 return result; // 返回已经解析的字符串
             }
 
@@ -812,11 +811,11 @@ impl Lexer {
                     '0' => '\0',
                     '\\' | '\'' | '"' => guard,
                     _ => {
-                        self.errors.push(
-                            self.guard,
-                            self.guard,
-                            format!("unknown escape char {}", guard),
-                        );
+                        self.errors.push(AnalyzerError {
+                            start: self.guard,
+                            end: self.guard + 1,
+                            message: format!("unknown escape char '{}'", guard),
+                        });
                         guard
                     }
                 };
@@ -834,11 +833,11 @@ impl Lexer {
 
     fn number_convert(&mut self, word: &str, base: u32) -> i64 {
         i64::from_str_radix(word, base).unwrap_or_else(|_| {
-            self.errors.push(
-                self.offset,
-                self.guard,
-                format!("Invalid number `{}`", word),
-            );
+            self.errors.push(AnalyzerError {
+                start: self.offset,
+                end: self.guard,
+                message: format!("Invalid number `{}`", word),
+            });
             return 0;
         })
     }

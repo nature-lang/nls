@@ -1,6 +1,4 @@
-use std::any::Any;
 use std::collections::HashMap;
-use std::rc::Rc;
 use strum_macros::Display;
 
 #[derive(Debug, Clone)]
@@ -11,23 +9,6 @@ pub struct AnalyzerError {
     pub start: usize,
     pub end: usize,
     pub message: String,
-}
-
-#[derive(Debug, Clone)]
-pub struct AnalyzerErrors(Vec<AnalyzerError>);
-
-impl AnalyzerErrors {
-    pub fn new() -> Self {
-        Self(Vec::new())
-    }
-
-    pub fn push(&mut self, start: usize, end: usize, message: String) {
-        self.0.push(AnalyzerError {
-            start,
-            end,
-            message,
-        });
-    }
 }
 
 #[derive(Debug, Clone)]
@@ -869,7 +850,7 @@ pub struct AstFnDef {
     pub params: Vec<VarDeclExpr>,
     pub rest_param: bool,
     pub body: Vec<Box<Stmt>>,
-    pub closure: Option<Rc<dyn Any>>,
+    pub closure: Option<isize>,
     pub generics_hash_table: Option<HashMap<String, Type>>,
     pub generics_args_table: Option<HashMap<String, Type>>,
     pub generics_args_hash: Option<String>,

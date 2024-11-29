@@ -2,36 +2,38 @@ pub mod lexer; // 声明子模块
 pub mod common;
 pub mod syntax;
 
+use common::{AnalyzerError, Stmt};
+
 pub struct Analyzer {
-    source: String,
-    tokens: Vec<lexer::Token>,
+    // source: String,
+    // tokens: Vec<lexer::Token>,
+    // errors: Vec<AnalyzerError>,
+    // stmts: Vec<Box<Stmt>>,
 }
 
 impl Analyzer {
-    pub fn new(source: String) -> Self {
-        Self {
-            source,
-            tokens: Vec::new(),
-        }
-    }
-
     // 执行完整的分析流程
-    pub fn analyze(&mut self) -> Result<(), String> {
+    pub fn analyze(source: String) -> (Vec<lexer::Token>, Vec<Box<Stmt>>, Vec<AnalyzerError>) {
         // 1. 词法分析
-        let mut lexer = lexer::Lexer::new(self.source.clone());
-        let (_, _) = lexer.scan();
-        
-        // 2. 语法分析 (后续添加)
-        // self.parse()?;
-        
-        // 3. 语义分析 (后续添加)
+        let mut lexer = lexer::Lexer::new(source.clone());
+        let (tokens, lexter_errors) = lexer.scan();
+        dbg!("lexer_scan completed, errors count: {}", lexter_errors.len());
+
+        let mut errors = Vec::new();
+        errors.extend(lexter_errors);
+
+        // 2. 语法分析 
+        let mut syntax = syntax::Syntax::new(tokens.clone());
+        let (stmts, syntax_errors) = syntax.parser();
+        dbg!("syntax_parser completed, errors count: {}", syntax_errors.len());
+
+        errors.extend(syntax_errors);
+
+        // 3. 语义分析
         // self.check_semantics()?;
-        
-        Ok(())
-    }
-    
-    // 获取分析结果
-    pub fn get_tokens(&self) -> &[lexer::Token] {
-        &self.tokens
+
+        // 4. 类型分析
+
+        (tokens, stmts, errors)
     }
 }

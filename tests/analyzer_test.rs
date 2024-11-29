@@ -1,4 +1,6 @@
 use nls::analyzer::lexer::{Lexer, TokenType};
+use nls::analyzer::syntax::*;
+use nls::analyzer::common::*;
 
 #[test]
 fn test_lexer() {
@@ -59,4 +61,22 @@ fn test_lexer() {
         assert_eq!(token.token_type, *expected_type, "token type mismatch at index {}", i);
         i += 1;
     }
+}
+
+#[test]
+fn test_syntax() {
+    let source = r#"
+
+    if b == 24 {{
+
+    "#
+    .to_string();
+
+    let mut lexer = Lexer::new(source);
+    let (tokens, lexer_errors) = lexer.scan();
+    assert!(lexer_errors.is_empty(), "Expected no lexer errors");
+
+    let mut syntax = Syntax::new(tokens);
+    let (_stmts, syntax_errors) = syntax.parser();
+    assert!(syntax_errors.is_empty(), "Expected no syntax errors");
 }

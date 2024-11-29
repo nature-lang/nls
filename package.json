@@ -1,38 +1,37 @@
 {
-  "name": "nrs-language-server",
-  "description": "nano rust language server",
+  "name": "nls",
+  "description": "nature language server",
   "license": "MIT",
-  "version": "1.5.0",
+  "version": "0.1.0",
   "categories": [],
   "keywords": [
-    "language-server",
-    "tower-lsp"
+    "nature-language-server"
   ],
   "repository": {
-    "url": "https://github.com/IWANABETHATGUY/tower-lsp-boilerplate"
+    "url": "https://github.com/weiwenhao/nls"
   },
   "engines": {
     "vscode": "^1.66.0"
   },
   "enabledApiProposals": [],
   "activationEvents": [
-    "onLanguage:nrs"
+    "onLanguage:n"
   ],
   "main": "./dist/extension.js",
   "contributes": {
     "languages": [
       {
-        "id": "nrs",
+        "id": "n",
         "extensions": [
-          ".nrs"
+          ".n"
         ]
       }
     ],
     "configuration": {
       "type": "object",
-      "title": "nrs-language-server",
+      "title": "nls",
       "properties": {
-        "nrs-language-server.trace.server": {
+        "nls.trace.server": {
           "type": "string",
           "scope": "window",
           "enum": [

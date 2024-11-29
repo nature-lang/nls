@@ -4,154 +4,159 @@
  * ------------------------------------------------------------------------------------------ */
 
 import {
-  languages,
-  workspace,
-  EventEmitter,
-  ExtensionContext,
-  window,
-  InlayHintsProvider,
-  TextDocument,
-  CancellationToken,
-  Range,
-  InlayHint,
-  TextDocumentChangeEvent,
-  ProviderResult,
-  commands,
-  WorkspaceEdit,
-  TextEdit,
-  Selection,
-  Uri,
+    languages,
+    workspace,
+    EventEmitter,
+    ExtensionContext,
+    window,
+    InlayHintsProvider,
+    TextDocument,
+    CancellationToken,
+    Range,
+    InlayHint,
+    TextDocumentChangeEvent,
+    ProviderResult,
+    commands,
+    WorkspaceEdit,
+    TextEdit,
+    Selection,
+    Uri,
 } from "vscode";
 
 import {
-  Disposable,
-  Executable,
-  LanguageClient,
-  LanguageClientOptions,
-  ServerOptions,
+    Disposable,
+    Executable,
+    LanguageClient,
+    LanguageClientOptions,
+    ServerOptions,
 } from "vscode-languageclient/node";
 
 let client: LanguageClient;
 // type a = Parameters<>;
 
 export async function activate(context: ExtensionContext) {
+    const traceOutputChannel = window.createOutputChannel("Nature Language Server trace");
+    traceOutputChannel.show(); // 强制显示输出通道
 
-  const traceOutputChannel = window.createOutputChannel("Nrs Language Server trace");
-  const command = process.env.SERVER_PATH || "nrs-language-server";
-  const run: Executable = {
-    command,
-    options: {
-      env: {
-        ...process.env,
-        // eslint-disable-next-line @typescript-eslint/naming-convention
-        RUST_LOG: "debug",
-      },
-    },
-  };
-  const serverOptions: ServerOptions = {
-    run,
-    debug: run,
-  };
-  // If the extension is launched in debug mode then the debug server options are used
-  // Otherwise the run options are used
-  // Options to control the language client
-  let clientOptions: LanguageClientOptions = {
-    // Register the server for plain text documents
-    documentSelector: [{ scheme: "file", language: "nrs" }],
-    synchronize: {
-      // Notify the server about file changes to '.clientrc files contained in the workspace
-      fileEvents: workspace.createFileSystemWatcher("**/.clientrc"),
-    },
-    traceOutputChannel,
-  };
+    const command = process.env.SERVER_PATH || "nls";
 
-  // Create the language client and start the client.
-  client = new LanguageClient("nrs-language-server", "nrs language server", serverOptions, clientOptions);
-  // activateInlayHints(context);
-  client.start();
+    // Log server command
+    traceOutputChannel.appendLine(`[LSP] Server command: ${command}`);
+
+    const run: Executable = {
+        command,
+        options: {
+            env: {
+                ...process.env,
+                // eslint-disable-next-line @typescript-eslint/naming-convention
+                RUST_LOG: "debug",
+            },
+        },
+    };
+    const serverOptions: ServerOptions = {
+        run,
+        debug: run,
+    };
+    // If the extension is launched in debug mode then the debug server options are used
+    // Otherwise the run options are used
+    // Options to control the language client
+    let clientOptions: LanguageClientOptions = {
+        // Register the server for plain text documents
+        documentSelector: [{ scheme: "file", language: "n" }],
+        synchronize: {
+            // Notify the server about file changes to '.clientrc files contained in the workspace
+            fileEvents: workspace.createFileSystemWatcher("**/.clientrc"),
+        },
+        traceOutputChannel,
+    };
+
+    // Create the language client and start the client.
+    client = new LanguageClient("nature-language-server", "nature language server", serverOptions, clientOptions);
+    // activateInlayHints(context);
+    client.start();
 }
 
 export function deactivate(): Thenable<void> | undefined {
-  if (!client) {
-    return undefined;
-  }
-  return client.stop();
+    if (!client) {
+        return undefined;
+    }
+    return client.stop();
 }
 
 export function activateInlayHints(ctx: ExtensionContext) {
-  const maybeUpdater = {
-    hintsProvider: null as Disposable | null,
-    updateHintsEventEmitter: new EventEmitter<void>(),
+    const maybeUpdater = {
+        hintsProvider: null as Disposable | null,
+        updateHintsEventEmitter: new EventEmitter<void>(),
 
-    async onConfigChange() {
-      this.dispose();
+        async onConfigChange() {
+            this.dispose();
 
-      const event = this.updateHintsEventEmitter.event;
-      // this.hintsProvider = languages.registerInlayHintsProvider(
-      //   { scheme: "file", language: "nrs" },
-      //   // new (class implements InlayHintsProvider {
-      //   //   onDidChangeInlayHints = event;
-      //   //   resolveInlayHint(hint: InlayHint, token: CancellationToken): ProviderResult<InlayHint> {
-      //   //     const ret = {
-      //   //       label: hint.label,
-      //   //       ...hint,
-      //   //     };
-      //   //     return ret;
-      //   //   }
-      //   //   async provideInlayHints(
-      //   //     document: TextDocument,
-      //   //     range: Range,
-      //   //     token: CancellationToken
-      //   //   ): Promise<InlayHint[]> {
-      //   //     const hints = (await client
-      //   //       .sendRequest("custom/inlay_hint", { path: document.uri.toString() })
-      //   //       .catch(err => null)) as [number, number, string][];
-      //   //     if (hints == null) {
-      //   //       return [];
-      //   //     } else {
-      //   //       return hints.map(item => {
-      //   //         const [start, end, label] = item;
-      //   //         let startPosition = document.positionAt(start);
-      //   //         let endPosition = document.positionAt(end);
-      //   //         return {
-      //   //           position: endPosition,
-      //   //           paddingLeft: true,
-      //   //           label: [
-      //   //             {
-      //   //               value: `${label}`,
-      //   //               // location: {
-      //   //               //   uri: document.uri,
-      //   //               //   range: new Range(1, 0, 1, 0)
-      //   //               // }
-      //   //               command: {
-      //   //                 title: "hello world",
-      //   //                 command: "helloworld.helloWorld",
-      //   //                 arguments: [document.uri],
-      //   //               },
-      //   //             },
-      //   //           ],
-      //   //         };
-      //   //       });
-      //   //     }
-      //   //   }
-      //   // })()
-      // );
-    },
+            const event = this.updateHintsEventEmitter.event;
+            // this.hintsProvider = languages.registerInlayHintsProvider(
+            //   { scheme: "file", language: "nrs" },
+            //   // new (class implements InlayHintsProvider {
+            //   //   onDidChangeInlayHints = event;
+            //   //   resolveInlayHint(hint: InlayHint, token: CancellationToken): ProviderResult<InlayHint> {
+            //   //     const ret = {
+            //   //       label: hint.label,
+            //   //       ...hint,
+            //   //     };
+            //   //     return ret;
+            //   //   }
+            //   //   async provideInlayHints(
+            //   //     document: TextDocument,
+            //   //     range: Range,
+            //   //     token: CancellationToken
+            //   //   ): Promise<InlayHint[]> {
+            //   //     const hints = (await client
+            //   //       .sendRequest("custom/inlay_hint", { path: document.uri.toString() })
+            //   //       .catch(err => null)) as [number, number, string][];
+            //   //     if (hints == null) {
+            //   //       return [];
+            //   //     } else {
+            //   //       return hints.map(item => {
+            //   //         const [start, end, label] = item;
+            //   //         let startPosition = document.positionAt(start);
+            //   //         let endPosition = document.positionAt(end);
+            //   //         return {
+            //   //           position: endPosition,
+            //   //           paddingLeft: true,
+            //   //           label: [
+            //   //             {
+            //   //               value: `${label}`,
+            //   //               // location: {
+            //   //               //   uri: document.uri,
+            //   //               //   range: new Range(1, 0, 1, 0)
+            //   //               // }
+            //   //               command: {
+            //   //                 title: "hello world",
+            //   //                 command: "helloworld.helloWorld",
+            //   //                 arguments: [document.uri],
+            //   //               },
+            //   //             },
+            //   //           ],
+            //   //         };
+            //   //       });
+            //   //     }
+            //   //   }
+            //   // })()
+            // );
+        },
 
-    onDidChangeTextDocument({ contentChanges, document }: TextDocumentChangeEvent) {
-      // debugger
-      // this.updateHintsEventEmitter.fire();
-    },
+        onDidChangeTextDocument({ contentChanges, document }: TextDocumentChangeEvent) {
+            // debugger
+            // this.updateHintsEventEmitter.fire();
+        },
 
-    dispose() {
-      this.hintsProvider?.dispose();
-      this.hintsProvider = null;
-      this.updateHintsEventEmitter.dispose();
-    },
-  };
+        dispose() {
+            this.hintsProvider?.dispose();
+            this.hintsProvider = null;
+            this.updateHintsEventEmitter.dispose();
+        },
+    };
 
-  workspace.onDidChangeConfiguration(maybeUpdater.onConfigChange, maybeUpdater, ctx.subscriptions);
-  workspace.onDidChangeTextDocument(maybeUpdater.onDidChangeTextDocument, maybeUpdater, ctx.subscriptions);
+    workspace.onDidChangeConfiguration(maybeUpdater.onConfigChange, maybeUpdater, ctx.subscriptions);
+    workspace.onDidChangeTextDocument(maybeUpdater.onDidChangeTextDocument, maybeUpdater, ctx.subscriptions);
 
-  maybeUpdater.onConfigChange().catch(console.error);
+    maybeUpdater.onConfigChange().catch(console.error);
 }

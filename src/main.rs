@@ -2,11 +2,11 @@ use std::collections::HashMap;
 
 use dashmap::DashMap;
 use log::debug;
+use nls::analyzer::lexer;
+use nls::analyzer::Analyzer;
 use nls::completion::completion;
-use nls::nrs_lang::{
-    parse, type_inference, Ast, ImCompleteSemanticToken, ParserResult,
-};
-use nls::semantic_analyze::{analyze_program, IdentType, Semantic};
+use nls::nrs_lang::{type_inference, Ast};
+use nls::semantic_analyze::{IdentType, Semantic};
 use nls::semantic_token::LEGEND_TYPE;
 use nls::span::Span;
 use ropey::Rope;
@@ -16,13 +16,14 @@ use tower_lsp::jsonrpc::Result;
 use tower_lsp::lsp_types::notification::Notification;
 use tower_lsp::lsp_types::*;
 use tower_lsp::{Client, LanguageServer, LspService, Server};
+
 #[derive(Debug)]
 struct Backend {
     client: Client,
     ast_map: DashMap<String, Ast>,
     semantic_map: DashMap<String, Semantic>,
     document_map: DashMap<String, Rope>,
-    semantic_token_map: DashMap<String, Vec<ImCompleteSemanticToken>>,
+    semantic_token_map: DashMap<String, Vec<lexer::Token>>,
 }
 
 // backend 除了实现自身的方法，还实现了 LanguageServer trait 的方法
@@ -34,16 +35,14 @@ impl LanguageServer for Backend {
             offset_encoding: None,
             capabilities: ServerCapabilities {
                 inlay_hint_provider: Some(OneOf::Left(true)),
-                text_document_sync: Some(TextDocumentSyncCapability::Options(
-                    TextDocumentSyncOptions {
-                        open_close: Some(true),
-                        change: Some(TextDocumentSyncKind::FULL),
-                        save: Some(TextDocumentSyncSaveOptions::SaveOptions(SaveOptions {
-                            include_text: Some(true),
-                        })),
-                        ..Default::default()
-                    },
-                )),
+                text_document_sync: Some(TextDocumentSyncCapability::Options(TextDocumentSyncOptions {
+                    open_close: Some(true),
+                    change: Some(TextDocumentSyncKind::FULL),
+                    save: Some(TextDocumentSyncSaveOptions::SaveOptions(SaveOptions {
+                        include_text: Some(true),
+                    })),
+                    ..Default::default()
+                })),
                 completion_provider: Some(CompletionOptions {
                     resolve_provider: Some(false),
                     trigger_characters: Some(vec![".".to_string()]),
@@ -63,31 +62,29 @@ impl LanguageServer for Backend {
                     }),
                     file_operations: None,
                 }),
-                semantic_tokens_provider: Some(
-                    SemanticTokensServerCapabilities::SemanticTokensRegistrationOptions(
-                        SemanticTokensRegistrationOptions {
-                            text_document_registration_options: {
-                                TextDocumentRegistrationOptions {
-                                    document_selector: Some(vec![DocumentFilter {
-                                        language: Some("nrs".to_string()),
-                                        scheme: Some("file".to_string()),
-                                        pattern: None,
-                                    }]),
-                                }
-                            },
-                            semantic_tokens_options: SemanticTokensOptions {
-                                work_done_progress_options: WorkDoneProgressOptions::default(),
-                                legend: SemanticTokensLegend {
-                                    token_types: LEGEND_TYPE.into(),
-                                    token_modifiers: vec![],
-                                },
-                                range: Some(true),
-                                full: Some(SemanticTokensFullOptions::Bool(true)),
-                            },
-                            static_registration_options: StaticRegistrationOptions::default(),
+                semantic_tokens_provider: Some(SemanticTokensServerCapabilities::SemanticTokensRegistrationOptions(
+                    SemanticTokensRegistrationOptions {
+                        text_document_registration_options: {
+                            TextDocumentRegistrationOptions {
+                                document_selector: Some(vec![DocumentFilter {
+                                    language: Some("nrs".to_string()),
+                                    scheme: Some("file".to_string()),
+                                    pattern: None,
+                                }]),
+                            }
                         },
-                    ),
-                ),
+                        semantic_tokens_options: SemanticTokensOptions {
+                            work_done_progress_options: WorkDoneProgressOptions::default(),
+                            legend: SemanticTokensLegend {
+                                token_types: LEGEND_TYPE.into(),
+                                token_modifiers: vec![],
+                            },
+                            range: Some(true),
+                            full: Some(SemanticTokensFullOptions::Bool(true)),
+                        },
+                        static_registration_options: StaticRegistrationOptions::default(),
+                    },
+                )),
                 // definition: Some(GotoCapability::default()),
                 definition_provider: Some(OneOf::Left(true)),
                 references_provider: Some(OneOf::Left(true)),
@@ -141,10 +138,7 @@ impl LanguageServer for Backend {
     }
 
     // did open 中已经对 document 进行了处理，所以这里只需要从 semantic 中获取信息
-    async fn goto_definition(
-        &self,
-        params: GotoDefinitionParams,
-    ) -> Result<Option<GotoDefinitionResponse>> {
+    async fn goto_definition(&self, params: GotoDefinitionParams) -> Result<Option<GotoDefinitionResponse>> {
         let definition = || -> Option<GotoDefinitionResponse> {
             // uri 标识当前文档的唯一标识
             let uri = params.text_document_position_params.text_document.uri;
@@ -218,10 +212,7 @@ impl LanguageServer for Backend {
         Ok(reference_list)
     }
 
-    async fn semantic_tokens_full(
-        &self,
-        params: SemanticTokensParams,
-    ) -> Result<Option<SemanticTokensResult>> {
+    async fn semantic_tokens_full(&self, params: SemanticTokensParams) -> Result<Option<SemanticTokensResult>> {
         let uri = params.text_document.uri.to_string();
         debug!("semantic_token_full");
         let semantic_tokens = || -> Option<Vec<SemanticToken>> {
@@ -237,16 +228,12 @@ impl LanguageServer for Backend {
                     let first = rope.try_line_to_char(line as usize).ok()? as u32;
                     let start = rope.try_byte_to_char(token.start).ok()? as u32 - first;
                     let delta_line = line - pre_line;
-                    let delta_start = if delta_line == 0 {
-                        start - pre_start
-                    } else {
-                        start
-                    };
+                    let delta_start = if delta_line == 0 { start - pre_start } else { start };
                     let ret = Some(SemanticToken {
                         delta_line,
                         delta_start,
                         length: token.length as u32,
-                        token_type: token.token_type as u32,
+                        token_type: token.token_type.clone() as u32,
                         token_modifiers_bitset: 0,
                     });
                     pre_line = line;
@@ -283,13 +270,9 @@ impl LanguageServer for Backend {
                     let start = rope.try_byte_to_char(token.start).ok()? as u32 - first;
                     let ret = Some(SemanticToken {
                         delta_line: line - pre_line,
-                        delta_start: if start >= pre_start {
-                            start - pre_start
-                        } else {
-                            start
-                        },
+                        delta_start: if start >= pre_start { start - pre_start } else { start },
                         length: token.length as u32,
-                        token_type: token.token_type as u32,
+                        token_type: token.token_type.clone() as u32,
                         token_modifiers_bitset: 0,
                     });
                     pre_line = line;
@@ -299,18 +282,10 @@ impl LanguageServer for Backend {
                 .collect::<Vec<_>>();
             Some(semantic_tokens)
         }();
-        Ok(semantic_tokens.map(|data| {
-            SemanticTokensRangeResult::Tokens(SemanticTokens {
-                result_id: None,
-                data,
-            })
-        }))
+        Ok(semantic_tokens.map(|data| SemanticTokensRangeResult::Tokens(SemanticTokens { result_id: None, data })))
     }
 
-    async fn inlay_hint(
-        &self,
-        params: tower_lsp::lsp_types::InlayHintParams,
-    ) -> Result<Option<Vec<InlayHint>>> {
+    async fn inlay_hint(&self, params: tower_lsp::lsp_types::InlayHintParams) -> Result<Option<Vec<InlayHint>>> {
         debug!("inlay hint");
         let uri = &params.text_document.uri;
         let mut hashmap = HashMap::new();
@@ -390,10 +365,7 @@ impl LanguageServer for Backend {
                             ..Default::default()
                         });
                     }
-                    nls::completion::ImCompleteCompletionItem::Function(
-                        name,
-                        args,
-                    ) => {
+                    nls::completion::ImCompleteCompletionItem::Function(name, args) => {
                         ret.push(CompletionItem {
                             label: name.clone(),
                             kind: Some(CompletionItemKind::FUNCTION),
@@ -492,85 +464,52 @@ struct TextDocumentItem<'a> {
 impl Backend {
     async fn on_change<'a>(&self, params: TextDocumentItem<'a>) {
         dbg!(&params.version);
+
         let rope = ropey::Rope::from_str(params.text);
-        self.document_map
-            .insert(params.uri.to_string(), rope.clone());
+        // uri 是文档的唯一标识
+        self.document_map.insert(params.uri.to_string(), rope.clone());
 
-        let ParserResult {
-            ast,
-            parse_errors,
-            semantic_tokens,
-        } = parse(params.text);
+        let (lexer_tokens, _ast_stmts, analyzer_errors) = Analyzer::analyze(params.text.to_string());
+        dbg!(&analyzer_errors);
 
-        let mut diagnostics = parse_errors
+        let diagnostics = analyzer_errors // 访问内部的 Vec<AnalyzerError>
             .into_iter()
-            .filter_map(|item| {
-                let (message, span) = match item.reason() {
-                    chumsky::error::SimpleReason::Unclosed { span, delimiter } => {
-                        (format!("Unclosed delimiter {}", delimiter), span.clone())
-                    }
-                    chumsky::error::SimpleReason::Unexpected => (
-                        format!(
-                            "{}, expected {}",
-                            if item.found().is_some() {
-                                "Unexpected token in input"
-                            } else {
-                                "Unexpected end of input"
-                            },
-                            if item.expected().len() == 0 {
-                                "something else".to_string()
-                            } else {
-                                item.expected()
-                                    .map(|expected| match expected {
-                                        Some(expected) => expected.to_string(),
-                                        None => "end of input".to_string(),
-                                    })
-                                    .collect::<Vec<_>>()
-                                    .join(", ")
-                            }
-                        ),
-                        item.span(),
-                    ),
-                    chumsky::error::SimpleReason::Custom(msg) => (msg.to_string(), item.span()),
-                };
-
-                let start_position = offset_to_position(span.start, &rope)?;
-                let end_position = offset_to_position(span.end, &rope)?;
+            .filter_map(|error| {
+                let start_position = offset_to_position(error.start, &rope)?;
+                let end_position = offset_to_position(error.end, &rope)?;
                 Some(Diagnostic::new_simple(
                     Range::new(start_position, end_position),
-                    message,
+                    error.message,
                 ))
             })
             .collect::<Vec<_>>();
 
-        if let Some(ast) = ast {
-            match analyze_program(&ast) {
-                Ok(semantic) => {
-                    self.semantic_map.insert(params.uri.to_string(), semantic);
-                }
-                Err(err) => {
-                    self.semantic_token_map.remove(&params.uri.to_string());
-                    let span = err.span();
-                    let start_position = offset_to_position(span.start, &rope);
-                    let end_position = offset_to_position(span.end, &rope);
-                    let diag = start_position
-                        .and_then(|start| end_position.map(|end| (start, end)))
-                        .map(|(start, end)| {
-                            Diagnostic::new_simple(Range::new(start, end), format!("{:?}", err))
-                        });
-                    if let Some(diag) = diag {
-                        diagnostics.push(diag);
-                    }
-                }
-            };
-            self.ast_map.insert(params.uri.to_string(), ast);
-        }
+        // if let Some(ast) = ast {
+        //     match analyze_program(&ast) {
+        //         Ok(semantic) => {
+        //             self.semantic_map.insert(params.uri.to_string(), semantic);
+        //         }
+        //         Err(err) => {
+        //             self.semantic_token_map.remove(&params.uri.to_string());
+        //             let span = err.span();
+        //             let start_position = offset_to_position(span.start, &rope);
+        //             let end_position = offset_to_position(span.end, &rope);
+        //             let diag = start_position
+        //                 .and_then(|start| end_position.map(|end| (start, end)))
+        //                 .map(|(start, end)| Diagnostic::new_simple(Range::new(start, end), format!("{:?}", err)));
+        //             if let Some(diag) = diag {
+        //                 diagnostics.push(diag);
+        //             }
+        //         }
+        //     };
+        //     self.ast_map.insert(params.uri.to_string(), ast);
+        // }
 
         self.client
             .publish_diagnostics(params.uri.clone(), diagnostics, params.version)
             .await;
-        self.semantic_token_map
-            .insert(params.uri.to_string(), semantic_tokens);
+
+        self.semantic_token_map.insert(params.uri.to_string(), lexer_tokens);
     }
 }
 
@@ -607,12 +546,7 @@ fn position_to_offset(position: Position, rope: &Rope) -> Option<usize> {
     Some(slice.len_bytes())
 }
 
-fn get_references(
-    semantic: &Semantic,
-    start: usize,
-    end: usize,
-    include_definition: bool,
-) -> Option<Vec<Span>> {
+fn get_references(semantic: &Semantic, start: usize, end: usize, include_definition: bool) -> Option<Vec<Span>> {
     let interval = semantic.ident_range.find(start, end).next()?;
     let interval_val = interval.val;
     match interval_val {
@@ -620,11 +554,7 @@ fn get_references(
             let references = semantic.table.symbol_id_to_references.get(&symbol_id)?;
             let mut reference_span_list: Vec<Span> = references
                 .iter()
-                .map(|reference_id| {
-                    semantic.table.reference_id_to_reference[*reference_id]
-                        .span
-                        .clone()
-                })
+                .map(|reference_id| semantic.table.reference_id_to_reference[*reference_id].span.clone())
                 .collect();
             if include_definition {
                 let symbol_range = semantic.table.symbol_id_to_span.get(symbol_id)?;
