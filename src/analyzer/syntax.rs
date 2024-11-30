@@ -200,7 +200,8 @@ impl Syntax {
     }
 
     fn must(&mut self, expect: TokenType) -> Result<&Token, SyntaxError> {
-        let token = self.peek(); // 对 self 进行了不可变借用
+        let token = self.peek().clone(); // 对 self 进行了不可变借用, clone 让借用立刻结束
+        self.advance();
 
         if token.token_type != expect {
             let message = format!("expected '{}'", expect.to_string());
@@ -208,7 +209,6 @@ impl Syntax {
             return Err(SyntaxError(token.start, token.end, message));
         }
 
-        self.advance();
         return Ok(self.prev().unwrap());
     }
 
@@ -483,7 +483,11 @@ impl Syntax {
                     });
 
                     // 查找到下一个同步点
-                    self.synchronize(0);
+                   let found = self.synchronize(0);
+                    if !found {
+                        // 当前字符无法被表达式解析，且 sync 查找下一个可用同步点失败，直接跳过当前字符
+                        self.advance();
+                    }
                 }
             }
         }
@@ -527,33 +531,35 @@ impl Syntax {
 
         loop {
             let token = self.peek().token_type.clone();
-            
+
             // 提前返回的情况
             match token {
                 TokenType::Eof => return false,
-                
+
                 // 在当前层级遇到语句结束符
                 TokenType::StmtEof if brace_level == current_brace_level => {
                     self.advance();
                     return true;
                 }
-                
+
                 // 在当前层级遇到关键字或基本类型
                 _ if brace_level == current_brace_level => {
-                    if matches!(token,
-                        TokenType::Fn 
-                        | TokenType::Var
-                        | TokenType::Return 
-                        | TokenType::If
-                        | TokenType::For
-                        | TokenType::Match
-                        | TokenType::Try 
-                        | TokenType::Catch
-                        | TokenType::Continue
-                        | TokenType::Break
-                        | TokenType::Import
-                        | TokenType::Type
-                    ) || self.is_basic_type() {
+                    if matches!(
+                        token,
+                        TokenType::Fn
+                            | TokenType::Var
+                            | TokenType::Return
+                            | TokenType::If
+                            | TokenType::For
+                            | TokenType::Match
+                            | TokenType::Try
+                            | TokenType::Catch
+                            | TokenType::Continue
+                            | TokenType::Break
+                            | TokenType::Import
+                            | TokenType::Type
+                    ) || self.is_basic_type()
+                    {
                         return true;
                     }
                 }

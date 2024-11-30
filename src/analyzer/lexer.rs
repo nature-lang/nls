@@ -291,7 +291,7 @@ impl Token {
 
 #[derive(Debug)]
 pub struct Lexer {
-    source: String,
+    source: Vec<char>,
     offset: usize,
     guard: usize,
     length: usize,
@@ -302,11 +302,12 @@ pub struct Lexer {
 }
 
 impl Lexer {
-    pub fn new(source: String) -> Self {
+    pub fn new(source_string: String) -> Self {
+        let source_chars = source_string.chars().collect::<Vec<char>>();
         Lexer {
             offset: 0,
             guard: 0,
-            source,
+            source: source_chars,
             length: 0,
             space_prev: '\0',
             space_next: '\0',
@@ -470,7 +471,7 @@ impl Lexer {
     }
 
     fn gen_word(&self) -> String {
-        self.source[self.offset..self.guard].to_string()
+        self.source[self.offset..self.guard].iter().collect()
     }
 
     fn is_string(&self, s: char) -> bool {
@@ -633,7 +634,11 @@ impl Lexer {
     }
 
     fn multi_comment_end(&self) -> bool {
-        self.source[self.guard..].starts_with("*/")
+        if self.guard + 1 >= self.source.len() {
+            return false;
+        }
+
+        self.source[self.guard] == '*' && self.source[self.guard + 1] == '/'
     }
 
     fn special_char(&mut self) -> TokenType {
@@ -919,7 +924,7 @@ impl Lexer {
     pub fn get_context(&self) -> String {
         let context_start = self.offset.saturating_sub(20);
         let context_end = (self.offset + 20).min(self.source.len());
-        format!("...{}...", &self.source[context_start..context_end])
+        format!("...{}...", &self.source[context_start..context_end].iter().collect::<String>())
     }
 
     fn peek_guard(&self) -> char {
@@ -931,14 +936,17 @@ impl Lexer {
             );
         }
 
-        self.source.as_bytes()[self.guard] as char
+        self.source[self.guard]
     }
     fn peek_guard_prev(&self) -> char {
-        self.source.as_bytes()[self.guard - 1] as char
+        if self.guard == 0 {
+            return '\0';
+        }
+        self.source[self.guard - 1]
     }
 
     fn peek_next(&self) -> Option<char> {
-        Some(self.source.as_bytes()[self.guard + 1] as char)
+        self.source.get(self.guard + 1).copied()
     }
 
     pub fn debug_tokens(tokens: &[Token]) {

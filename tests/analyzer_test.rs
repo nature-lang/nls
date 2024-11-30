@@ -73,6 +73,26 @@ fn test_lexer_error() {
 }
 
 #[test]
+fn test_lexer_utf8() {
+    let source = r#"
+        for 10 > i 」
+}
+    "#;
+
+    let mut lexer = Lexer::new(source.to_string());
+    let (tokens, lexer_errors) = lexer.scan();
+    dbg!(&tokens);
+    dbg!(&lexer_errors);
+    assert_eq!(lexer_errors.len(), 1, "Expected 1 lexer errors");
+
+    let mut syntax = Syntax::new(tokens);
+    let (_stmts, syntax_errors) = syntax.parser();
+    dbg!(&_stmts);
+    dbg!(&syntax_errors);
+    assert_eq!(syntax_errors.len(), 1);
+}
+
+#[test]
 fn test_syntax() {
     let source = r#"if b == 24 {
         int a =
