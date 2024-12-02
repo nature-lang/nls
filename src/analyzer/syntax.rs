@@ -4,6 +4,7 @@ use super::lexer::TokenType;
 use std::collections::HashMap;
 use std::error::Error;
 use std::fmt;
+use std::sync::{Arc, Mutex};
 
 pub struct SyntaxError(usize, usize, String);
 
@@ -483,7 +484,7 @@ impl Syntax {
                     });
 
                     // 查找到下一个同步点
-                   let found = self.synchronize(0);
+                    let found = self.synchronize(0);
                     if !found {
                         // 当前字符无法被表达式解析，且 sync 查找下一个可用同步点失败，直接跳过当前字符
                         self.advance();
@@ -864,13 +865,14 @@ impl Syntax {
             if self.consume(TokenType::Dot) {
                 second = Some(self.advance());
             }
-            let mut alias = TypeAlias {
-                ident: if let Some(second_token) = second {
-                    second_token.literal.clone()
-                } else {
-                    first.literal.clone()
-                },
 
+            let ident = if let Some(second_token) = second {
+                second_token.clone()
+            } else {
+                first.clone()
+            };
+            let mut alias = TypeAlias {
+                ident: ident.literal,
                 import_as: if second.is_some() {
                     Some(first.literal.clone())
                 } else {
@@ -956,10 +958,10 @@ impl Syntax {
 
         self.must(TokenType::Type)?;
         let ident_token = self.must(TokenType::Ident)?;
-        let alias_ident = ident_token.literal.clone();
+        let alias_ident = ident_token.clone();
 
         // T<arg1, arg2>
-        let mut alias_params = Vec::new();
+        let mut alias_args = Vec::new();
         if self.consume(TokenType::LeftAngle) {
             if self.is(TokenType::RightAngle) {
                 return Err(SyntaxError(
@@ -989,7 +991,7 @@ impl Syntax {
                     }
                 }
 
-                alias_params.push(param);
+                alias_args.push(param);
 
                 self.type_params_table.insert(ident.clone(), ident.clone());
 
@@ -1008,15 +1010,13 @@ impl Syntax {
         // 恢复之前的 type_params_table
         self.type_params_table = HashMap::new();
 
-        stmt.node = AstNode::TypeAlias(
-            alias_ident,
-            if alias_params.is_empty() {
-                None
-            } else {
-                Some(alias_params)
-            },
-            alias_type,
-        );
+        stmt.node = AstNode::TypeAlias(Arc::new(Mutex::new(TypeAliasStmt {
+            ident: alias_ident.literal,
+            symbol_start: alias_ident.start,
+            symbol_end: alias_ident.end,
+            params: if alias_args.is_empty() { None } else { Some(alias_args) },
+            type_: alias_type,
+        })));
 
         Ok(stmt)
     }
@@ -1064,18 +1064,20 @@ impl Syntax {
     }
 
     // 解析变量声明
-    fn parser_var_decl(&mut self) -> Result<VarDeclExpr, SyntaxError> {
+    fn parser_var_decl(&mut self) -> Result<Arc<Mutex<VarDeclExpr>>, SyntaxError> {
         let var_type = self.parser_type()?;
 
         // 变量名必须是标识符
         let var_ident = self.must(TokenType::Ident)?;
 
-        Ok(VarDeclExpr {
+        Ok(Arc::new(Mutex::new(VarDeclExpr {
             type_: var_type,
             ident: var_ident.literal.clone(),
+            symbol_start: var_ident.start,
+            symbol_end: var_ident.end,
             be_capture: false,
             heap_ident: None,
-        })
+        })))
     }
 
     // 解析函数参数
@@ -1316,6 +1318,8 @@ impl Syntax {
 
         let catch_err = VarDeclExpr {
             ident: error_ident.literal.clone(),
+            symbol_start: error_ident.start,
+            symbol_end: error_ident.end,
             type_: Type::new(TypeKind::Unknown), // 实际上就是 error type
             be_capture: false,
             heap_ident: None,
@@ -1723,17 +1727,23 @@ impl Syntax {
 
         // for k,v in map {}
         if self.is(TokenType::Ident) && (self.next_is(1, TokenType::Comma) || self.next_is(1, TokenType::In)) {
+            let first_ident = self.must(TokenType::Ident)?;
             let first = VarDeclExpr {
                 type_: Type::new(TypeKind::Unknown),
-                ident: self.must(TokenType::Ident)?.literal.clone(),
+                ident: first_ident.literal.clone(),
+                symbol_start: first_ident.start,
+                symbol_end: first_ident.end,
                 be_capture: false,
                 heap_ident: None,
             };
 
             let second = if self.consume(TokenType::Comma) {
+                let second_ident = self.must(TokenType::Ident)?;
                 Some(VarDeclExpr {
                     type_: Type::new(TypeKind::Unknown),
-                    ident: self.must(TokenType::Ident)?.literal.clone(),
+                    ident: second_ident.literal.clone(),
+                    symbol_start: second_ident.start,
+                    symbol_end: second_ident.end,
                     be_capture: false,
                     heap_ident: None,
                 })
@@ -2012,7 +2022,7 @@ impl Syntax {
         // parse ident
         if self.is(TokenType::Ident) {
             let name = self.advance().literal.clone();
-            fndef.symbol_name = Some(name.clone());
+            fndef.symbol_name = name.clone();
             fndef.fn_name = Some(name);
         }
 
@@ -2026,7 +2036,7 @@ impl Syntax {
         }
 
         fndef.body = self.parser_body()?;
-        expr.node = AstNode::FnDef(fndef);
+        expr.node = AstNode::FnDef(Arc::new(Mutex::new(fndef)));
 
         // parse immediately call fn expr
         if self.is(TokenType::LeftParen) {
@@ -2135,16 +2145,18 @@ impl Syntax {
         }
 
         // 处理 var a = 1 形式
-        let ident = self.must(TokenType::Ident)?.literal.clone();
+        let ident = self.must(TokenType::Ident)?.clone();
         self.must(TokenType::Equal)?;
 
         stmt.node = AstNode::VarDef(
-            VarDeclExpr {
+            Arc::new(Mutex::new(VarDeclExpr {
                 type_: type_decl,
-                ident,
+                ident: ident.literal,
+                symbol_start: ident.start,
+                symbol_end: ident.end,
                 be_capture: false,
                 heap_ident: None,
-            },
+            })),
             self.parser_expr()?,
         );
 
@@ -2154,7 +2166,7 @@ impl Syntax {
     fn parser_type_begin_stmt(&mut self) -> Result<Box<Stmt>, SyntaxError> {
         let mut stmt = self.stmt_new();
         let type_decl = self.parser_type()?;
-        let ident = self.must(TokenType::Ident)?.literal.clone();
+        let ident = self.must(TokenType::Ident)?.clone();
 
         // 仅 var 支持元组解构
         if self.is(TokenType::LeftParen) {
@@ -2169,12 +2181,14 @@ impl Syntax {
         self.must(TokenType::Equal)?;
 
         stmt.node = AstNode::VarDef(
-            VarDeclExpr {
+            Arc::new(Mutex::new(VarDeclExpr {
                 type_: type_decl,
-                ident,
+                ident: ident.literal,
+                symbol_start: ident.start,
+                symbol_end: ident.end,
                 be_capture: false,
                 heap_ident: None,
-            },
+            })),
             self.parser_expr()?,
         );
 
@@ -2387,7 +2401,7 @@ impl Syntax {
 
         // 处理函数名
         let ident = self.must(TokenType::Ident)?;
-        fndef.symbol_name = Some(ident.literal.clone());
+        fndef.symbol_name = ident.literal.clone();
         fndef.fn_name = Some(ident.literal.clone());
 
         // 处理非实现类型的泛型参数
@@ -2438,7 +2452,7 @@ impl Syntax {
         // tpl fn not body;
         if self.is_stmt_eof() {
             fndef.is_tpl = true;
-            stmt.node = AstNode::FnDef(fndef);
+            stmt.node = AstNode::FnDef(Arc::new(Mutex::new(fndef)));
             return Ok(stmt);
         }
 
@@ -2452,7 +2466,7 @@ impl Syntax {
 
         self.type_params_table = HashMap::new();
 
-        stmt.node = AstNode::FnDef(fndef);
+        stmt.node = AstNode::FnDef(Arc::new(Mutex::new(fndef)));
         Ok(stmt)
     }
 
@@ -2758,12 +2772,14 @@ impl Syntax {
         // var a = call(x, x, x)
         let mut vardef_stmt = self.stmt_new();
         vardef_stmt.node = AstNode::VarDef(
-            VarDeclExpr {
+            Arc::new(Mutex::new(VarDeclExpr {
                 type_: Type::new(TypeKind::Unknown),
                 ident: "result".to_string(),
+                symbol_start: 0,
+                symbol_end: 0,
                 be_capture: false,
                 heap_ident: None,
-            },
+            })),
             call_expr.clone(),
         );
 

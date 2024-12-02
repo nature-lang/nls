@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 use strum_macros::Display;
 
 #[derive(Debug, Clone)]
@@ -244,6 +245,15 @@ pub enum TypeKind {
     GcUpvalue,
 }
 
+impl TypeKind {
+    pub fn is_unknown(&self) -> bool {
+        matches!(self, TypeKind::Unknown)
+    }
+
+    pub fn is_exist(&self) -> bool {
+        !self.is_unknown()
+    }
+}
 // ast struct
 
 #[derive(Debug, Clone, PartialEq, Display)]
@@ -356,7 +366,6 @@ pub enum AstNode {
     Break(Option<Box<Expr>>), // (expr)
     Continue,
     Import(ImportStmt),                                    // 比较复杂直接保留
-    VarDef(VarDeclExpr, Box<Expr>),                        // (var_decl, right)
     VarTupleDestr(Box<TupleDestrExpr>, Box<Expr>),         // (tuple_destr, right)
     Assign(Box<Expr>, Box<Expr>),                          // (left, right)
     Return(Option<Box<Expr>>),                             // (expr)
@@ -368,13 +377,15 @@ pub enum AstNode {
 
     ForCond(Box<Expr>, Vec<Box<Stmt>>),                            // (condition, body)
     ForTradition(Box<Stmt>, Box<Expr>, Box<Stmt>, Vec<Box<Stmt>>), // (init, cond, update, body)
-    TypeAlias(String, Option<Vec<GenericsParam>>, Type),           // (ident, params, type_)
 
     // 既可以作为表达式，也可以作为语句
     Call(AstCall),
     Catch(Box<Expr>, VarDeclExpr, Vec<Box<Stmt>>), // (try_expr, catch_err, catch_body)
     Match(Option<Box<Expr>>, Vec<MatchCase>),      // (subject, cases)
-    FnDef(AstFnDef),
+
+    VarDef(Arc<Mutex<VarDeclExpr>>, Box<Expr>),                        // (var_decl, right)
+    TypeAlias(Arc<Mutex<TypeAliasStmt>>),
+    FnDef(Arc<Mutex<AstFnDef>>),
 }
 
 impl AstNode {
@@ -436,6 +447,8 @@ impl Expr {
 #[derive(Debug, Clone)]
 pub struct VarDeclExpr {
     pub ident: String,
+    pub symbol_start: usize, // 符号定义位置
+    pub symbol_end: usize,   // 符号定义位置
     pub type_: Type,
     pub be_capture: bool,
     pub heap_ident: Option<String>,
@@ -514,6 +527,15 @@ impl GenericsParam {
 }
 
 #[derive(Debug, Clone)]
+pub struct TypeAliasStmt {
+    pub ident: String,
+    pub params: Option<Vec<GenericsParam>>,
+    pub type_: Type,
+    pub symbol_start: usize,
+    pub symbol_end: usize,
+}
+
+#[derive(Debug, Clone)]
 pub struct MatchCase {
     pub cond_list: Vec<Box<Expr>>,
     pub is_default: bool,
@@ -523,10 +545,10 @@ pub struct MatchCase {
 
 #[derive(Debug, Clone)]
 pub struct AstFnDef {
-    pub symbol_name: Option<String>,
+    pub symbol_name: String,
     pub closure_name: Option<String>,
     pub return_type: Type,
-    pub params: Vec<VarDeclExpr>,
+    pub params: Vec<Arc<Mutex<VarDeclExpr>>>,
     pub rest_param: bool,
     pub body: Vec<Box<Stmt>>,
     pub closure: Option<isize>,
@@ -543,14 +565,19 @@ pub struct AstFnDef {
     pub local_children: Vec<Box<AstFnDef>>,
     pub is_local: bool,
     pub is_tpl: bool,
-    pub linkid: Option<String>,
     pub is_generics: bool,
     pub is_co_async: bool,
     pub is_private: bool,
     pub break_target_types: Vec<Type>,
+    pub linkid: Option<String>,
     pub fn_name: Option<String>,
     pub rel_path: Option<String>,
 
+    // symbol 符号定义位置
+    pub symbol_start: usize,
+    pub symbol_end: usize,
+
+    // 整个函数的其实与结束位置
     pub start: usize,
     pub end: usize,
 }
@@ -559,7 +586,7 @@ pub struct AstFnDef {
 impl Default for AstFnDef {
     fn default() -> Self {
         Self {
-            symbol_name: None,
+            symbol_name: "".to_string(),
             closure_name: None,
             return_type: Type::new(TypeKind::Void),
             params: Vec::new(),
@@ -586,6 +613,8 @@ impl Default for AstFnDef {
             break_target_types: Vec::new(),
             fn_name: None,
             rel_path: None,
+            symbol_start: 0,
+            symbol_end: 0,
             start: 0,
             end: 0,
         }
