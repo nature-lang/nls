@@ -34,7 +34,9 @@ impl LanguageServer for Backend {
             server_info: None,
             offset_encoding: None,
             capabilities: ServerCapabilities {
-                inlay_hint_provider: Some(OneOf::Left(true)),
+                //  开启内联提示
+                inlay_hint_provider: Some(OneOf::Left(true)), 
+                // 文档同步配置
                 text_document_sync: Some(TextDocumentSyncCapability::Options(TextDocumentSyncOptions {
                     open_close: Some(true),
                     change: Some(TextDocumentSyncKind::FULL),
@@ -43,6 +45,7 @@ impl LanguageServer for Backend {
                     })),
                     ..Default::default()
                 })),
+                // 代码补全配置
                 completion_provider: Some(CompletionOptions {
                     resolve_provider: Some(false),
                     trigger_characters: Some(vec![".".to_string()]),
@@ -55,6 +58,7 @@ impl LanguageServer for Backend {
                     work_done_progress_options: Default::default(),
                 }),
 
+                // 工作区配置
                 workspace: Some(WorkspaceServerCapabilities {
                     workspace_folders: Some(WorkspaceFoldersServerCapabilities {
                         supported: Some(true),
@@ -62,13 +66,14 @@ impl LanguageServer for Backend {
                     }),
                     file_operations: None,
                 }),
+                // 语义标记配置
                 semantic_tokens_provider: Some(SemanticTokensServerCapabilities::SemanticTokensRegistrationOptions(
                     SemanticTokensRegistrationOptions {
                         text_document_registration_options: {
                             TextDocumentRegistrationOptions {
                                 document_selector: Some(vec![DocumentFilter {
-                                    language: Some("nrs".to_string()),
-                                    scheme: Some("file".to_string()),
+                                    language: Some("n".to_string()), // 指定语言
+                                    scheme: Some("file".to_string()), // 文件系统方案
                                     pattern: None,
                                 }]),
                             }
@@ -76,10 +81,11 @@ impl LanguageServer for Backend {
                         semantic_tokens_options: SemanticTokensOptions {
                             work_done_progress_options: WorkDoneProgressOptions::default(),
                             legend: SemanticTokensLegend {
-                                token_types: LEGEND_TYPE.into(),
-                                token_modifiers: vec![],
+                                // // LEGEND_TYPE 通常定义在 semantic_token.rs 中，包含所有支持的标记类型
+                                token_types: LEGEND_TYPE.into(), // 支持的标记类型, 如函数、变量、字符串等
+                                token_modifiers: vec![], // 支持的标记修饰符, 例如 readonly, static 等
                             },
-                            range: Some(true),
+                            range: Some(true), // 范围增量更新语义
                             full: Some(SemanticTokensFullOptions::Bool(true)),
                         },
                         static_registration_options: StaticRegistrationOptions::default(),
@@ -94,7 +100,7 @@ impl LanguageServer for Backend {
         })
     }
     async fn initialized(&self, _: InitializedParams) {
-        debug!("initialized!");
+        debug!("initialized!--------------");
     }
 
     async fn shutdown(&self) -> Result<()> {
@@ -215,25 +221,37 @@ impl LanguageServer for Backend {
     async fn semantic_tokens_full(&self, params: SemanticTokensParams) -> Result<Option<SemanticTokensResult>> {
         let uri = params.text_document.uri.to_string();
         debug!("semantic_token_full");
+
+        // semantic_tokens 是一个闭包, 返回 vscode 要求的 SemanticToken 结构
         let semantic_tokens = || -> Option<Vec<SemanticToken>> {
+            // 获取 semantic_token_map 中的 token
             let mut im_complete_tokens = self.semantic_token_map.get_mut(&uri)?;
             let rope = self.document_map.get(&uri)?;
-            im_complete_tokens.sort_by(|a, b| a.start.cmp(&b.start));
+
+            // im_complete_tokens.sort_by(|a, b| a.start.cmp(&b.start));
+
             let mut pre_line = 0;
             let mut pre_start = 0;
-            let semantic_tokens = im_complete_tokens
+            let semantic_tokens: Vec<SemanticToken> = im_complete_tokens
                 .iter()
                 .filter_map(|token| {
-                    let line = rope.try_byte_to_line(token.start).ok()? as u32;
+
+                    // dbg!(token.clone(), pre_line, pre_start);
+
+                    let line = rope.try_char_to_line(token.start).ok()? as u32;
                     let first = rope.try_line_to_char(line as usize).ok()? as u32;
-                    let start = rope.try_byte_to_char(token.start).ok()? as u32 - first;
+                    let start = token.start as u32 - first;
                     let delta_line = line - pre_line;
                     let delta_start = if delta_line == 0 { start - pre_start } else { start };
+
+                    // dbg!(line, first, start, delta_line, delta_start, "--------------------------------");
+
+
                     let ret = Some(SemanticToken {
                         delta_line,
                         delta_start,
                         length: token.length as u32,
-                        token_type: token.token_type.clone() as u32,
+                        token_type: token.semantic_token_type.clone() as u32,
                         token_modifiers_bitset: 0,
                     });
                     pre_line = line;
@@ -472,7 +490,7 @@ impl Backend {
         // uri 是文档的唯一标识
         self.document_map.insert(params.uri.to_string(), rope.clone());
 
-        let (lexer_tokens, _, analyzer_errors) = Analyzer::analyze(params.text.to_string());
+        let (sem_tokens, _, analyzer_errors) = Analyzer::analyze(params.text.to_string());
         dbg!(&analyzer_errors);
 
         let diagnostics = analyzer_errors // 访问内部的 Vec<AnalyzerError>
@@ -512,7 +530,7 @@ impl Backend {
             .publish_diagnostics(params.uri.clone(), diagnostics, params.version)
             .await;
 
-        self.semantic_token_map.insert(params.uri.to_string(), lexer_tokens);
+        self.semantic_token_map.insert(params.uri.to_string(), sem_tokens);
     }
 }
 

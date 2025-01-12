@@ -8,11 +8,11 @@ use std::sync::{Arc, Mutex};
 pub struct NodeId(NonZeroU32);
 
 // 全局 scope id
-const GLOBAL_SCOPE_ID: NodeId = unsafe { NodeId(NonZeroU32::new_unchecked(1)) };
+pub const GLOBAL_SCOPE_ID: NodeId = unsafe { NodeId(NonZeroU32::new_unchecked(1)) };
 
 // Arena 分配器
 #[derive(Debug)]
-struct Arena<T> {
+pub struct Arena<T> {
     items: Vec<T>,
 }
 
@@ -37,6 +37,7 @@ impl<T> Arena<T> {
     }
 }
 
+//  引用自 AstNode 
 #[derive(Debug)]
 pub enum SymbolKind {
     Var(Arc<Mutex<VarDeclExpr>>), // 变量原始定义
@@ -47,52 +48,54 @@ pub enum SymbolKind {
 // symbol table 可以同时处理多个文件的 scope, 存在一个 global scope 管理所有的全局 scope, 符号注册到 global scope 时，define_ident 需要携带 package_name 保证符号的唯一性
 #[derive(Debug)]
 pub struct Symbol {
-    // 符号定义的原始值, 用于符号的查找, 不同 scope 下可以有相同的 define_ident
-    pub define_ident: String,
+    // local symbol 直接使用，global symbol 会携带 package ident
+    pub ident: String,
     pub kind: SymbolKind,
-    pub defined_in: NodeId,
+    pub defined_in: NodeId, // defined in scope
     pub pos: usize, // 符号定义的其实位置
 
     // local symbol 需要一些额外信息
-    pub unique_ident: String, // 全局唯一标识, 用于在全局符号表中快速定位符号信息
     pub is_capture: bool,     // 如果变量被捕获，则需要分配到堆中，避免作用域问题
 }
 
 #[derive(Debug)]
 pub struct FreeIdent {
-    in_parent_local: bool,   // 是否在父作用域中直接定义, 否则需要通过 envs[index] 访问
-    parent_env_index: usize, // 父作用域起传递作用, 通过 envs 参数向下传递
+    pub in_parent_local: bool,   // 是否在父作用域中直接定义, 否则需要通过 envs[index] 访问
+    pub parent_env_index: usize, // 父作用域起传递作用, 通过 envs 参数向下传递
 
-    index: usize, // free in frees index
-    ident: String,
+    pub index: usize, // free in frees index
+    pub ident: String,
+    pub kind: SymbolKind,
 }
 
 #[derive(Debug)]
 pub enum ScopeKind {
     Global,
-    Fn,
+    GlobalFn(Arc<Mutex<AstFnDef>>),
+    LocalFn(Arc<Mutex<AstFnDef>>),
     Local,
 }
 
 #[derive(Debug)]
-struct Scope {
-    parent: Option<NodeId>,              // 除了全局作用域外，每个作用域都有一个父作用域
-    symbols: Vec<NodeId>,                // 当前作用域中定义的符号列表
-    children: Vec<NodeId>,               // 子作用域列表
-    symbol_map: HashMap<String, NodeId>, // 符号名到符号ID的映射
-    range: (usize, usize),               // 作用域的范围, [start, end)
+pub struct Scope {
+    pub parent: Option<NodeId>,              // 除了全局作用域外，每个作用域都有一个父作用域
+    pub symbols: Vec<NodeId>,                // 当前作用域中定义的符号列表
+    pub children: Vec<NodeId>,               // 子作用域列表
+    pub symbol_map: HashMap<String, NodeId>, // 符号名到符号ID的映射
+
+    pub range: (usize, usize),               // 作用域的范围, [start, end)
 
     // 当前作用域是否为函数级别作用域
-    kind: ScopeKind,
+    pub kind: ScopeKind,
 
-    frees: HashMap<String, FreeIdent>, // fn scope 需要处理函数外的自由变量
+    pub frees: HashMap<String, FreeIdent>, // fn scope 需要处理函数外的自由变量
 }
 
 #[derive(Debug)]
 pub struct SymbolTable {
-    scopes: Arena<Scope>,     // 作用域列表, 根据 NodeId 索引
-    symbols: Arena<Symbol>,   // 符号列表, 根据 NodeId 索引
-    current_scope_id: NodeId, // ast 解析时记录当前作用域 id
+    pub scopes: Arena<Scope>,     // 作用域列表, 根据 NodeId 索引
+    pub symbols: Arena<Symbol>,   // 符号列表, 根据 NodeId 索引
+    pub current_scope_id: NodeId, // ast 解析时记录当前作用域 id
 }
 
 impl SymbolTable {
@@ -118,6 +121,14 @@ impl SymbolTable {
             symbols: Arena::new(),
             current_scope_id: global_scope_id,
         }
+    }
+
+    pub fn get_scope(&self) -> &Scope {
+        self.scopes.get(self.current_scope_id).unwrap()
+    }
+
+    pub fn find_scope(&self, scope_id: NodeId) -> Option<&Scope> {
+        self.scopes.get(scope_id)
     }
 
     // 创建新的作用域
@@ -164,24 +175,22 @@ impl SymbolTable {
     // 在当前作用域中定义符号
     pub fn define_symbol(
         &mut self,
-        unique_ident: String,
-        define_ident: String,
+        ident: String,
         kind: SymbolKind,
         pos: usize,
     ) -> Result<NodeId, String> {
         // 检查当前作用域是否已存在同名符号
         if let Some(scope) = self.scopes.get(self.current_scope_id) {
-            if scope.symbol_map.contains_key(&define_ident) {
-                return Err(format!("Symbol '{}' already defined in current scope", define_ident));
+            if scope.symbol_map.contains_key(&ident) {
+                return Err(format!("Symbol '{}' already defined in current scope", ident));
             }
         }
 
         let symbol = Symbol {
-            define_ident: define_ident.clone(),
+            ident: ident.clone(),
             kind,
             defined_in: self.current_scope_id,
             pos,
-            unique_ident: unique_ident.clone(),
             is_capture: false,
         };
 
@@ -190,20 +199,20 @@ impl SymbolTable {
         // 将符号添加到当前作用域
         if let Some(scope) = self.scopes.get_mut(self.current_scope_id) {
             scope.symbols.push(symbol_id);
-            scope.symbol_map.insert(define_ident, symbol_id);
+            scope.symbol_map.insert(ident, symbol_id);
         }
 
         Ok(symbol_id)
     }
 
     // 查找符号（包括父作用域）
-    pub fn lookup_symbol(&self, name: &str) -> Option<NodeId> {
+    pub fn lookup_symbol(&self, ident: &str) -> Option<NodeId> {
         let mut current = Some(self.current_scope_id);
 
         while let Some(scope_id) = current {
             if let Some(scope) = self.scopes.get(scope_id) {
                 // 在当前作用域中查找
-                if let Some(&symbol_id) = scope.symbol_map.get(name) {
+                if let Some(&symbol_id) = scope.symbol_map.get(ident) {
                     return Some(symbol_id);
                 }
                 // 继续查找父作用域
@@ -215,7 +224,47 @@ impl SymbolTable {
         None
     }
 
-    // 获取符号信息
+    pub fn find_global_fn(&self) -> Option<Arc<Mutex<AstFnDef>>> {
+        let mut current = Some(self.current_scope_id);
+        
+        while let Some(scope_id) = current {
+            if let Some(scope) = self.scopes.get(scope_id) {
+                match &scope.kind {
+                    ScopeKind::GlobalFn(fn_def) => return Some(fn_def.clone()),
+                    _ => current = scope.parent,
+                }
+            } else {
+                break;
+            }
+        }
+        None
+    }
+
+    pub fn find_symbol(&self, ident: &str, scope_id: NodeId) -> Option<NodeId> {
+        if let Some(scope) = self.scopes.get(scope_id) {
+            return scope.symbol_map.get(ident).cloned();
+        } else {
+            return None;
+        }
+    }
+
+    pub fn symbol_exists_in_scope(&self, ident: &str, scope_id: NodeId) -> bool {
+        if let Some(scope) = self.scopes.get(scope_id) {
+            return scope.symbol_map.contains_key(ident);
+        } else {
+            return false;
+        }
+    }
+
+    pub fn symbol_exists_in_current(&self, ident: &str) -> bool {
+        if let Some(scope) = self.scopes.get(self.current_scope_id) {
+            return scope.symbol_map.contains_key(ident);
+        } else {
+            return false;
+        }
+    }
+
+    // 获取符号信息(从当前 作用域)
     pub fn get_symbol(&self, id: NodeId) -> Option<&Symbol> {
         self.symbols.get(id)
     }
@@ -231,7 +280,7 @@ impl SymbolTable {
                     println!(
                         "{}  Symbol: {} ({:?})",
                         " ".repeat(indent),
-                        symbol.unique_ident,
+                        symbol.ident,
                         symbol.kind
                     );
                 }

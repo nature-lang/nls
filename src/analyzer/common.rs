@@ -2,6 +2,9 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use strum_macros::Display;
 
+use super::symbol::NodeId;
+
+
 #[derive(Debug, Clone)]
 pub struct PackageConfig {}
 
@@ -71,6 +74,44 @@ impl Type {
                 | TypeKind::CoroutineT
                 | TypeKind::Chan(..)
         )
+    }
+
+    pub fn is_integer(kind: &TypeKind) -> bool {
+        matches!(
+            kind,
+            TypeKind::Int
+                | TypeKind::Uint
+                | TypeKind::Int8
+                | TypeKind::Uint8
+                | TypeKind::Int16
+                | TypeKind::Uint16
+                | TypeKind::Int32
+                | TypeKind::Uint32
+                | TypeKind::Int64
+                | TypeKind::Uint64
+        )
+    }
+
+    pub fn is_float(kind: &TypeKind) -> bool {
+        matches!(kind, TypeKind::Float32 | TypeKind::Float64 | TypeKind::Float)
+    }
+
+    pub fn is_number(kind: &TypeKind) -> bool {
+        Self::is_integer(kind) || Self::is_float(kind)
+    }
+
+    pub fn is_impl_builtin_type(kind: &TypeKind) -> bool {
+        Self::is_number(kind)
+            || matches!(
+                kind,
+                TypeKind::Bool
+                    | TypeKind::String
+                    | TypeKind::Map(..)
+                    | TypeKind::Set(..)
+                    | TypeKind::Vec(..)
+                    | TypeKind::Chan(..)
+                    | TypeKind::CoroutineT
+            )
     }
 
     pub fn ptr_of(t: Type) -> Type {
@@ -254,6 +295,13 @@ impl TypeKind {
         !self.is_unknown()
     }
 }
+
+impl PartialEq for TypeKind {
+    fn eq(&self, other: &Self) -> bool {
+        std::mem::discriminant(self) == std::mem::discriminant(other)
+    }
+}
+
 // ast struct
 
 #[derive(Debug, Clone, PartialEq, Display)]
@@ -322,7 +370,7 @@ pub enum AstNode {
     Literal(TypeKind, String),            // (kind, value)
     Binary(ExprOp, Box<Expr>, Box<Expr>), // (op, left, right)
     Unary(ExprOp, Box<Expr>),             // (op, operand)
-    Ident(String),                        // ident
+    Ident(String, Option<NodeId>),        // (ident, symbol_id)
     As(Type, Box<Expr>),                  // (target_type, src)
     Is(Type, Box<Expr>),                  // (target_type, src)
     MatchIs(Type),                        // (target_type)
@@ -332,7 +380,7 @@ pub enum AstNode {
     MacroUla(Box<Expr>),     // (src)
     MacroReflectHash(Type),  // (target_type)
     MacroTypeEq(Type, Type), // (left_type, right_type)
-    MacroCoAsync(MacroCoAsyncExpr),
+    MacroAsync(MacroAsyncExpr),
     MacroCall(String, Vec<MacroArg>), // (ident, args)
     MacroDefault,
 
@@ -356,9 +404,9 @@ pub enum AstNode {
 
     // 未推断出具体表达式类型
     EmptyCurlyNew,
-    Access(Box<Expr>, Box<Expr>),                // (left, key)
-    Select(Box<Expr>, String),                   // (left, key)
-    VarDecl(String, Type, bool, Option<String>), // (ident, type_, be_capture, heap_ident)
+    AccessExpr(Box<Expr>, Box<Expr>),                // (left, key)
+    SelectExpr(Box<Expr>, String),                   // (left, key)
+    VarDecl(Arc<Mutex<VarDeclExpr>>), 
 
     // Statements
     Fake(Box<Expr>), // (expr)
@@ -366,24 +414,26 @@ pub enum AstNode {
     Break(Option<Box<Expr>>), // (expr)
     Continue,
     Import(ImportStmt),                                    // 比较复杂直接保留
-    VarTupleDestr(Box<TupleDestrExpr>, Box<Expr>),         // (tuple_destr, right)
+    VarTupleDestr(Vec<Box<Expr>>, Box<Expr>),         // (elements, right)
     Assign(Box<Expr>, Box<Expr>),                          // (left, right)
     Return(Option<Box<Expr>>),                             // (expr)
-    If(Box<Expr>, Vec<Box<Stmt>>, Option<Vec<Box<Stmt>>>), // (condition, consequent, alternate)
+    If(Box<Expr>, Vec<Box<Stmt>>, Vec<Box<Stmt>>), // (condition, consequent, alternate)
     Throw(Box<Expr>),
-    TryCatch(Box<Expr>, VarDeclExpr, Vec<Box<Stmt>>), // (try_expr, catch_err, catch_body)
+    TryCatch(Box<Expr>, Arc<Mutex<VarDeclExpr>>, Vec<Box<Stmt>>), // (try_expr, catch_err, catch_body)
     Let(Box<Expr>),                                   // (expr)
-    ForIterator(Box<Expr>, VarDeclExpr, Option<VarDeclExpr>, Vec<Box<Stmt>>), // (iterate, first, second, body)
+    ForIterator(Box<Expr>, Arc<Mutex<VarDeclExpr>>, Option<Arc<Mutex<VarDeclExpr>>>, Vec<Box<Stmt>>), // (iterate, first, second, body)
 
     ForCond(Box<Expr>, Vec<Box<Stmt>>),                            // (condition, body)
     ForTradition(Box<Stmt>, Box<Expr>, Box<Stmt>, Vec<Box<Stmt>>), // (init, cond, update, body)
 
     // 既可以作为表达式，也可以作为语句
     Call(AstCall),
-    Catch(Box<Expr>, VarDeclExpr, Vec<Box<Stmt>>), // (try_expr, catch_err, catch_body)
+    Catch(Box<Expr>, Arc<Mutex<VarDeclExpr>>, Vec<Box<Stmt>>), // (try_expr, catch_err, catch_body)
     Match(Option<Box<Expr>>, Vec<MatchCase>),      // (subject, cases)
 
-    VarDef(Arc<Mutex<VarDeclExpr>>, Box<Expr>),                        // (var_decl, right)
+    Select(Vec<SelectCase>, bool, i16, i16), // (cases, has_default, send_count, recv_count)
+
+    VarDef(Arc<Mutex<VarDeclExpr>>, Box<Expr>), // (var_decl, right)
     TypeAlias(Arc<Mutex<TypeAliasStmt>>),
     FnDef(Arc<Mutex<AstFnDef>>),
 }
@@ -393,8 +443,8 @@ impl AstNode {
         matches!(
             self,
             AstNode::Ident(..)
-                | AstNode::Access(..)
-                | AstNode::Select(..)
+                | AstNode::AccessExpr(..)
+                | AstNode::SelectExpr(..)
                 | AstNode::MapAccess(..)
                 | AstNode::VecAccess(..)
                 | AstNode::EnvAccess(..)
@@ -439,7 +489,7 @@ impl Expr {
             end,
             type_: Type::default(),
             target_type: Type::default(),
-            node: AstNode::Ident(literal),
+            node: AstNode::Ident(literal, None),
         }
     }
 }
@@ -447,6 +497,7 @@ impl Expr {
 #[derive(Debug, Clone)]
 pub struct VarDeclExpr {
     pub ident: String,
+    pub symbol_id: Option<NodeId>, // unique symbol table id
     pub symbol_start: usize, // 符号定义位置
     pub symbol_end: usize,   // 符号定义位置
     pub type_: Type,
@@ -471,9 +522,9 @@ pub struct StructNewProperty {
 }
 
 #[derive(Debug, Clone)]
-pub struct MacroCoAsyncExpr {
-    pub closure_fn: Box<AstFnDef>,
-    pub closure_fn_void: Box<AstFnDef>,
+pub struct MacroAsyncExpr {
+    pub closure_fn: Arc<Mutex<AstFnDef>>,
+    pub closure_fn_void: Arc<Mutex<AstFnDef>>,
     pub origin_call: Box<AstCall>,
     pub flag_expr: Option<Box<Expr>>,
     pub return_type: Type,
@@ -502,13 +553,13 @@ pub struct TupleDestrExpr {
 pub struct ImportStmt {
     pub file: Option<String>,
     pub ast_package: Option<Vec<String>>,
-    pub as_name: Option<String>,
-    pub module_type: u8,
+    pub as_name: String,
+    pub package_type: u8,
     pub full_path: String,
     pub package_conf: Option<PackageConfig>,
     pub package_dir: String,
     pub use_links: bool,
-    pub module_ident: String,
+    pub package_ident: String,
 }
 
 #[derive(Debug, Clone)]
@@ -533,20 +584,29 @@ pub struct TypeAliasStmt {
     pub type_: Type,
     pub symbol_start: usize,
     pub symbol_end: usize,
+    pub symbol_id: Option<NodeId>,
 }
 
 #[derive(Debug, Clone)]
 pub struct MatchCase {
     pub cond_list: Vec<Box<Expr>>,
     pub is_default: bool,
-    pub handle_expr: Option<Box<Expr>>,
-    pub handle_body: Option<Vec<Box<Stmt>>>,
+    pub handle_body: Vec<Box<Stmt>>,
+}
+
+#[derive(Debug, Clone)]
+pub struct SelectCase {
+    pub on_call: Option<AstCall>,
+    pub recv_var: Option<Arc<Mutex<VarDeclExpr>>>,
+    pub is_recv: bool,
+    pub is_default: bool,
+    pub handle_body: Vec<Box<Stmt>>,
 }
 
 #[derive(Debug, Clone)]
 pub struct AstFnDef {
-    pub symbol_name: String,
-    pub closure_name: Option<String>,
+    pub symbol_name: String, 
+    pub symbol_id: Option<NodeId>,
     pub return_type: Type,
     pub params: Vec<Arc<Mutex<VarDeclExpr>>>,
     pub rest_param: bool,
@@ -561,12 +621,13 @@ pub struct AstFnDef {
     pub be_capture_locals: Vec<String>,
     pub type_: Type,
     pub generic_assign: Option<HashMap<String, Type>>,
-    pub global_parent: Option<Box<AstFnDef>>,
-    pub local_children: Vec<Box<AstFnDef>>,
+    pub global_parent: Option<Arc<Mutex<AstFnDef>>>,
+    pub local_children: Vec<Arc<Mutex<AstFnDef>>>,
+    pub is_closure: bool, // fn 如果引用了外部的 var, 就需要编译成闭包
     pub is_local: bool,
     pub is_tpl: bool,
     pub is_generics: bool,
-    pub is_co_async: bool,
+    pub is_async: bool,
     pub is_private: bool,
     pub break_target_types: Vec<Type>,
     pub linkid: Option<String>,
@@ -587,7 +648,7 @@ impl Default for AstFnDef {
     fn default() -> Self {
         Self {
             symbol_name: "".to_string(),
-            closure_name: None,
+            symbol_id: None,
             return_type: Type::new(TypeKind::Void),
             params: Vec::new(),
             rest_param: false,
@@ -604,11 +665,12 @@ impl Default for AstFnDef {
             generic_assign: None,
             global_parent: None,
             local_children: Vec::new(),
+            is_closure: false,
             is_local: false,
             is_tpl: false,
             linkid: None,
             is_generics: false,
-            is_co_async: false,
+            is_async: false,
             is_private: false,
             break_target_types: Vec::new(),
             fn_name: None,

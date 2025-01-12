@@ -5,6 +5,10 @@ use std::collections::HashMap;
 use std::error::Error;
 use std::fmt;
 use std::sync::{Arc, Mutex};
+use crate::semantic_token::semantic_token_type_index;
+use tower_lsp::lsp_types::SemanticTokenType; 
+
+const LOCAL_FN_NAME: &str = "lambda";
 
 pub struct SyntaxError(usize, usize, String);
 
@@ -133,9 +137,11 @@ impl SyntaxPrecedence {
 }
 
 pub struct Syntax {
-    tokens: Vec<Token>,
+    token_db: Vec<Token>,
+    token_indexes: Vec<usize>,
     current: usize, // token index
 
+    lambda_index: usize, // default 0
     errors: Vec<AnalyzerError>,
 
     // parser 阶段辅助记录当前的 type_param, 当进入到 fn body 或者 struct def 时可以准确识别当前是 type param 还是 alias, 仅仅使用到 key
@@ -151,33 +157,53 @@ pub struct Syntax {
 
 impl Syntax {
     // static method new, Syntax::new(tokens)
-    pub fn new(tokens: Vec<Token>) -> Self {
+    pub fn new(token_db: Vec<Token>, token_indexes: Vec<usize>) -> Self {
         Self {
-            tokens: tokens,
+            token_db: token_db,
+            token_indexes: token_indexes,
             current: 0,
             type_params_table: HashMap::new(),
             match_cond: false,
             match_subject: false,
             errors: Vec::new(),
+            lambda_index: 0,
         }
+    }
+
+    fn set_current_token_type(&mut self, token_type: SemanticTokenType) {
+        if self.current >= self.token_indexes.len() {
+            panic!("syntax::peek: current index out of range");
+        }
+
+        self.token_db[self.token_indexes[self.current]].semantic_token_type = semantic_token_type_index(token_type);
     }
 
     fn advance(&mut self) -> &Token {
-        // assert!(
-        //     self.current + 1 < self.tokens.len(),
-        //     "Syntax::advance: current index out of range"
-        // );
-        let token = &self.tokens[self.current];
+        assert!(self.current + 1 < self.token_indexes.len(), "Syntax::advance: current index out of range");
+
+        let token_index = self.token_indexes[self.current];
 
         self.current += 1;
-        return token;
+        return &self.token_db[token_index];
+    }
+
+    // 当前符号不是 EOF 时才能 advance
+    fn safe_advance(&mut self) -> Result<&Token, SyntaxError> {
+        let token_index = self.token_indexes[self.current];
+
+        if self.token_db[token_index].token_type == TokenType::Eof {
+            return Err(SyntaxError(self.peek().start, self.peek().end, "unexpected end of file".to_string()));
+        }
+
+        self.current += 1;
+        return Ok(&self.token_db[token_index]);
     }
 
     fn peek(&self) -> &Token {
-        if self.current >= self.tokens.len() {
+        if self.current >= self.token_indexes.len() {
             panic!("syntax::peek: current index out of range");
         }
-        return &self.tokens[self.current];
+        return &self.token_db[self.token_indexes[self.current]];
     }
 
     fn prev(&self) -> Option<&Token> {
@@ -185,7 +211,7 @@ impl Syntax {
             return None;
         }
 
-        return Some(&self.tokens[self.current - 1]);
+        return Some(&self.token_db[self.token_indexes[self.current - 1]]);
     }
 
     fn is(&self, token_type: TokenType) -> bool {
@@ -202,23 +228,27 @@ impl Syntax {
 
     fn must(&mut self, expect: TokenType) -> Result<&Token, SyntaxError> {
         let token = self.peek().clone(); // 对 self 进行了不可变借用, clone 让借用立刻结束
-        self.advance();
 
         if token.token_type != expect {
             let message = format!("expected '{}'", expect.to_string());
-
             return Err(SyntaxError(token.start, token.end, message));
         }
+
+        if self.current + 1 >= self.token_indexes.len() {
+            return Err(SyntaxError(token.start, token.end, "unexpected end of file".to_string()));
+        }
+
+        self.advance();
 
         return Ok(self.prev().unwrap());
     }
 
     // 对应 parser_next
     fn next(&self, step: usize) -> Option<&Token> {
-        if self.current + step >= self.tokens.len() {
+        if self.current + step >= self.token_indexes.len() {
             return None;
         }
-        Some(&self.tokens[self.current + step])
+        Some(&self.token_db[self.token_indexes[self.current + step]])
     }
 
     // 对应 parser_next_is
@@ -468,13 +498,13 @@ impl Syntax {
         )
     }
 
-    pub fn parser(&mut self) -> (Vec<Box<Stmt>>, Vec<AnalyzerError>) {
+    pub fn parser(&mut self) -> (Vec<Box<Stmt>>, Vec<Token>, Vec<AnalyzerError>) {
         self.current = 0;
 
         let mut stmt_list = Vec::new();
 
         while !self.is(TokenType::Eof) {
-            match self.parser_stmt() {
+            match self.parser_global_stmt() {
                 Ok(stmt) => stmt_list.push(stmt),
                 Err(e) => {
                     self.errors.push(AnalyzerError {
@@ -485,7 +515,7 @@ impl Syntax {
 
                     // 查找到下一个同步点
                     let found = self.synchronize(0);
-                    if !found {
+                    if !found && !self.is(TokenType::Eof) {
                         // 当前字符无法被表达式解析，且 sync 查找下一个可用同步点失败，直接跳过当前字符
                         self.advance();
                     }
@@ -493,14 +523,22 @@ impl Syntax {
             }
         }
 
-        return (stmt_list, self.errors.clone());
+        return (stmt_list, self.token_db.clone(), self.errors.clone());
     }
 
     fn parser_body(&mut self) -> Result<Vec<Box<Stmt>>, SyntaxError> {
         let mut stmt_list = Vec::new();
         self.must(TokenType::LeftCurly)?;
 
-        while !self.is(TokenType::RightCurly) && !self.is(TokenType::Eof) {
+        while !self.is(TokenType::RightCurly) {
+            if self.is(TokenType::Eof) {
+                return Err(SyntaxError(
+                    self.peek().start,
+                    self.peek().end,
+                    "unexpected end of file, expected '}'".to_string(),
+                ));
+            }
+
             match self.parser_stmt() {
                 Ok(stmt) => stmt_list.push(stmt),
                 Err(e) => {
@@ -510,7 +548,10 @@ impl Syntax {
                         message: e.2,
                     });
 
-                    self.synchronize(1);
+                    let found = self.synchronize(1);
+                    if !found && !self.is(TokenType::Eof) {
+                        self.advance();
+                    }
                 }
             }
         }
@@ -519,19 +560,12 @@ impl Syntax {
         return Ok(stmt_list);
     }
 
-    // fn advance_line(&mut self) {
-    //     let current_line = self.peek().line;
-
-    //     while !self.is(TokenType::Eof) && self.peek().line == current_line {
-    //         self.advance();
-    //     }
-    // }
 
     fn synchronize(&mut self, current_brace_level: isize) -> bool {
         let mut brace_level = current_brace_level;
 
         loop {
-            let token = self.peek().token_type.clone();
+            let token: TokenType = self.peek().token_type.clone();
 
             // 提前返回的情况
             match token {
@@ -545,23 +579,30 @@ impl Syntax {
 
                 // 在当前层级遇到关键字或基本类型
                 _ if brace_level == current_brace_level => {
-                    if matches!(
-                        token,
-                        TokenType::Fn
-                            | TokenType::Var
-                            | TokenType::Return
-                            | TokenType::If
-                            | TokenType::For
-                            | TokenType::Match
-                            | TokenType::Try
-                            | TokenType::Catch
-                            | TokenType::Continue
-                            | TokenType::Break
-                            | TokenType::Import
-                            | TokenType::Type
-                    ) || self.is_basic_type()
-                    {
-                        return true;
+                    // brace_level = 0 时只识别全局级别的语句
+                    if brace_level == 0 {
+                        if matches!(token, TokenType::Fn | TokenType::Var | TokenType::Import | TokenType::Type) || self.is_basic_type() {
+                            return true;
+                        }
+                    } else {
+                        // brace_level > 0 时可以识别函数体内的所有语句类型
+                        if matches!(
+                            token,
+                            TokenType::Var
+                                | TokenType::Return
+                                | TokenType::If
+                                | TokenType::For
+                                | TokenType::Match
+                                | TokenType::Try
+                                | TokenType::Catch
+                                | TokenType::Continue
+                                | TokenType::Break
+                                | TokenType::Import
+                                | TokenType::Type
+                        ) || self.is_basic_type()
+                        {
+                            return true;
+                        }
                     }
                 }
                 _ => {}
@@ -573,6 +614,7 @@ impl Syntax {
                 TokenType::RightCurly => {
                     brace_level -= 1;
                     if brace_level < current_brace_level {
+                        // 如果小于当前层级，则说明查找同步点失败。
                         return false;
                     }
                 }
@@ -580,6 +622,9 @@ impl Syntax {
             }
 
             self.advance();
+            if self.is(TokenType::Eof) {
+                return false;
+            }
         }
     }
 
@@ -597,14 +642,12 @@ impl Syntax {
 
         // 基本类型 int/float/bool/string/void/var
         if self.is_basic_type() {
+            // 已经明确了 current 是 basic type token, 才能使用 advance
             let type_token = self.advance();
             t.kind = token_to_type_kind(&type_token.token_type);
             t.impl_ident = Some(t.kind.to_string());
 
-            if matches!(
-                type_token.token_type,
-                TokenType::Int | TokenType::Uint | TokenType::Float
-            ) {
+            if matches!(type_token.token_type, TokenType::Int | TokenType::Uint | TokenType::Float) {
                 t.origin_ident = Some(type_token.literal.clone());
                 t.origin_type_kind = t.kind.clone();
             }
@@ -707,13 +750,10 @@ impl Syntax {
             self.must(TokenType::Comma)?;
             let length_token = self.must(TokenType::IntLiteral)?;
 
-            let length = length_token.literal.parse::<u64>().map_err(|_| {
-                SyntaxError(
-                    length_token.start,
-                    length_token.end,
-                    "array length must be a valid integer".to_string(),
-                )
-            })?;
+            let length = length_token
+                .literal
+                .parse::<u64>()
+                .map_err(|_| SyntaxError(length_token.start, length_token.end, "array length must be a valid integer".to_string()))?;
 
             if length == 0 {
                 return Err(SyntaxError(
@@ -778,7 +818,7 @@ impl Syntax {
 
             while !self.is(TokenType::RightCurly) {
                 let field_type = self.parser_type()?;
-                let field_name = self.advance().literal.clone();
+                let field_name = self.must(TokenType::Ident)?.literal.clone();
 
                 let mut default_value = None;
 
@@ -850,7 +890,8 @@ impl Syntax {
 
         // ident foo = 12
         if self.is(TokenType::Ident) {
-            let first = self.advance().clone();
+            self.set_current_token_type(SemanticTokenType::TYPE);
+            let first = self.must(TokenType::Ident)?.clone();
 
             // handle param
             if !self.type_params_table.is_empty() && self.type_params_table.contains_key(&first.literal) {
@@ -863,7 +904,8 @@ impl Syntax {
             // handle alias (package.ident)
             let mut second = None;
             if self.consume(TokenType::Dot) {
-                second = Some(self.advance());
+                self.set_current_token_type(SemanticTokenType::TYPE);
+                second = Some(self.must(TokenType::Ident)?);
             }
 
             let ident = if let Some(second_token) = second {
@@ -873,11 +915,7 @@ impl Syntax {
             };
             let mut alias = TypeAlias {
                 ident: ident.literal,
-                import_as: if second.is_some() {
-                    Some(first.literal.clone())
-                } else {
-                    None
-                },
+                import_as: if second.is_some() { Some(first.literal.clone()) } else { None },
 
                 args: None,
             };
@@ -904,11 +942,7 @@ impl Syntax {
             return Ok(t);
         }
 
-        return Err(SyntaxError(
-            self.peek().start,
-            self.peek().end,
-            "Type definition exception".to_string(),
-        ));
+        return Err(SyntaxError(self.peek().start, self.peek().end, "Type definition exception".to_string()));
     }
 
     fn parser_type(&mut self) -> Result<Type, SyntaxError> {
@@ -957,6 +991,7 @@ impl Syntax {
         let mut stmt = self.stmt_new();
 
         self.must(TokenType::Type)?;
+        self.set_current_token_type(SemanticTokenType::TYPE);
         let ident_token = self.must(TokenType::Ident)?;
         let alias_ident = ident_token.clone();
 
@@ -964,18 +999,14 @@ impl Syntax {
         let mut alias_args = Vec::new();
         if self.consume(TokenType::LeftAngle) {
             if self.is(TokenType::RightAngle) {
-                return Err(SyntaxError(
-                    self.peek().start,
-                    self.peek().end,
-                    "type alias params cannot be empty".to_string(),
-                ));
+                return Err(SyntaxError(self.peek().start, self.peek().end, "type alias params cannot be empty".to_string()));
             }
 
             // 临时保存当前的 type_params_table
             self.type_params_table = HashMap::new();
 
             loop {
-                let ident = self.advance().literal.clone();
+                let ident = self.must(TokenType::Ident)?.literal.clone();
                 let mut param = GenericsParam::new(ident.clone());
 
                 // 可选的泛型类型约束 <T:t1|t2, U:t1|t2>
@@ -1016,6 +1047,7 @@ impl Syntax {
             symbol_end: alias_ident.end,
             params: if alias_args.is_empty() { None } else { Some(alias_args) },
             type_: alias_type,
+            symbol_id: None,
         })));
 
         Ok(stmt)
@@ -1030,7 +1062,7 @@ impl Syntax {
         // 根据左值表达式类型构造 TypeAlias
         let alias = match &left_expr.node {
             // 简单标识符: foo
-            AstNode::Ident(ident) => {
+            AstNode::Ident(ident, _) => {
                 t.origin_ident = Some(ident.clone());
                 t.origin_type_kind = TypeKind::Alias(Box::new(TypeAlias::default()));
 
@@ -1042,8 +1074,8 @@ impl Syntax {
             }
 
             // 包选择器: pkg.foo
-            AstNode::Select(left, key) => {
-                if let AstNode::Ident(left_ident) = &left.node {
+            AstNode::SelectExpr(left, key) => {
+                if let AstNode::Ident(left_ident, _) = &left.node {
                     t.origin_ident = Some(key.clone());
                     t.origin_type_kind = TypeKind::Alias(Box::new(TypeAlias::default()));
 
@@ -1077,6 +1109,7 @@ impl Syntax {
             symbol_end: var_ident.end,
             be_capture: false,
             heap_ident: None,
+            symbol_id: None,
         })))
     }
 
@@ -1118,7 +1151,7 @@ impl Syntax {
     fn parser_binary(&mut self, left: Box<Expr>) -> Result<Box<Expr>, SyntaxError> {
         let mut expr = self.expr_new();
 
-        let operator_token = self.advance().clone();
+        let operator_token = self.safe_advance()?.clone();
 
         // 获取运算符优先级
         let precedence = self.find_rule(operator_token.token_type.clone()).infix_precedence;
@@ -1135,10 +1168,10 @@ impl Syntax {
 
         // 必须是标识符或选择器表达式
         match &left.node {
-            AstNode::Ident(_) => (),
-            AstNode::Select(left, _) => {
+            AstNode::Ident(..) => (),
+            AstNode::SelectExpr(left, _) => {
                 // 选择器的左侧必须是标识符
-                if !matches!(left.node, AstNode::Ident(_)) {
+                if !matches!(left.node, AstNode::Ident(..)) {
                     return false;
                 }
             }
@@ -1146,7 +1179,7 @@ impl Syntax {
         }
 
         // 跳过 <
-        self.advance();
+        self.must(TokenType::LeftAngle).unwrap();
 
         // 尝试解析第一个类型
         if let Err(_) = self.parser_type() {
@@ -1272,20 +1305,20 @@ impl Syntax {
 
     fn parser_unary(&mut self) -> Result<Box<Expr>, SyntaxError> {
         let mut expr = self.expr_new();
-        let operator_token = self.advance();
+        let operator_token = self.safe_advance()?.clone();
 
         let operator = match operator_token.token_type {
             TokenType::Not => ExprOp::Not,
             TokenType::Minus => {
                 // 检查是否可以直接合并成字面量
                 if self.is(TokenType::IntLiteral) {
-                    let int_token = self.advance();
+                    let int_token = self.must(TokenType::IntLiteral)?;
                     expr.node = AstNode::Literal(TypeKind::Int, format!("-{}", int_token.literal));
                     return Ok(expr);
                 }
 
                 if self.is(TokenType::FloatLiteral) {
-                    let float_token = self.advance();
+                    let float_token = self.must(TokenType::FloatLiteral)?;
                     expr.node = AstNode::Literal(TypeKind::Float, format!("-{}", float_token.literal));
                     return Ok(expr);
                 }
@@ -1323,11 +1356,12 @@ impl Syntax {
             type_: Type::new(TypeKind::Unknown), // 实际上就是 error type
             be_capture: false,
             heap_ident: None,
+            symbol_id: None,
         };
 
         let catch_body = self.parser_body()?;
 
-        expr.node = AstNode::Catch(left, catch_err, catch_body);
+        expr.node = AstNode::Catch(left, Arc::new(Mutex::new(catch_err)), catch_body);
 
         Ok(expr)
     }
@@ -1411,7 +1445,7 @@ impl Syntax {
 
     fn parser_literal(&mut self) -> Result<Box<Expr>, SyntaxError> {
         let mut expr = self.expr_new();
-        let literal_token = self.advance();
+        let literal_token = self.safe_advance()?;
 
         let kind = token_to_type_kind(&literal_token.token_type);
 
@@ -1421,7 +1455,7 @@ impl Syntax {
     }
 
     fn parser_is_tuple_typedecl(&self, current: usize) -> bool {
-        let t = &self.tokens[current];
+        let t = &self.token_db[self.token_indexes[current]];
         assert_eq!(t.token_type, TokenType::LeftParen, "tuple type decl start left param");
 
         // param is left paren, so close + 1 = 1,
@@ -1430,7 +1464,7 @@ impl Syntax {
 
         while t.token_type != TokenType::Eof {
             pos += 1;
-            let t = &self.tokens[pos];
+            let t = &self.token_db[self.token_indexes[pos]];
 
             if t.token_type == TokenType::LeftParen {
                 close += 1;
@@ -1449,7 +1483,7 @@ impl Syntax {
         }
 
         // (...) ident; ) 的 下一符号如果是 ident 就表示 (...) 里面是 tuple typedecl
-        let t = &self.tokens[pos + 1];
+        let t = &self.token_db[self.token_indexes[pos + 1]];
         if t.token_type != TokenType::Ident {
             return false;
         }
@@ -1461,7 +1495,7 @@ impl Syntax {
         let mut expr = self.expr_new();
         let ident_token = self.must(TokenType::Ident)?;
 
-        expr.node = AstNode::Ident(ident_token.literal.clone());
+        expr.node = AstNode::Ident(ident_token.literal.clone(), None);
 
         Ok(expr)
     }
@@ -1473,7 +1507,7 @@ impl Syntax {
         let key = self.parser_expr()?;
         self.must(TokenType::RightSquare)?;
 
-        expr.node = AstNode::Access(left, key);
+        expr.node = AstNode::AccessExpr(left, key);
 
         Ok(expr)
     }
@@ -1484,7 +1518,7 @@ impl Syntax {
         self.must(TokenType::Dot)?;
 
         let property_token = self.must(TokenType::Ident)?;
-        expr.node = AstNode::Select(left, property_token.literal.clone());
+        expr.node = AstNode::SelectExpr(left, property_token.literal.clone());
 
         Ok(expr)
     }
@@ -1549,6 +1583,7 @@ impl Syntax {
 
     fn parser_if_stmt(&mut self) -> Result<Box<Stmt>, SyntaxError> {
         let mut stmt = self.stmt_new();
+
         self.must(TokenType::If)?;
 
         let condition = self.parser_expr_with_precedence()?;
@@ -1561,14 +1596,10 @@ impl Syntax {
                 self.parser_body()?
             }
         } else {
-            Vec::new()
+            Vec::new() // default empty vec
         };
 
-        stmt.node = AstNode::If(
-            condition,
-            consequent,
-            if alternate.is_empty() { None } else { Some(alternate) },
-        );
+        stmt.node = AstNode::If(condition, consequent, alternate);
 
         Ok(stmt)
     }
@@ -1577,17 +1608,13 @@ impl Syntax {
         let mut semicolon_count = 0;
         let mut close = 0;
         let mut pos = self.current;
-        let current_line = self.tokens[pos].line;
+        let current_line = self.token_db[self.token_indexes[pos]].line;
 
-        while pos < self.tokens.len() {
-            let t = &self.tokens[pos];
+        while pos < self.token_indexes.len() {
+            let t = &self.token_db[self.token_indexes[pos]];
 
             if t.token_type == TokenType::Eof {
-                return Err(SyntaxError(
-                    self.peek().start,
-                    self.peek().end,
-                    "unexpected end of file".to_string(),
-                ));
+                return Err(SyntaxError(self.peek().start, self.peek().end, "unexpected end of file".to_string()));
             }
 
             if close == 0 && t.token_type == TokenType::StmtEof {
@@ -1658,11 +1685,7 @@ impl Syntax {
         }
 
         // package.ident foo = xxx
-        if self.is(TokenType::Ident)
-            && self.next_is(1, TokenType::Dot)
-            && self.next_is(2, TokenType::Ident)
-            && self.next_is(3, TokenType::Ident)
-        {
+        if self.is(TokenType::Ident) && self.next_is(1, TokenType::Dot) && self.next_is(2, TokenType::Ident) && self.next_is(3, TokenType::Ident) {
             return true;
         }
 
@@ -1672,11 +1695,7 @@ impl Syntax {
         }
 
         // package.ident|i8 foo = xxx
-        if self.is(TokenType::Ident)
-            && self.next_is(1, TokenType::Dot)
-            && self.next_is(2, TokenType::Ident)
-            && self.next_is(3, TokenType::Or)
-        {
+        if self.is(TokenType::Ident) && self.next_is(1, TokenType::Dot) && self.next_is(2, TokenType::Ident) && self.next_is(3, TokenType::Or) {
             return true;
         }
 
@@ -1686,11 +1705,7 @@ impl Syntax {
         }
 
         // person.foo<[i8]>
-        if self.is(TokenType::Ident)
-            && self.next_is(1, TokenType::Dot)
-            && self.next_is(2, TokenType::Ident)
-            && self.next_is(3, TokenType::LeftAngle)
-        {
+        if self.is(TokenType::Ident) && self.next_is(1, TokenType::Dot) && self.next_is(2, TokenType::Ident) && self.next_is(3, TokenType::LeftAngle) {
             return true;
         }
 
@@ -1704,7 +1719,8 @@ impl Syntax {
     }
 
     fn parser_for_stmt(&mut self) -> Result<Box<Stmt>, SyntaxError> {
-        self.advance();
+        self.must(TokenType::For)?;
+
         let mut stmt = self.stmt_new();
 
         // 通过找 ; 号的形式判断, 必须要有两个 ; 才会是 tradition
@@ -1734,19 +1750,21 @@ impl Syntax {
                 symbol_start: first_ident.start,
                 symbol_end: first_ident.end,
                 be_capture: false,
+                symbol_id: None,
                 heap_ident: None,
             };
 
             let second = if self.consume(TokenType::Comma) {
                 let second_ident = self.must(TokenType::Ident)?;
-                Some(VarDeclExpr {
+                Some(Arc::new(Mutex::new(VarDeclExpr {
                     type_: Type::new(TypeKind::Unknown),
                     ident: second_ident.literal.clone(),
                     symbol_start: second_ident.start,
                     symbol_end: second_ident.end,
                     be_capture: false,
                     heap_ident: None,
-                })
+                    symbol_id: None,
+                })))
             } else {
                 None
             };
@@ -1755,7 +1773,7 @@ impl Syntax {
             let iterate = self.parser_precedence_expr(SyntaxPrecedence::TypeCast, TokenType::Unknown)?;
             let body = self.parser_body()?;
 
-            stmt.node = AstNode::ForIterator(iterate, first, second, body);
+            stmt.node = AstNode::ForIterator(iterate, Arc::new(Mutex::new(first)), second, body);
 
             return Ok(stmt);
         }
@@ -1782,21 +1800,13 @@ impl Syntax {
         }
 
         // 复合赋值
-        let t = self.advance().clone();
+        let t = self.safe_advance()?.clone();
         if !t.is_complex_assign() {
-            return Err(SyntaxError(
-                t.start,
-                t.end,
-                format!("assign={} token exception", t.token_type),
-            ));
+            return Err(SyntaxError(t.start, t.end, format!("expected '=' actual '{}'", t.token_type)));
         }
 
         let mut right = self.expr_new();
-        right.node = AstNode::Binary(
-            token_to_expr_op(&t.token_type),
-            left.clone(),
-            self.parser_expr_with_precedence()?,
-        );
+        right.node = AstNode::Binary(token_to_expr_op(&t.token_type), left.clone(), self.parser_expr_with_precedence()?);
 
         stmt.node = AstNode::Assign(left, right);
 
@@ -1809,11 +1819,7 @@ impl Syntax {
         // 处理函数调用语句
         if let AstNode::Call(call) = left.node {
             if self.is(TokenType::Equal) {
-                return Err(SyntaxError(
-                    self.peek().start,
-                    self.peek().end,
-                    "call expr cannot assign".to_string(),
-                ));
+                return Err(SyntaxError(self.peek().start, self.peek().end, "call expr cannot assign".to_string()));
             }
 
             let mut stmt = self.stmt_new();
@@ -1838,11 +1844,7 @@ impl Syntax {
 
         // 检查表达式完整性
         if self.is_stmt_eof() {
-            return Err(SyntaxError(
-                self.peek().start,
-                self.peek().end,
-                "expr incompleteness".to_string(),
-            ));
+            return Err(SyntaxError(self.peek().start, self.peek().end, "expr incompleteness".to_string()));
         }
 
         // 处理赋值语句
@@ -1873,7 +1875,7 @@ impl Syntax {
 
     fn parser_return_stmt(&mut self) -> Result<Box<Stmt>, SyntaxError> {
         let mut stmt = self.stmt_new();
-        self.advance();
+        self.must(TokenType::Return)?;
 
         let expr = if !self.is_stmt_eof() && !self.is(TokenType::RightCurly) {
             Some(self.parser_expr()?)
@@ -1887,9 +1889,9 @@ impl Syntax {
 
     fn parser_import_stmt(&mut self) -> Result<Box<Stmt>, SyntaxError> {
         let mut stmt = self.stmt_new();
-        self.advance();
+        self.must(TokenType::Import)?; 
 
-        let token = self.advance();
+        let token = self.safe_advance()?.clone();
         let (file, ast_package) = if token.token_type == TokenType::StringLiteral {
             (Some(token.literal.clone()), None)
         } else if token.token_type == TokenType::Ident {
@@ -1900,37 +1902,31 @@ impl Syntax {
             }
             (None, Some(package))
         } else {
-            return Err(SyntaxError(
-                token.start,
-                token.end,
-                "import token must be string or ident".to_string(),
-            ));
+            return Err(SyntaxError(token.start, token.end, "import token must be string or ident".to_string()));
         };
 
         let as_name = if self.consume(TokenType::As) {
-            let t = self.advance();
+            let t = self.safe_advance()?.clone();
+
             if !matches!(t.token_type, TokenType::Ident | TokenType::ImportStar) {
-                return Err(SyntaxError(
-                    t.start,
-                    t.end,
-                    "import as token must be ident or *".to_string(),
-                ));
+                return Err(SyntaxError(t.start, t.end, "import as token must be ident or *".to_string()));
             }
-            Some(t.literal.clone())
+            t.literal.clone()
         } else {
-            None
+            // 使用 ast_package 的最后一个元素作为 as_name
+            ast_package.as_ref().unwrap().last().unwrap().clone()
         };
 
         stmt.node = AstNode::Import(ImportStmt {
             file,
             ast_package,
             as_name,
-            module_type: 0,
+            package_type: 0,
             full_path: String::new(),
             package_conf: None,
             package_dir: String::new(),
             use_links: false,
-            module_ident: String::new(),
+            package_ident: String::new(),
         });
 
         Ok(stmt)
@@ -2019,9 +2015,14 @@ impl Syntax {
         fndef.start = start;
         fndef.end = end;
 
-        // parse ident
         if self.is(TokenType::Ident) {
-            let name = self.advance().literal.clone();
+            // fn expr 不能包含名称
+            return Err(SyntaxError(self.peek().start, self.peek().end, "local fn must be anonymous".to_string()));
+        } else {
+            // gen unique lambda name
+            let name = format!("{}{}", LOCAL_FN_NAME, self.lambda_index);
+            self.lambda_index += 1;
+
             fndef.symbol_name = name.clone();
             fndef.fn_name = Some(name);
         }
@@ -2066,14 +2067,14 @@ impl Syntax {
         Ok(expr)
     }
 
-    fn parser_tuple_destr(&mut self) -> Result<TupleDestrExpr, SyntaxError> {
+    fn parser_tuple_destr(&mut self) -> Result<Vec<Box<Expr>>, SyntaxError> {
         self.must(TokenType::LeftParen)?;
 
         let mut elements = Vec::new();
         loop {
             let element = if self.is(TokenType::LeftParen) {
                 let mut expr = self.expr_new();
-                expr.node = AstNode::TupleDestr(self.parser_tuple_destr()?.elements);
+                expr.node = AstNode::TupleDestr(self.parser_tuple_destr()?);
                 expr
             } else {
                 let expr = self.parser_expr()?;
@@ -2098,23 +2099,31 @@ impl Syntax {
 
         self.must(TokenType::RightParen)?;
 
-        Ok(TupleDestrExpr { elements })
+        Ok(elements)
     }
 
-    fn parser_var_tuple_destr(&mut self) -> Result<TupleDestrExpr, SyntaxError> {
+    fn parser_var_tuple_destr(&mut self) -> Result<Vec<Box<Expr>>, SyntaxError> {
         self.must(TokenType::LeftParen)?;
 
         let mut elements = Vec::new();
         loop {
             let element = if self.is(TokenType::LeftParen) {
                 let mut expr = self.expr_new();
-                expr.node = AstNode::TupleDestr(self.parser_var_tuple_destr()?.elements);
+                expr.node = AstNode::TupleDestr(self.parser_var_tuple_destr()?);
                 expr
             } else {
-                let ident = self.must(TokenType::Ident)?.literal.clone();
+                let ident_token = self.must(TokenType::Ident)?.clone();
                 let mut expr = self.expr_new();
 
-                expr.node = AstNode::VarDecl(ident, Type::new(TypeKind::Unknown), false, None);
+                expr.node = AstNode::VarDecl(Arc::new(Mutex::new(VarDeclExpr {
+                    type_: Type::new(TypeKind::Unknown),
+                    ident: ident_token.literal.clone(),
+                    symbol_start: ident_token.start,
+                    symbol_end: ident_token.end,
+                    be_capture: false,
+                    heap_ident: None,
+                    symbol_id: None,
+                })));
                 expr
             };
 
@@ -2127,7 +2136,7 @@ impl Syntax {
 
         self.must(TokenType::RightParen)?;
 
-        Ok(TupleDestrExpr { elements })
+        Ok(elements)
     }
 
     fn parser_var_begin_stmt(&mut self) -> Result<Box<Stmt>, SyntaxError> {
@@ -2140,7 +2149,7 @@ impl Syntax {
             self.must(TokenType::Equal)?;
             let right = self.parser_expr()?;
 
-            stmt.node = AstNode::VarTupleDestr(Box::new(tuple_destr), right);
+            stmt.node = AstNode::VarTupleDestr(tuple_destr, right);
             return Ok(stmt);
         }
 
@@ -2156,6 +2165,7 @@ impl Syntax {
                 symbol_end: ident.end,
                 be_capture: false,
                 heap_ident: None,
+                symbol_id: None,
             })),
             self.parser_expr()?,
         );
@@ -2188,6 +2198,7 @@ impl Syntax {
                 symbol_end: ident.end,
                 be_capture: false,
                 heap_ident: None,
+                symbol_id: None,
             })),
             self.parser_expr()?,
         );
@@ -2219,10 +2230,10 @@ impl Syntax {
         if self.is(TokenType::Ident) && self.next_is(1, TokenType::LeftAngle) {
             let mut close = 1;
             let mut pos = self.current + 1;
-            let current_line = self.tokens[pos].line;
+            let current_line = self.token_db[self.token_indexes[pos]].line;
 
-            while pos < self.tokens.len() {
-                let t = &self.tokens[pos];
+            while pos < self.token_indexes.len() {
+                let t = &self.token_db[self.token_indexes[pos]];
 
                 if t.token_type == TokenType::Eof || t.token_type == TokenType::StmtEof || t.line != current_line {
                     break;
@@ -2246,7 +2257,7 @@ impl Syntax {
                 return false;
             }
 
-            let next = &self.tokens[pos + 1];
+            let next = &self.token_db[self.token_indexes[pos + 1]];
             if next.token_type == TokenType::Dot {
                 return true;
             }
@@ -2295,7 +2306,7 @@ impl Syntax {
         let is_impl_type = if self.is_impl_fn() {
             let temp_current = self.current; // 回退位置
 
-            let first_token = self.advance().clone();
+            let first_token = self.safe_advance()?.clone();
 
             // 处理泛型参数
             if self.consume(TokenType::LeftAngle) {
@@ -2303,7 +2314,7 @@ impl Syntax {
                 fndef.generics_params = Some(Vec::new());
 
                 loop {
-                    let ident = self.advance().clone();
+                    let ident = self.must(TokenType::Ident)?.clone();
 
                     let mut param = GenericsParam::new(ident.literal.clone());
 
@@ -2323,8 +2334,7 @@ impl Syntax {
                         params.push(param);
                     }
 
-                    self.type_params_table
-                        .insert(ident.literal.clone(), ident.literal.clone());
+                    self.type_params_table.insert(ident.literal.clone(), ident.literal.clone());
 
                     if !self.consume(TokenType::Comma) {
                         break;
@@ -2400,7 +2410,9 @@ impl Syntax {
         };
 
         // 处理函数名
+        self.set_current_token_type(SemanticTokenType::FUNCTION);
         let ident = self.must(TokenType::Ident)?;
+
         fndef.symbol_name = ident.literal.clone();
         fndef.fn_name = Some(ident.literal.clone());
 
@@ -2410,7 +2422,7 @@ impl Syntax {
             fndef.generics_params = Some(Vec::new());
 
             loop {
-                let ident = self.advance().literal.clone();
+                let ident = self.must(TokenType::Ident)?.literal.clone();
                 let mut param = GenericsParam::new(ident.clone());
 
                 if self.consume(TokenType::Colon) {
@@ -2458,11 +2470,7 @@ impl Syntax {
 
         fndef.body = self.parser_body()?;
 
-        fndef.end = if let Some(prev) = self.prev() {
-            prev.end
-        } else {
-            self.peek().end
-        };
+        fndef.end = if let Some(prev) = self.prev() { prev.end } else { self.peek().end };
 
         self.type_params_table = HashMap::new();
 
@@ -2473,8 +2481,8 @@ impl Syntax {
     fn parser_fn_label(&mut self) -> Result<Box<Stmt>, SyntaxError> {
         let mut fndef = AstFnDef::default();
 
-        while self.is(TokenType::FnLabel) {
-            let token = self.must(TokenType::FnLabel)?;
+        while self.is(TokenType::Label) {
+            let token = self.must(TokenType::Label)?;
 
             if token.literal == "linkid" {
                 if self.is(TokenType::Ident) {
@@ -2487,11 +2495,7 @@ impl Syntax {
             } else if token.literal == "local" {
                 fndef.is_private = true;
             } else {
-                return Err(SyntaxError(
-                    token.start,
-                    token.end,
-                    format!("unknown fn label '{}'", token.literal),
-                ));
+                return Err(SyntaxError(token.start, token.end, format!("unknown fn label '{}'", token.literal)));
             }
         }
 
@@ -2539,7 +2543,7 @@ impl Syntax {
             // 元组解构赋值语句
             let mut stmt = self.stmt_new();
             let mut left = self.expr_new();
-            left.node = AstNode::TupleDestr(self.parser_tuple_destr()?.elements);
+            left.node = AstNode::TupleDestr(self.parser_tuple_destr()?);
 
             self.must(TokenType::Equal)?;
             let right = self.parser_expr()?;
@@ -2552,45 +2556,25 @@ impl Syntax {
         }
     }
 
-    fn parser_stmt(&mut self) -> Result<Box<Stmt>, SyntaxError> {
-        let stmt = match self.peek().token_type {
-            TokenType::Var => self.parser_var_begin_stmt()?,
-            TokenType::LeftParen => self.parser_left_paren_begin_stmt()?,
-            TokenType::Throw => self.parser_throw_stmt()?,
-            TokenType::Let => self.parser_let_stmt()?,
-            TokenType::FnLabel => self.parser_fn_label()?,
-            TokenType::Ident => self.parser_expr_begin_stmt()?,
-            TokenType::Fn => self.parser_fndef_stmt(AstFnDef::default())?,
-            TokenType::If => self.parser_if_stmt()?,
-            TokenType::For => self.parser_for_stmt()?,
-            TokenType::Return => self.parser_return_stmt()?,
-            TokenType::Import => self.parser_import_stmt()?,
-            TokenType::Type => self.parser_type_alias_stmt()?,
-            TokenType::Continue => self.parser_continue_stmt()?,
-            TokenType::Break => self.parser_break_stmt()?,
-            TokenType::Go => {
-                let expr = self.parser_go_expr()?;
-                self.fake_new(expr)
-            }
-            TokenType::Match => {
-                let expr = self.parser_match_expr()?;
-                self.fake_new(expr)
-            }
-            TokenType::MacroIdent => {
-                let expr = self.parser_expr_with_precedence()?;
-                self.fake_new(expr)
-            }
-            _ => {
-                if self.is_type_begin_stmt() {
-                    self.parser_type_begin_stmt()?
-                } else {
-                    return Err(SyntaxError(
-                        self.peek().start,
-                        self.peek().end,
-                        format!("statement cannot start with '{}'", self.peek().literal),
-                    ));
-                }
-            }
+    fn parser_global_stmt(&mut self) -> Result<Box<Stmt>, SyntaxError> {
+        let stmt = if self.is(TokenType::Var) {
+            self.parser_var_begin_stmt()?
+        } else if self.is_type_begin_stmt() {
+            self.parser_type_begin_stmt()?
+        } else if self.is(TokenType::Label) {
+            self.parser_fn_label()?
+        } else if self.is(TokenType::Fn) {
+            self.parser_fndef_stmt(AstFnDef::default())?
+        } else if self.is(TokenType::Import) {
+            self.parser_import_stmt()?
+        } else if self.is(TokenType::Type) {
+            self.parser_type_alias_stmt()?
+        } else {
+            return Err(SyntaxError(
+                self.peek().start,
+                self.peek().end,
+                format!("statement cannot start with '{}'", self.peek().literal),
+            ));
         };
 
         self.must_stmt_end()?;
@@ -2598,21 +2582,64 @@ impl Syntax {
         Ok(stmt)
     }
 
-    fn parser_precedence_expr(
-        &mut self,
-        precedence: SyntaxPrecedence,
-        exclude: TokenType,
-    ) -> Result<Box<Expr>, SyntaxError> {
+    fn parser_stmt(&mut self) -> Result<Box<Stmt>, SyntaxError> {
+        let stmt = if self.is(TokenType::Var) {
+            self.parser_var_begin_stmt()?
+        } else if self.is_type_begin_stmt() {
+            self.parser_type_begin_stmt()?
+        } else if self.is(TokenType::LeftParen) {
+            self.parser_left_paren_begin_stmt()?
+        } else if self.is(TokenType::Throw) {
+            self.parser_throw_stmt()?
+        } else if self.is(TokenType::Let) {
+            self.parser_let_stmt()?
+        } else if self.is(TokenType::Ident) {
+            self.parser_expr_begin_stmt()?
+        } else if self.is(TokenType::Label) {
+            self.parser_fn_label()?
+        } else if self.is(TokenType::If) {
+            self.parser_if_stmt()?
+        } else if self.is(TokenType::For) {
+            self.parser_for_stmt()?
+        } else if self.is(TokenType::Return) {
+            self.parser_return_stmt()?
+        } else if self.is(TokenType::Import) {
+            self.parser_import_stmt()?
+        } else if self.is(TokenType::Type) {
+            self.parser_type_alias_stmt()?
+        } else if self.is(TokenType::Continue) {
+            self.parser_continue_stmt()?
+        } else if self.is(TokenType::Break) {
+            self.parser_break_stmt()?
+        } else if self.is(TokenType::Go) {
+            let expr = self.parser_go_expr()?;
+            self.fake_new(expr)
+        } else if self.is(TokenType::Match) {
+            let expr = self.parser_match_expr()?;
+            self.fake_new(expr)
+        } else if self.is(TokenType::MacroIdent) {
+            let expr = self.parser_expr_with_precedence()?;
+            self.fake_new(expr)
+        } else {
+            return Err(SyntaxError(
+                self.peek().start,
+                self.peek().end,
+                format!("statement cannot start with '{}'", self.peek().literal),
+            ));
+        };
+
+        self.must_stmt_end()?;
+
+        Ok(stmt)
+    }
+
+    fn parser_precedence_expr(&mut self, precedence: SyntaxPrecedence, exclude: TokenType) -> Result<Box<Expr>, SyntaxError> {
         // 读取表达式前缀
         let rule = self.find_rule(self.peek().token_type.clone());
 
-        let prefix_fn = rule.prefix.ok_or_else(|| {
-            SyntaxError(
-                self.peek().start,
-                self.peek().end,
-                format!("<expr> expected, found '{}'", self.peek().literal),
-            )
-        })?;
+        let prefix_fn = rule
+            .prefix
+            .ok_or_else(|| SyntaxError(self.peek().start, self.peek().end, format!("<expr> expected, found '{}'", self.peek().literal)))?;
 
         let mut expr = prefix_fn(self)?;
 
@@ -2645,7 +2672,7 @@ impl Syntax {
     }
 
     fn is_struct_param_new_prefix(&self, current: usize) -> bool {
-        let t = &self.tokens[current];
+        let t = &self.token_db[self.token_indexes[current]];
         if t.token_type != TokenType::LeftAngle {
             return false;
         }
@@ -2653,9 +2680,9 @@ impl Syntax {
         let mut close = 1;
         let mut pos = current;
 
-        while pos < self.tokens.len() {
+        while pos < self.token_indexes.len() {
             pos += 1;
-            let t = &self.tokens[pos];
+            let t = &self.token_db[self.token_indexes[pos]];
 
             if t.token_type == TokenType::LeftAngle {
                 close += 1;
@@ -2678,11 +2705,11 @@ impl Syntax {
         }
 
         // next is '{' ?
-        if pos + 1 >= self.tokens.len() {
+        if pos + 1 >= self.token_indexes.len() {
             return false;
         }
 
-        self.tokens[pos + 1].token_type == TokenType::LeftCurly
+        self.token_db[self.token_indexes[pos + 1]].token_type == TokenType::LeftCurly
     }
 
     fn parser_is_struct_new_expr(&self) -> bool {
@@ -2692,11 +2719,7 @@ impl Syntax {
         }
 
         // foo.bar {}
-        if self.is(TokenType::Ident)
-            && self.next_is(1, TokenType::Dot)
-            && self.next_is(2, TokenType::Ident)
-            && self.next_is(3, TokenType::LeftCurly)
-        {
+        if self.is(TokenType::Ident) && self.next_is(1, TokenType::Dot) && self.next_is(2, TokenType::Ident) && self.next_is(3, TokenType::LeftCurly) {
             return true;
         }
 
@@ -2708,11 +2731,7 @@ impl Syntax {
         }
 
         // foo.bar<a, b> {}
-        if self.is(TokenType::Ident)
-            && self.next_is(1, TokenType::Dot)
-            && self.next_is(2, TokenType::Ident)
-            && self.next_is(3, TokenType::LeftAngle)
-        {
+        if self.is(TokenType::Ident) && self.next_is(1, TokenType::Dot) && self.next_is(2, TokenType::Ident) && self.next_is(3, TokenType::LeftAngle) {
             if self.is_struct_param_new_prefix(self.current + 3) {
                 return true;
             }
@@ -2763,7 +2782,7 @@ impl Syntax {
 
     fn coroutine_fn_closure(&mut self, call_expr: &Box<Expr>) -> AstFnDef {
         let mut fndef = AstFnDef::default();
-        fndef.is_co_async = true;
+        fndef.is_async = true;
         fndef.params = Vec::new();
         fndef.return_type = Type::new(TypeKind::Void);
 
@@ -2779,6 +2798,7 @@ impl Syntax {
                 symbol_end: 0,
                 be_capture: false,
                 heap_ident: None,
+                symbol_id: None,
             })),
             call_expr.clone(),
         );
@@ -2789,10 +2809,7 @@ impl Syntax {
             return_type: Type::default(),
             left: Box::new(Expr::ident(fndef.start, fndef.end, "co_return".to_string())),
             args: vec![Box::new(Expr {
-                node: AstNode::Unary(
-                    ExprOp::La,
-                    Box::new(Expr::ident(fndef.start, fndef.end, "result".to_string())),
-                ),
+                node: AstNode::Unary(ExprOp::La, Box::new(Expr::ident(fndef.start, fndef.end, "result".to_string()))),
                 ..Default::default()
             })],
             generics_args: Vec::new(),
@@ -2809,7 +2826,7 @@ impl Syntax {
 
     fn coroutine_fn_void_closure(&mut self, call_expr: &Box<Expr>) -> AstFnDef {
         let mut fndef = AstFnDef::default();
-        fndef.is_co_async = true;
+        fndef.is_async = true;
         fndef.params = Vec::new();
         fndef.return_type = Type::new(TypeKind::Void);
 
@@ -2859,10 +2876,17 @@ impl Syntax {
             self.must(TokenType::RightArrow)?;
             self.match_cond = false;
 
-            let (exec_expr, exec_body) = if self.is(TokenType::LeftCurly) {
-                (None, Some(self.parser_body()?))
+            let exec_body = if self.is(TokenType::LeftCurly) {
+                self.parser_body()?
             } else {
-                (Some(self.parser_expr()?), None)
+                let exec_expr = self.parser_expr()?;
+
+                // gen retrun stmt
+                let mut stmt = self.stmt_new();
+                stmt.node = AstNode::Return(Some(exec_expr.clone()));
+                stmt.start = exec_expr.start.clone();
+                stmt.end = exec_expr.end.clone();
+                vec![stmt]
             };
 
             self.must_stmt_end()?;
@@ -2870,7 +2894,6 @@ impl Syntax {
             cases.push(MatchCase {
                 cond_list,
                 handle_body: exec_body,
-                handle_expr: exec_expr,
                 is_default: false,
             });
         }
@@ -2886,22 +2909,18 @@ impl Syntax {
 
         // expr 的 type 必须是 call
         if !matches!(call_expr.node, AstNode::Call(_)) {
-            return Err(SyntaxError(
-                call_expr.start,
-                call_expr.end,
-                "go expr must be call".to_string(),
-            ));
+            return Err(SyntaxError(call_expr.start, call_expr.end, "go expr must be call".to_string()));
         }
 
         let mut expr = self.expr_new();
-        expr.node = AstNode::MacroCoAsync(MacroCoAsyncExpr {
+        expr.node = AstNode::MacroAsync(MacroAsyncExpr {
             origin_call: if let AstNode::Call(call) = &call_expr.node {
                 Box::new(call.clone())
             } else {
                 panic!("go expr must be call")
             },
-            closure_fn: Box::new(self.coroutine_fn_closure(&call_expr)),
-            closure_fn_void: Box::new(self.coroutine_fn_void_closure(&call_expr)),
+            closure_fn: Arc::new(Mutex::new(self.coroutine_fn_closure(&call_expr))),
+            closure_fn_void: Arc::new(Mutex::new(self.coroutine_fn_void_closure(&call_expr))),
             flag_expr: None,
             return_type: Type::new(TypeKind::Void),
         });
@@ -2909,29 +2928,29 @@ impl Syntax {
         Ok(expr)
     }
 
-    fn parser_macro_co_async_expr(&mut self) -> Result<Box<Expr>, SyntaxError> {
+    fn parser_macro_async_expr(&mut self) -> Result<Box<Expr>, SyntaxError> {
         let mut expr = self.expr_new();
         self.must(TokenType::LeftParen)?;
 
         let call_expr = self.parser_expr()?;
-        let mut co_async = MacroCoAsyncExpr {
+        let mut r#async = MacroAsyncExpr {
             origin_call: if let AstNode::Call(call) = &call_expr.node {
                 Box::new(call.clone())
             } else {
-                panic!("co_async expr must be call")
+                panic!("async expr must be call")
             },
-            closure_fn: Box::new(self.coroutine_fn_closure(&call_expr)),
-            closure_fn_void: Box::new(self.coroutine_fn_void_closure(&call_expr)),
+            closure_fn: Arc::new(Mutex::new(self.coroutine_fn_closure(&call_expr))),
+            closure_fn_void: Arc::new(Mutex::new(self.coroutine_fn_void_closure(&call_expr))),
             flag_expr: None,
             return_type: Type::new(TypeKind::Void),
         };
 
         if self.consume(TokenType::Comma) {
-            co_async.flag_expr = Some(self.parser_expr()?);
+            r#async.flag_expr = Some(self.parser_expr()?);
         }
         self.must(TokenType::RightParen)?;
 
-        expr.node = AstNode::MacroCoAsync(co_async);
+        expr.node = AstNode::MacroAsync(r#async);
         Ok(expr)
     }
 
@@ -2954,13 +2973,9 @@ impl Syntax {
             "sizeof" => self.parser_macro_sizeof(),
             "reflect_hash" => self.parser_macro_reflect_hash(),
             "default" => self.parser_macro_default_expr(),
-            "co_async" => self.parser_macro_co_async_expr(),
+            "async" => self.parser_macro_async_expr(),
             "ula" => self.parser_macro_ula_expr(),
-            _ => Err(SyntaxError(
-                token.start,
-                token.end,
-                format!("macro '{}' not defined", token.literal),
-            )),
+            _ => Err(SyntaxError(token.start, token.end, format!("macro '{}' not defined", token.literal))),
         }
     }
 
