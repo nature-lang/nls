@@ -11,7 +11,7 @@ pub struct NodeId(NonZeroU32);
 pub const GLOBAL_SCOPE_ID: NodeId = unsafe { NodeId(NonZeroU32::new_unchecked(1)) };
 
 // Arena 分配器
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Arena<T> {
     items: Vec<T>,
 }
@@ -38,7 +38,7 @@ impl<T> Arena<T> {
 }
 
 //  引用自 AstNode 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum SymbolKind {
     Var(Arc<Mutex<VarDeclExpr>>), // 变量原始定义
     Fn(Arc<Mutex<AstFnDef>>),
@@ -46,7 +46,7 @@ pub enum SymbolKind {
 }
 
 // symbol table 可以同时处理多个文件的 scope, 存在一个 global scope 管理所有的全局 scope, 符号注册到 global scope 时，define_ident 需要携带 package_name 保证符号的唯一性
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Symbol {
     // local symbol 直接使用，global symbol 会携带 package ident
     pub ident: String,
@@ -58,7 +58,7 @@ pub struct Symbol {
     pub is_capture: bool,     // 如果变量被捕获，则需要分配到堆中，避免作用域问题
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct FreeIdent {
     pub in_parent_local: bool,   // 是否在父作用域中直接定义, 否则需要通过 envs[index] 访问
     pub parent_env_index: usize, // 父作用域起传递作用, 通过 envs 参数向下传递
@@ -68,7 +68,7 @@ pub struct FreeIdent {
     pub kind: SymbolKind,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum ScopeKind {
     Global,
     GlobalFn(Arc<Mutex<AstFnDef>>),
@@ -76,7 +76,7 @@ pub enum ScopeKind {
     Local,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Scope {
     pub parent: Option<NodeId>,              // 除了全局作用域外，每个作用域都有一个父作用域
     pub symbols: Vec<NodeId>,                // 当前作用域中定义的符号列表
@@ -91,7 +91,7 @@ pub struct Scope {
     pub frees: HashMap<String, FreeIdent>, // fn scope 需要处理函数外的自由变量
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct SymbolTable {
     pub scopes: Arena<Scope>,     // 作用域列表, 根据 NodeId 索引
     pub symbols: Arena<Symbol>,   // 符号列表, 根据 NodeId 索引
@@ -172,7 +172,9 @@ impl SymbolTable {
         }
     }
 
-    // 在当前作用域中定义符号
+    /**
+     * 存在 rebuild 机制，所以同一个符号会被重复定义, 但是定义的位置相同。
+     */
     pub fn define_symbol(
         &mut self,
         ident: String,
@@ -181,8 +183,18 @@ impl SymbolTable {
     ) -> Result<NodeId, String> {
         // 检查当前作用域是否已存在同名符号
         if let Some(scope) = self.scopes.get(self.current_scope_id) {
-            if scope.symbol_map.contains_key(&ident) {
-                return Err(format!("Symbol '{}' already defined in current scope", ident));
+            if let Some(&existing_symbol_id) = scope.symbol_map.get(&ident) {
+                // 获取已存在的符号
+                if let Some(existing_symbol) = self.symbols.get_mut(existing_symbol_id) {
+                    // 如果位置相同，则更新 kind
+                    if existing_symbol.pos == pos {
+                        existing_symbol.kind = kind;
+                        return Ok(existing_symbol_id);
+                    } else {
+                        // 位置不同，则是真正的重复定义
+                        return Err(format!("symbol '{}' already defined in current scope at position {}", ident, existing_symbol.pos));
+                    }
+                }
             }
         }
 

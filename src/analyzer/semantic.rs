@@ -1,43 +1,29 @@
+use crate::project::Module;
+
 use super::common::*;
-use super::symbol::{NodeId, Scope, ScopeKind, SymbolKind, SymbolTable, GLOBAL_SCOPE_ID};
-use std::error::Error;
-use std::fmt;
+use super::symbol::{NodeId, ScopeKind, SymbolKind, SymbolTable, GLOBAL_SCOPE_ID};
 use std::sync::{Arc, Mutex};
 
-pub struct SemanticError(usize, usize, String);
-
-impl fmt::Display for SemanticError {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "SyntaxError: {}", self.2)
-    }
-}
-
-impl fmt::Debug for SemanticError {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "SemanticError: {}", self.2)
-    }
-}
-impl Error for SemanticError {}
-
 #[derive(Debug)]
-pub struct Semantic {
-    symbol_table: SymbolTable,
+pub struct Semantic<'a> {
+    symbol_table: &'a mut SymbolTable,
     errors: Vec<AnalyzerError>,
-    package_name: String,
+    module_ident: String,
     stmts: Vec<Box<Stmt>>,
-    imports: Vec<Box<ImportStmt>>,
+    imports: Vec<ImportStmt>,
     current_local_fn_list: Vec<Arc<Mutex<AstFnDef>>>,
 }
 
-impl Semantic {
-    pub fn new(package_name: String, stmts: Vec<Box<Stmt>>) -> Self {
+impl<'a> Semantic<'a> {
+    pub fn new(m: &Module, symbol_table: &'a mut SymbolTable) -> Self {
+        dbg!("semantic new", &m.ident, m.dependencies.clone());
         Self {
-            symbol_table: SymbolTable::new(),
+            symbol_table,
             errors: Vec::new(),
-            package_name,
-            stmts,
+            module_ident: m.ident.clone(),
+            stmts: m.stmts.clone(),
+            imports: m.dependencies.clone(),
             current_local_fn_list: Vec::new(),
-            imports: Vec::new(),
         }
     }
 
@@ -147,7 +133,7 @@ impl Semantic {
                         }
 
                         // 更新标识符指向
-                        let global_pkg_ident = format!("{}.{}", import.package_ident, ident);
+                        let global_pkg_ident = format!("{}.{}", import.module_ident, ident);
 
                         // check exists
                         if !self.symbol_table.symbol_exists_in_scope(&global_pkg_ident, GLOBAL_SCOPE_ID) {
@@ -281,7 +267,7 @@ impl Semantic {
 
                     // fndef 的 symbol_name 需要包含 package name 来构成全局搜索名称
                     // package_name.symbol_name
-                    fndef.symbol_name = format!("{}.{}", self.package_name, symbol_name);
+                    fndef.symbol_name = format!("{}.{}", self.module_ident, symbol_name);
 
                     if let Err(e) = self
                         .symbol_table
@@ -300,7 +286,7 @@ impl Semantic {
                     let mut var_decl = var_decl_mutex.lock().unwrap();
 
                     // ident rewrite
-                    var_decl.ident = format!("{}.{}", self.package_name, var_decl.ident);
+                    var_decl.ident = format!("{}.{}", self.module_ident, var_decl.ident);
 
                     // global ident to symbol_table
                     if let Err(e) = self
@@ -328,7 +314,7 @@ impl Semantic {
                 AstNode::TypeAlias(type_alias_mutex) => {
                     let mut type_alias = type_alias_mutex.lock().unwrap();
 
-                    type_alias.ident = format!("{}.{}", self.package_name, type_alias.ident);
+                    type_alias.ident = format!("{}.{}", self.module_ident, type_alias.ident);
 
                     // 添加到符号表
                     if let Err(e) = self.symbol_table.define_symbol(
@@ -368,7 +354,7 @@ impl Semantic {
         if !var_assign_list.is_empty() {
             // 创建init函数定义
             let mut fn_init = AstFnDef::default();
-            fn_init.symbol_name = format!("{}.{}", self.package_name, "init");
+            fn_init.symbol_name = format!("{}.{}", self.module_ident, "init");
             fn_init.fn_name = Some(fn_init.symbol_name.clone());
             fn_init.return_type = Type::new(TypeKind::Void);
             fn_init.body = var_assign_list;
@@ -387,7 +373,7 @@ impl Semantic {
 
     pub fn resolve_type_alias(&mut self, ident: &str, scope_id: NodeId) -> Option<String> {
         if scope_id == GLOBAL_SCOPE_ID {
-            let curent_package_ident = format!("{}.{}", self.package_name, ident);
+            let curent_package_ident = format!("{}.{}", self.module_ident, ident);
 
             // check global symbol map
             if self.symbol_table.symbol_exists_in_scope(&curent_package_ident, scope_id) {
@@ -400,7 +386,7 @@ impl Semantic {
                     continue;
                 };
 
-                let temp_package_ident = format!("{}.{}", i.package_ident, ident);
+                let temp_package_ident = format!("{}.{}", i.module_ident, ident);
                 if self.symbol_table.symbol_exists_in_scope(&temp_package_ident, scope_id) {
                     return Some(temp_package_ident);
                 }
@@ -518,7 +504,7 @@ impl Semantic {
         // import * ident
         for import in &self.imports {
             if import.as_name == "*" {
-                let global_ident = format!("{}.{}", import.package_ident, ident);
+                let global_ident = format!("{}.{}", import.module_ident, ident);
                 if let Some(id) = self.symbol_table.find_symbol(&global_ident, GLOBAL_SCOPE_ID) {
                     return Some((id, global_ident));
                 }
@@ -534,6 +520,8 @@ impl Semantic {
     }
 
     pub fn analyze_unknown_select(&mut self, expr: &mut Box<Expr>) {
+        dbg!("analyze_unknown_select", &self.module_ident, &self.imports);
+
         let AstNode::SelectExpr(left, key) = &mut expr.node else { unreachable!() };
 
         if let AstNode::Ident(ident, symbol_id) = &mut left.node {
@@ -544,7 +532,7 @@ impl Semantic {
                 return;
             }
 
-            let current_pkg_ident = format!("{}.{}", self.package_name, ident);
+            let current_pkg_ident = format!("{}.{}", self.module_ident, ident);
 
             // find current package global ident
             if let Some(id) = self.symbol_table.find_symbol(&current_pkg_ident, GLOBAL_SCOPE_ID) {
@@ -556,10 +544,10 @@ impl Semantic {
 
             // import package ident
             for import in &self.imports {
-                if import.package_ident == *ident {
+                if import.as_name == *ident {
                     // 找到对应的 import
                     // 构造全局唯一标识符
-                    let global_ident = format!("{}.{}", import.package_ident, key);
+                    let global_ident = format!("{}.{}", import.module_ident, key);
 
                     // 检查是否存在于 global import symbol 中
                     if let Some(id) = self.symbol_table.find_symbol(&global_ident, GLOBAL_SCOPE_ID) {
@@ -567,6 +555,7 @@ impl Semantic {
                         *symbol_id = Some(id);
                         return;
                     }
+                    // TODO expr 符号改写
                 }
             }
 
@@ -578,12 +567,12 @@ impl Semantic {
             }
 
             self.errors.push(AnalyzerError {
-                start: left.start,
-                end: left.end,
-                message: format!("identifier '{}' undeclared", ident),
+                start: expr.start,
+                end: expr.end,
+                message: format!("identifier '{}.{}' undeclared", ident, key),
             });
 
-            return; 
+            return;
         }
 
         self.analyze_expr(left);
@@ -598,7 +587,7 @@ impl Semantic {
         }
 
         // current package ident
-        let current_pkg_ident = format!("{}.{}", self.package_name, ident);
+        let current_pkg_ident = format!("{}.{}", self.module_ident, ident);
         if let Some(id) = self.symbol_table.find_symbol(&current_pkg_ident, GLOBAL_SCOPE_ID) {
             *ident = current_pkg_ident;
             *symbol_id = Some(id);
@@ -654,7 +643,7 @@ impl Semantic {
                         case.is_default = true;
                         continue;
                     }
-                } else if let AstNode::Is(target_type, src) = &cond.node {
+                } else if let AstNode::Is(_, _) = &cond.node {
                     is_cond = true;
                 }
 
@@ -769,7 +758,7 @@ impl Semantic {
                     self.analyze_expr(element);
                 }
             }
-            AstNode::VecNew(elements, len, cap) => {
+            AstNode::VecNew(elements, _len, _cap) => {
                 for element in elements {
                     self.analyze_expr(element);
                 }
@@ -1006,9 +995,10 @@ impl Semantic {
     pub fn analyze_if(&mut self, cond: &mut Box<Expr>, consequent: &mut Vec<Box<Stmt>>, alternate: &mut Vec<Box<Stmt>>) {
         // if has is expr push T e = e as T
         if let Some(is_expr) = self.extract_is_expr(cond) {
-            assert!(matches!(is_expr.node, AstNode::Ident(..)));
-            let AstNode::Ident(ident, _) = is_expr.node else { unreachable!() };
-            let ast_stmt = self.auto_as_stmt(is_expr.start, is_expr.end, &ident, &is_expr.type_);
+            assert!(matches!(is_expr.node, AstNode::Is(..)));
+            let AstNode::Is(target_type, src) = is_expr.node else { unreachable!() };
+            let AstNode::Ident(ident, _) = &src.node else { unreachable!() };
+            let ast_stmt = self.auto_as_stmt(is_expr.start, is_expr.end, &ident, &target_type);
             // insert ast_stmt to consequent first
             consequent.insert(0, ast_stmt);
         }

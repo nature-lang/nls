@@ -1,11 +1,11 @@
 use super::common::*;
+use super::lexer::semantic_token_type_index;
 use super::lexer::Token;
 use super::lexer::TokenType;
 use std::collections::HashMap;
 use std::error::Error;
 use std::fmt;
 use std::sync::{Arc, Mutex};
-use crate::semantic_token::semantic_token_type_index;
 use tower_lsp::lsp_types::SemanticTokenType; 
 
 const LOCAL_FN_NAME: &str = "lambda";
@@ -284,6 +284,7 @@ impl Syntax {
     fn fake_new(&self, expr: Box<Expr>) -> Box<Stmt> {
         let mut stmt = self.stmt_new();
         stmt.node = AstNode::Fake(expr);
+        stmt.end = self.prev().unwrap().end;
 
         return stmt;
     }
@@ -1049,6 +1050,7 @@ impl Syntax {
             type_: alias_type,
             symbol_id: None,
         })));
+        stmt.end = self.prev().unwrap().end;
 
         Ok(stmt)
     }
@@ -1150,6 +1152,7 @@ impl Syntax {
     // 解析二元表达式
     fn parser_binary(&mut self, left: Box<Expr>) -> Result<Box<Expr>, SyntaxError> {
         let mut expr = self.expr_new();
+        expr.start = left.start;
 
         let operator_token = self.safe_advance()?.clone();
 
@@ -1158,6 +1161,7 @@ impl Syntax {
         let right = self.parser_precedence_expr(precedence.next().unwrap(), TokenType::Unknown)?;
 
         expr.node = AstNode::Binary(token_to_expr_op(&operator_token.token_type), left, right);
+        expr.end = self.prev().unwrap().end;
 
         Ok(expr)
     }
@@ -1230,6 +1234,7 @@ impl Syntax {
         assert!(self.is(TokenType::LeftAngle));
 
         let mut expr = self.expr_new();
+        expr.start = left.start;
 
         // 解析泛型参数
         let mut generics_args = Vec::new();
@@ -1299,6 +1304,7 @@ impl Syntax {
         }
 
         expr.node = AstNode::StructNew(String::new(), type_, properties);
+        expr.end = self.prev().unwrap().end;
 
         Ok(expr)
     }
@@ -1339,12 +1345,14 @@ impl Syntax {
 
         let operand = self.parser_precedence_expr(SyntaxPrecedence::Unary, TokenType::Unknown)?;
         expr.node = AstNode::Unary(operator, operand);
+        expr.end = self.prev().unwrap().end;
 
         Ok(expr)
     }
 
     fn parser_catch_expr(&mut self, left: Box<Expr>) -> Result<Box<Expr>, SyntaxError> {
         let mut expr = self.expr_new();
+        expr.start = left.start;
         self.must(TokenType::Catch)?;
 
         let error_ident = self.must(TokenType::Ident)?;
@@ -1362,6 +1370,7 @@ impl Syntax {
         let catch_body = self.parser_body()?;
 
         expr.node = AstNode::Catch(left, Arc::new(Mutex::new(catch_err)), catch_body);
+        expr.end = self.prev().unwrap().end;
 
         Ok(expr)
     }
@@ -1372,7 +1381,9 @@ impl Syntax {
 
         let target_type = self.parser_single_type()?;
 
+        expr.start = left.start;
         expr.node = AstNode::As(target_type, left);
+        expr.end = self.prev().unwrap().end;
 
         Ok(expr)
     }
@@ -1393,6 +1404,7 @@ impl Syntax {
         let target_type = self.parser_single_type()?;
 
         expr.node = AstNode::MatchIs(target_type);
+        expr.end = self.prev().unwrap().end;
 
         Ok(expr)
     }
@@ -1403,7 +1415,9 @@ impl Syntax {
 
         let target_type = self.parser_single_type()?;
 
+        expr.start = left.start;
         expr.node = AstNode::Is(target_type, left);
+        expr.end = self.prev().unwrap().end;
 
         Ok(expr)
     }
@@ -1439,6 +1453,7 @@ impl Syntax {
 
         let mut tuple_expr = self.expr_new();
         tuple_expr.node = AstNode::TupleNew(elements);
+        tuple_expr.end = self.prev().unwrap().end;
 
         Ok(tuple_expr)
     }
@@ -1450,6 +1465,7 @@ impl Syntax {
         let kind = token_to_type_kind(&literal_token.token_type);
 
         expr.node = AstNode::Literal(kind, literal_token.literal.clone());
+        expr.end = self.prev().unwrap().end;
 
         Ok(expr)
     }
@@ -1496,6 +1512,7 @@ impl Syntax {
         let ident_token = self.must(TokenType::Ident)?;
 
         expr.node = AstNode::Ident(ident_token.literal.clone(), None);
+        expr.end = self.prev().unwrap().end;
 
         Ok(expr)
     }
@@ -1507,7 +1524,9 @@ impl Syntax {
         let key = self.parser_expr()?;
         self.must(TokenType::RightSquare)?;
 
+        expr.start = left.start;
         expr.node = AstNode::AccessExpr(left, key);
+        expr.end = self.prev().unwrap().end;
 
         Ok(expr)
     }
@@ -1518,7 +1537,9 @@ impl Syntax {
         self.must(TokenType::Dot)?;
 
         let property_token = self.must(TokenType::Ident)?;
+        expr.start = left.start;
         expr.node = AstNode::SelectExpr(left, property_token.literal.clone());
+        expr.end = self.prev().unwrap().end;
 
         Ok(expr)
     }
@@ -1560,6 +1581,7 @@ impl Syntax {
 
     fn parser_call_expr(&mut self, left: Box<Expr>) -> Result<Box<Expr>, SyntaxError> {
         let mut expr = self.expr_new();
+        expr.start = left.start;
 
         let mut call = AstCall {
             return_type: Type::default(),
@@ -1572,6 +1594,7 @@ impl Syntax {
         call.args = self.parser_args(&mut call)?;
 
         expr.node = AstNode::Call(call);
+        expr.end = self.prev().unwrap().end;
         Ok(expr)
     }
 
@@ -1600,6 +1623,7 @@ impl Syntax {
         };
 
         stmt.node = AstNode::If(condition, consequent, alternate);
+        stmt.end = self.prev().unwrap().end;
 
         Ok(stmt)
     }
@@ -1737,6 +1761,7 @@ impl Syntax {
             let body = self.parser_body()?;
 
             stmt.node = AstNode::ForTradition(init, cond, update, body);
+            stmt.end = self.prev().unwrap().end;
 
             return Ok(stmt);
         }
@@ -1790,11 +1815,15 @@ impl Syntax {
     fn parser_assign(&mut self, left: Box<Expr>) -> Result<Box<Stmt>, SyntaxError> {
         let mut stmt = self.stmt_new();
 
+        let stmt_start = left.start.clone();
+
         // 简单赋值
         if self.consume(TokenType::Equal) {
             let right = self.parser_expr()?;
 
             stmt.node = AstNode::Assign(left, right);
+            stmt.start = stmt_start;
+            stmt.end = self.prev().unwrap().end;
 
             return Ok(stmt);
         }
@@ -1807,8 +1836,11 @@ impl Syntax {
 
         let mut right = self.expr_new();
         right.node = AstNode::Binary(token_to_expr_op(&t.token_type), left.clone(), self.parser_expr_with_precedence()?);
+        right.end = self.prev().unwrap().end;
 
         stmt.node = AstNode::Assign(left, right);
+        stmt.start = stmt_start;
+        stmt.end = self.prev().unwrap().end;
 
         Ok(stmt)
     }
@@ -1824,6 +1856,8 @@ impl Syntax {
 
             let mut stmt = self.stmt_new();
             stmt.node = AstNode::Call(call);
+            stmt.start = left.start;
+            stmt.end = self.prev().unwrap().end;
             return Ok(stmt);
         }
 
@@ -1839,6 +1873,8 @@ impl Syntax {
 
             let mut stmt = self.stmt_new();
             stmt.node = AstNode::Catch(try_expr, catch_err, catch_body);
+            stmt.start = left.start;
+            stmt.end = self.prev().unwrap().end;
             return Ok(stmt);
         }
 
@@ -1862,6 +1898,7 @@ impl Syntax {
         };
 
         stmt.node = AstNode::Break(expr);
+        stmt.end = self.prev().unwrap().end;
         Ok(stmt)
     }
 
@@ -1870,6 +1907,7 @@ impl Syntax {
         self.must(TokenType::Continue)?;
 
         stmt.node = AstNode::Continue;
+        stmt.end = self.prev().unwrap().end;
         Ok(stmt)
     }
 
@@ -1884,6 +1922,7 @@ impl Syntax {
         };
 
         stmt.node = AstNode::Return(expr);
+        stmt.end = self.prev().unwrap().end;
         Ok(stmt)
     }
 
@@ -1891,7 +1930,10 @@ impl Syntax {
         let mut stmt = self.stmt_new();
         self.must(TokenType::Import)?; 
 
+
         let token = self.safe_advance()?.clone();
+        let mut import_end = token.end;
+
         let (file, ast_package) = if token.token_type == TokenType::StringLiteral {
             (Some(token.literal.clone()), None)
         } else if token.token_type == TokenType::Ident {
@@ -1899,6 +1941,7 @@ impl Syntax {
             while self.consume(TokenType::Dot) {
                 let ident = self.must(TokenType::Ident)?;
                 package.push(ident.literal.clone());
+                import_end = ident.end;
             }
             (None, Some(package))
         } else {
@@ -1921,14 +1964,17 @@ impl Syntax {
             file,
             ast_package,
             as_name,
-            package_type: 0,
+            module_type: 0,
             full_path: String::new(),
             package_conf: None,
             package_dir: String::new(),
             use_links: false,
-            package_ident: String::new(),
+            module_ident: String::new(),
+            start: stmt.start,
+            end: import_end
         });
 
+        stmt.end = self.prev().unwrap().end;
         Ok(stmt)
     }
 
@@ -1950,6 +1996,7 @@ impl Syntax {
         }
 
         expr.node = AstNode::VecNew(elements, None, None);
+        expr.end = self.prev().unwrap().end;
 
         Ok(expr)
     }
@@ -1961,6 +2008,7 @@ impl Syntax {
         self.must(TokenType::LeftCurly)?;
         if self.consume(TokenType::RightCurly) {
             expr.node = AstNode::EmptyCurlyNew;
+            expr.end = self.prev().unwrap().end;
             return Ok(expr);
         }
 
@@ -1986,6 +2034,7 @@ impl Syntax {
             self.must(TokenType::RightCurly)?;
 
             expr.node = AstNode::MapNew(elements);
+            expr.end = self.prev().unwrap().end;
             return Ok(expr);
         }
 
@@ -2000,6 +2049,7 @@ impl Syntax {
 
         self.must(TokenType::RightCurly)?;
         expr.node = AstNode::SetNew(elements);
+        expr.end = self.prev().unwrap().end;
 
         Ok(expr)
     }
@@ -2052,8 +2102,11 @@ impl Syntax {
 
             let mut call_expr = self.expr_new();
             call_expr.node = AstNode::Call(call);
+            call_expr.end = self.prev().unwrap().end;
             return Ok(call_expr);
         }
+
+        expr.end = self.prev().unwrap().end;
 
         Ok(expr)
     }
@@ -2063,6 +2116,7 @@ impl Syntax {
         self.must(TokenType::New)?;
 
         expr.node = AstNode::New(self.parser_type()?, Vec::new());
+        expr.end = self.prev().unwrap().end;
 
         Ok(expr)
     }
@@ -2075,9 +2129,10 @@ impl Syntax {
             let element = if self.is(TokenType::LeftParen) {
                 let mut expr = self.expr_new();
                 expr.node = AstNode::TupleDestr(self.parser_tuple_destr()?);
+                expr.end = self.prev().unwrap().end;
                 expr
             } else {
-                let expr = self.parser_expr()?;
+                let mut expr = self.parser_expr()?;
 
                 // 检查表达式是否可赋值
                 if !expr.node.can_assign() {
@@ -2087,6 +2142,7 @@ impl Syntax {
                         "tuple destr src operand assign failed".to_string(),
                     ));
                 }
+                expr.end = self.prev().unwrap().end;
                 expr
             };
 
@@ -2110,6 +2166,7 @@ impl Syntax {
             let element = if self.is(TokenType::LeftParen) {
                 let mut expr = self.expr_new();
                 expr.node = AstNode::TupleDestr(self.parser_var_tuple_destr()?);
+                expr.end = self.prev().unwrap().end;
                 expr
             } else {
                 let ident_token = self.must(TokenType::Ident)?.clone();
@@ -2124,6 +2181,7 @@ impl Syntax {
                     heap_ident: None,
                     symbol_id: None,
                 })));
+                expr.end = self.prev().unwrap().end;
                 expr
             };
 
@@ -2150,6 +2208,7 @@ impl Syntax {
             let right = self.parser_expr()?;
 
             stmt.node = AstNode::VarTupleDestr(tuple_destr, right);
+            stmt.end = self.prev().unwrap().end;
             return Ok(stmt);
         }
 
@@ -2169,7 +2228,7 @@ impl Syntax {
             })),
             self.parser_expr()?,
         );
-
+        stmt.end = self.prev().unwrap().end;
         Ok(stmt)
     }
 
@@ -2202,7 +2261,7 @@ impl Syntax {
             })),
             self.parser_expr()?,
         );
-
+        stmt.end = self.prev().unwrap().end;
         Ok(stmt)
     }
 
@@ -2475,6 +2534,7 @@ impl Syntax {
         self.type_params_table = HashMap::new();
 
         stmt.node = AstNode::FnDef(Arc::new(Mutex::new(fndef)));
+        stmt.end = self.prev().unwrap().end;
         Ok(stmt)
     }
 
@@ -2516,6 +2576,7 @@ impl Syntax {
         }
 
         stmt.node = AstNode::Let(expr);
+        stmt.end = self.prev().unwrap().end;
         Ok(stmt)
     }
 
@@ -2524,6 +2585,7 @@ impl Syntax {
         self.must(TokenType::Throw)?;
 
         stmt.node = AstNode::Throw(self.parser_expr()?);
+        stmt.end = self.prev().unwrap().end;
         Ok(stmt)
     }
 
@@ -2544,11 +2606,13 @@ impl Syntax {
             let mut stmt = self.stmt_new();
             let mut left = self.expr_new();
             left.node = AstNode::TupleDestr(self.parser_tuple_destr()?);
+            left.end = self.prev().unwrap().end;
 
             self.must(TokenType::Equal)?;
             let right = self.parser_expr()?;
 
             stmt.node = AstNode::Assign(left, right);
+            stmt.end = self.prev().unwrap().end;
             Ok(stmt)
         } else {
             // 普通表达式语句
@@ -2755,6 +2819,7 @@ impl Syntax {
         self.must(TokenType::RightParen)?;
 
         expr.node = AstNode::MacroDefault;
+        expr.end = self.prev().unwrap().end;
         Ok(expr)
     }
 
@@ -2766,6 +2831,7 @@ impl Syntax {
         self.must(TokenType::RightParen)?;
 
         expr.node = AstNode::MacroSizeof(target_type);
+        expr.end = self.prev().unwrap().end;
         Ok(expr)
     }
 
@@ -2777,6 +2843,7 @@ impl Syntax {
         self.must(TokenType::RightParen)?;
 
         expr.node = AstNode::MacroReflectHash(target_type);
+        expr.end = self.prev().unwrap().end;
         Ok(expr)
     }
 
@@ -2802,6 +2869,7 @@ impl Syntax {
             })),
             call_expr.clone(),
         );
+        vardef_stmt.end = self.prev().unwrap().end;
 
         // co_return(&result)
         let mut call_stmt = self.stmt_new();
@@ -2816,6 +2884,7 @@ impl Syntax {
             spread: false,
         };
         call_stmt.node = AstNode::Call(call);
+        call_stmt.end = self.prev().unwrap().end;
 
         stmt_list.push(vardef_stmt);
         stmt_list.push(call_stmt);
@@ -2836,6 +2905,7 @@ impl Syntax {
         let mut call_stmt = self.stmt_new();
         if let AstNode::Call(call) = &call_expr.node {
             call_stmt.node = AstNode::Call(call.clone());
+            call_stmt.end = self.prev().unwrap().end;
         }
         stmt_list.push(call_stmt);
         fndef.body = stmt_list;
@@ -2900,6 +2970,7 @@ impl Syntax {
 
         self.match_subject = false;
         expr.node = AstNode::Match(subject, cases);
+        expr.end = self.prev().unwrap().end;
         Ok(expr)
     }
 
@@ -2951,6 +3022,7 @@ impl Syntax {
         self.must(TokenType::RightParen)?;
 
         expr.node = AstNode::MacroAsync(r#async);
+        expr.end = self.prev().unwrap().end;
         Ok(expr)
     }
 
@@ -2962,6 +3034,7 @@ impl Syntax {
         self.must(TokenType::RightParen)?;
 
         expr.node = AstNode::MacroUla(src);
+        expr.end = self.prev().unwrap().end;
         Ok(expr)
     }
 

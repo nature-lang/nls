@@ -1,7 +1,38 @@
 use super::common::AnalyzerError;
-use crate::semantic_token::semantic_token_type_index;
 use strum_macros::Display;
 use tower_lsp::lsp_types::SemanticTokenType;
+
+pub const LEGEND_TYPE: &[SemanticTokenType] = &[
+    SemanticTokenType::FUNCTION, // fn ident
+    SemanticTokenType::VARIABLE, // variable ident
+    SemanticTokenType::STRING, // string literal
+    SemanticTokenType::COMMENT, // comment
+    SemanticTokenType::NUMBER, // number literal
+    SemanticTokenType::KEYWORD, //  所有的语法关键字，比如 var, if, then, else, fn ...
+    SemanticTokenType::OPERATOR, // 运算符
+    SemanticTokenType::PARAMETER, // function parameter ident
+    SemanticTokenType::TYPE,          // 用于类型名称（如 int, float, string 等）
+    SemanticTokenType::MACRO,         // 用于宏标识符
+    SemanticTokenType::PROPERTY,      // struct property ident
+    SemanticTokenType::NAMESPACE,     // package ident
+];
+
+pub fn semantic_token_type_index(token_type: SemanticTokenType) -> usize {
+    if token_type == SemanticTokenType::FUNCTION { return 0; }
+    if token_type == SemanticTokenType::VARIABLE { return 1; }
+    if token_type == SemanticTokenType::STRING { return 2; }
+    if token_type == SemanticTokenType::COMMENT { return 3; }
+    if token_type == SemanticTokenType::NUMBER { return 4; }
+    if token_type == SemanticTokenType::KEYWORD { return 5; }
+    if token_type == SemanticTokenType::OPERATOR { return 6; }
+    if token_type == SemanticTokenType::PARAMETER { return 7; }
+    if token_type == SemanticTokenType::TYPE { return 8; }
+    if token_type == SemanticTokenType::MACRO { return 9; }
+    if token_type == SemanticTokenType::PROPERTY { return 10; }
+    if token_type == SemanticTokenType::NAMESPACE { return 11; }
+
+    panic!("unknown semantic token type: {:?}", token_type)
+}
 
 #[derive(Debug, Clone, PartialEq, Display)]
 pub enum TokenType {
@@ -917,7 +948,6 @@ impl Lexer {
 
         while self.peek_guard() != close_char {
             let mut guard_char = self.peek_guard(); // utf8 char
-            dbg!(guard_char);
 
             if guard_char == '\n' {
                 self.errors.push(AnalyzerError {

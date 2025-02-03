@@ -66,7 +66,7 @@ export async function activate(context: ExtensionContext) {
         documentSelector: [{ scheme: "file", language: "n" }],
         synchronize: {
             // Notify the server about file changes to '.clientrc files contained in the workspace
-            fileEvents: workspace.createFileSystemWatcher("**/.clientrc"),
+            fileEvents: workspace.createFileSystemWatcher("**/package.toml"),
         },
         traceOutputChannel,
     };

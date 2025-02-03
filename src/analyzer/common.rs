@@ -4,9 +4,44 @@ use strum_macros::Display;
 
 use super::symbol::NodeId;
 
+use serde::Deserialize;
+
+#[derive(Deserialize, Debug, Clone)]
+pub struct LinkTargets {
+    pub linux_amd64: Option<String>,
+    pub linux_arm64: Option<String>,
+    pub darwin_amd64: Option<String>,
+    pub darwin_arm64: Option<String>,
+}
+
+#[derive(Deserialize, Debug, Clone)]
+pub struct Dependency {
+    #[serde(rename = "type")]
+    pub dep_type: String, // git or local
+    pub version: String,
+    pub url: Option<String>,
+    pub path: Option<String>,
+}
+
+#[derive(Deserialize, Debug, Clone)]
+pub struct PackageData {
+    pub name: String,
+    pub version: String,
+    pub entry: Option<String>, // custom entry point, default main
+    pub authors: Option<Vec<String>>,
+    pub description: Option<String>,
+    pub license: Option<String>,
+    #[serde(rename = "type")]
+    pub package_type: String, // 因为 type 是关键字，所以重命名
+    pub links: Option<HashMap<String, LinkTargets>>,
+    pub dependencies: HashMap<String, Dependency>,
+}
 
 #[derive(Debug, Clone)]
-pub struct PackageConfig {}
+pub struct PackageConfig {
+    pub path: String,
+    pub package_data: PackageData,
+}
 
 #[derive(Debug, Clone)]
 pub struct AnalyzerError {
@@ -554,13 +589,34 @@ pub struct ImportStmt {
     pub file: Option<String>,
     pub ast_package: Option<Vec<String>>,
     pub as_name: String,
-    pub package_type: u8,
+    pub module_type: u8,
+    pub module_ident: String, //  基于 full path 计算的 unique ident, 如果是 main.n 则 包含 main
     pub full_path: String,
-    pub package_conf: Option<PackageConfig>,
+    pub package_conf: Option<PackageConfig>, // import package 时总是依赖该配置
     pub package_dir: String,
     pub use_links: bool,
-    pub package_ident: String,
+    pub start: usize, // 冗余自 stmt, 用于 analyzer_import  能够快速处理
+    pub end: usize
 }
+
+impl Default for ImportStmt {
+    fn default() -> Self {
+        Self {
+            file: None,
+            ast_package: None,
+            as_name: String::new(),
+            module_type: 0,
+            full_path: String::new(),
+            package_conf: None,
+            package_dir: String::new(),
+            use_links: false,
+            module_ident: String::new(),
+            start: 0,
+            end: 0
+        }
+    }
+}
+
 
 #[derive(Debug, Clone)]
 pub struct GenericsParam {

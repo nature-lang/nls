@@ -22,6 +22,6 @@ thiserror = "2.0.3"
 rust-lapper = "1.1.0"
 strum = "0.25"
 strum_macros = "0.25"
-toml = "0.5"
-
+toml = "0.8"
+lazy_static = "1.4.0"
 

@@ -1,17 +1,13 @@
-use std::collections::HashMap;
-
 use dashmap::DashMap;
 use log::debug;
-use nls::analyzer::lexer;
-use nls::analyzer::Analyzer;
-use nls::completion::completion;
-use nls::nrs_lang::{type_inference, Ast};
-use nls::semantic_analyze::{IdentType, Semantic};
-use nls::semantic_token::LEGEND_TYPE;
-use nls::span::Span;
-use ropey::Rope;
+use nls::analyzer::lexer::LEGEND_TYPE;
+use nls::analyzer::module_unique_ident;
+use nls::package::parse_package;
+use nls::project::Project;
+use nls::utils::offset_to_position;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::sync::{Arc, Mutex};
 use tower_lsp::jsonrpc::Result;
 use tower_lsp::lsp_types::notification::Notification;
 use tower_lsp::lsp_types::*;
@@ -20,29 +16,40 @@ use tower_lsp::{Client, LanguageServer, LspService, Server};
 #[derive(Debug)]
 struct Backend {
     client: Client,
-    ast_map: DashMap<String, Ast>,
-    semantic_map: DashMap<String, Semantic>,
-    document_map: DashMap<String, Rope>,
-    semantic_token_map: DashMap<String, Vec<lexer::Token>>,
+    // document_map: DashMap<String, Rope>,
+    projects: DashMap<String, Project>, // key 是工作区 URI，value 是对应的项目
 }
 
 // backend 除了实现自身的方法，还实现了 LanguageServer trait 的方法
 #[tower_lsp::async_trait]
 impl LanguageServer for Backend {
-    async fn initialize(&self, _: InitializeParams) -> Result<InitializeResult> {
+    async fn initialize(&self, params: InitializeParams) -> Result<InitializeResult> {
+        // 获取工作区根目录
+        if let Some(workspace_folders) = params.workspace_folders {
+            for folder in workspace_folders {
+                // folder.uri 是工作区根目录的 URI
+                let project_root = folder.uri.to_file_path().expect("Failed to convert URI to file path").to_string_lossy().to_string();
+                let project = Project::new(project_root.clone(), self.client.clone());
+                project.backend_handle_queue();
+
+                dbg!(&project);
+
+                // 多工作区处理
+                self.projects.insert(project_root, project);
+            }
+        }
+
         Ok(InitializeResult {
             server_info: None,
             offset_encoding: None,
             capabilities: ServerCapabilities {
                 //  开启内联提示
-                inlay_hint_provider: Some(OneOf::Left(true)), 
+                inlay_hint_provider: Some(OneOf::Left(true)),
                 // 文档同步配置
                 text_document_sync: Some(TextDocumentSyncCapability::Options(TextDocumentSyncOptions {
                     open_close: Some(true),
                     change: Some(TextDocumentSyncKind::FULL),
-                    save: Some(TextDocumentSyncSaveOptions::SaveOptions(SaveOptions {
-                        include_text: Some(true),
-                    })),
+                    save: Some(TextDocumentSyncSaveOptions::SaveOptions(SaveOptions { include_text: Some(true) })),
                     ..Default::default()
                 })),
                 // 代码补全配置
@@ -72,8 +79,8 @@ impl LanguageServer for Backend {
                         text_document_registration_options: {
                             TextDocumentRegistrationOptions {
                                 document_selector: Some(vec![DocumentFilter {
-                                    language: Some("n".to_string()), // 指定语言
-                                    scheme: Some("file".to_string()), // 文件系统方案
+                                    language: Some("n".to_string()),
+                                    scheme: Some("file".to_string()),
                                     pattern: None,
                                 }]),
                             }
@@ -83,7 +90,7 @@ impl LanguageServer for Backend {
                             legend: SemanticTokensLegend {
                                 // // LEGEND_TYPE 通常定义在 semantic_token.rs 中，包含所有支持的标记类型
                                 token_types: LEGEND_TYPE.into(), // 支持的标记类型, 如函数、变量、字符串等
-                                token_modifiers: vec![], // 支持的标记修饰符, 例如 readonly, static 等
+                                token_modifiers: vec![],         // 支持的标记修饰符, 例如 readonly, static 等
                             },
                             range: Some(true), // 范围增量更新语义
                             full: Some(SemanticTokensFullOptions::Bool(true)),
@@ -100,7 +107,7 @@ impl LanguageServer for Backend {
         })
     }
     async fn initialized(&self, _: InitializedParams) {
-        debug!("initialized!--------------");
+        debug!("initialized");
     }
 
     async fn shutdown(&self) -> Result<()> {
@@ -144,89 +151,99 @@ impl LanguageServer for Backend {
     }
 
     // did open 中已经对 document 进行了处理，所以这里只需要从 semantic 中获取信息
-    async fn goto_definition(&self, params: GotoDefinitionParams) -> Result<Option<GotoDefinitionResponse>> {
+    async fn goto_definition(&self, _params: GotoDefinitionParams) -> Result<Option<GotoDefinitionResponse>> {
         let definition = || -> Option<GotoDefinitionResponse> {
             // uri 标识当前文档的唯一标识
-            let uri = params.text_document_position_params.text_document.uri;
+            // let uri = params.text_document_position_params.text_document.uri;
 
             // self 表示当前 backend, 通过 uri 标识快速获取对应的 semantic
-            let semantic = self.semantic_map.get(uri.as_str())?;
+            // let semantic = self.semantic_map.get(uri.as_str())?;
 
-            let rope = self.document_map.get(uri.as_str())?;
+            // let rope = self.document_map.get(uri.as_str())?;
 
-            // 获取当前光标位置
-            let position = params.text_document_position_params.position;
+            // // 获取当前光标位置
+            // let position = params.text_document_position_params.position;
 
-            // 将光标位置转换为偏移量
-            let offset = position_to_offset(position, &rope)?;
+            // // 将光标位置转换为偏移量
+            // let offset = position_to_offset(position, &rope)?;
 
-            // 获取当前光标位置的符号
-            let interval = semantic.ident_range.find(offset, offset + 1).next()?;
-            let interval_val = interval.val;
+            // // 获取当前光标位置的符号
+            // let interval = semantic.ident_range.find(offset, offset + 1).next()?;
+            // let interval_val = interval.val;
 
-            let range = match interval_val {
-                // 回到定义点
-                IdentType::Binding(symbol_id) => {
-                    let span = &semantic.table.symbol_id_to_span[symbol_id];
-                    Some(span.clone())
-                }
+            // let range = match interval_val {
+            //     // 回到定义点
+            //     IdentType::Binding(symbol_id) => {
+            //         let span = &semantic.table.symbol_id_to_span[symbol_id];
+            //         Some(span.clone())
+            //     }
 
-                // 通过引用获取符号定义的位置
-                IdentType::Reference(reference_id) => {
-                    let reference = semantic.table.reference_id_to_reference.get(reference_id)?;
-                    let symbol_id = reference.symbol_id?;
-                    let symbol_range = semantic.table.symbol_id_to_span.get(symbol_id)?;
-                    Some(symbol_range.clone())
-                }
-            };
+            //     // 通过引用获取符号定义的位置
+            //     IdentType::Reference(reference_id) => {
+            //         let reference = semantic.table.reference_id_to_reference.get(reference_id)?;
+            //         let symbol_id = reference.symbol_id?;
+            //         let symbol_range = semantic.table.symbol_id_to_span.get(symbol_id)?;
+            //         Some(symbol_range.clone())
+            //     }
+            // };
 
-            // 将源代码转换为 lsp 输出需要的位置格式
-            range.and_then(|range| {
-                let start_position = offset_to_position(range.start, &rope)?;
-                let end_position = offset_to_position(range.end, &rope)?;
-                Some(GotoDefinitionResponse::Scalar(Location::new(
-                    uri,
-                    Range::new(start_position, end_position),
-                )))
-            })
+            // // 将源代码转换为 lsp 输出需要的位置格式
+            // range.and_then(|range| {
+            //     let start_position = offset_to_position(range.start, &rope)?;
+            //     let end_position = offset_to_position(range.end, &rope)?;
+            //     Some(GotoDefinitionResponse::Scalar(Location::new(uri, Range::new(start_position, end_position))))
+            // })
+            None
         }();
         Ok(definition)
     }
 
     async fn references(&self, params: ReferenceParams) -> Result<Option<Vec<Location>>> {
         let reference_list = || -> Option<Vec<Location>> {
-            let uri = params.text_document_position.text_document.uri;
-            let semantic = self.semantic_map.get(uri.as_str())?;
-            let rope = self.document_map.get(uri.as_str())?;
-            let position = params.text_document_position.position;
-            let offset = position_to_offset(position, &rope)?;
-            let reference_span_list = get_references(&semantic, offset, offset + 1, false)?;
+            let _uri = params.text_document_position.text_document.uri;
+            // let semantic = self.semantic_map.get(uri.as_str())?;
+            // let rope = self.document_map.get(uri.as_str())?;
+            // let position = params.text_document_position.position;
+            // let offset = position_to_offset(position, &rope)?;
+            // let reference_span_list = get_references(&semantic, offset, offset + 1, false)?;
 
-            let ret = reference_span_list
-                .into_iter()
-                .filter_map(|range| {
-                    let start_position = offset_to_position(range.start, &rope)?;
-                    let end_position = offset_to_position(range.end, &rope)?;
+            // let ret = reference_span_list
+            //     .into_iter()
+            //     .filter_map(|range| {
+            //         let start_position = offset_to_position(range.start, &rope)?;
+            //         let end_position = offset_to_position(range.end, &rope)?;
 
-                    let range = Range::new(start_position, end_position);
+            //         let range = Range::new(start_position, end_position);
 
-                    Some(Location::new(uri.clone(), range))
-                })
-                .collect::<Vec<_>>();
-            Some(ret)
+            //         Some(Location::new(uri.clone(), range))
+            //     })
+            //     .collect::<Vec<_>>();
+            // Some(ret)
+            None
         }();
         Ok(reference_list)
     }
 
     async fn semantic_tokens_full(&self, params: SemanticTokensParams) -> Result<Option<SemanticTokensResult>> {
-        let uri = params.text_document.uri.to_string();
+        let file_path = params.text_document.uri.path();
         debug!("semantic_token_full");
 
         // semantic_tokens 是一个闭包, 返回 vscode 要求的 SemanticToken 结构
         let semantic_tokens = || -> Option<Vec<SemanticToken>> {
+            let Some(project) = self.get_file_project(&file_path) else { unreachable!() };
+
+            // 直接从 module_handled 中获取
+            let module_index = {
+                let module_handled = project.module_handled.lock().unwrap();
+                module_handled.get(file_path)?.clone()
+            };
+
+            let mut module_db = project.module_db.lock().unwrap();
+            let m = &mut module_db[module_index];
+
             // 获取 semantic_token_map 中的 token
-            let mut im_complete_tokens = self.semantic_token_map.get_mut(&uri)?;
-            let rope = self.document_map.get(&uri)?;
+            let im_complete_tokens = m.sem_token_db.clone();
+            let rope = m.rope.clone();
 
             // im_complete_tokens.sort_by(|a, b| a.start.cmp(&b.start));
 
@@ -235,7 +252,6 @@ impl LanguageServer for Backend {
             let semantic_tokens: Vec<SemanticToken> = im_complete_tokens
                 .iter()
                 .filter_map(|token| {
-
                     // dbg!(token.clone(), pre_line, pre_start);
 
                     let line = rope.try_char_to_line(token.start).ok()? as u32;
@@ -245,7 +261,6 @@ impl LanguageServer for Backend {
                     let delta_start = if delta_line == 0 { start - pre_start } else { start };
 
                     // dbg!(line, first, start, delta_line, delta_start, "--------------------------------");
-
 
                     let ret = Some(SemanticToken {
                         delta_line,
@@ -270,14 +285,26 @@ impl LanguageServer for Backend {
         Ok(None)
     }
 
-    async fn semantic_tokens_range(
-        &self,
-        params: SemanticTokensRangeParams,
-    ) -> Result<Option<SemanticTokensRangeResult>> {
-        let uri = params.text_document.uri.to_string();
+    async fn semantic_tokens_range(&self, params: SemanticTokensRangeParams) -> Result<Option<SemanticTokensRangeResult>> {
+        let file_path = params.text_document.uri.path();
         let semantic_tokens = || -> Option<Vec<SemanticToken>> {
-            let im_complete_tokens = self.semantic_token_map.get(&uri)?;
-            let rope = self.document_map.get(&uri)?;
+            let Some(project) = self.get_file_project(&file_path) else {
+                unreachable!()
+            };
+
+            // 直接从 module_handled 中获取
+            let module_index = {
+                let module_handled = project.module_handled.lock().unwrap();
+                module_handled.get(file_path)?.clone()
+            };
+
+            let mut module_db = project.module_db.lock().unwrap();
+            let m = &mut module_db[module_index];
+
+            // 获取 semantic_token_map 中的 token
+            let im_complete_tokens = m.sem_token_db.clone();
+            let rope = m.rope.clone();
+
             let mut pre_line = 0;
             let mut pre_start = 0;
             let semantic_tokens = im_complete_tokens
@@ -303,137 +330,137 @@ impl LanguageServer for Backend {
         Ok(semantic_tokens.map(|data| SemanticTokensRangeResult::Tokens(SemanticTokens { result_id: None, data })))
     }
 
-    async fn inlay_hint(&self, params: tower_lsp::lsp_types::InlayHintParams) -> Result<Option<Vec<InlayHint>>> {
-        debug!("inlay hint");
-        let uri = &params.text_document.uri;
-        let mut hashmap = HashMap::new();
-        if let Some(ast) = self.ast_map.get(uri.as_str()) {
-            ast.iter().for_each(|(func, _)| {
-                type_inference(&func.body, &mut hashmap);
-            });
-        }
+    async fn inlay_hint(&self, _params: tower_lsp::lsp_types::InlayHintParams) -> Result<Option<Vec<InlayHint>>> {
+        // debug!("inlay hint");
+        // let uri = &params.text_document.uri;
+        // let mut hashmap = HashMap::new();
+        // if let Some(ast) = self.ast_map.get(uri.as_str()) {
+        //     ast.iter().for_each(|(func, _)| {
+        //         type_inference(&func.body, &mut hashmap);
+        //     });
+        // }
 
-        let document = match self.document_map.get(uri.as_str()) {
-            Some(rope) => rope,
-            None => return Ok(None),
-        };
-        let inlay_hint_list = hashmap
-            .into_iter()
-            .map(|(k, v)| {
-                (
-                    k.start,
-                    k.end,
-                    match v {
-                        nls::nrs_lang::Value::Null => "null".to_string(),
-                        nls::nrs_lang::Value::Bool(_) => "bool".to_string(),
-                        nls::nrs_lang::Value::Num(_) => "number".to_string(),
-                        nls::nrs_lang::Value::Str(_) => "string".to_string(),
-                    },
-                )
-            })
-            .filter_map(|item| {
-                // let start_position = offset_to_position(item.0, document)?;
-                let end_position = offset_to_position(item.1, &document)?;
-                let inlay_hint = InlayHint {
-                    text_edits: None,
-                    tooltip: None,
-                    kind: Some(InlayHintKind::TYPE),
-                    padding_left: None,
-                    padding_right: None,
-                    data: None,
-                    position: end_position,
-                    label: InlayHintLabel::LabelParts(vec![InlayHintLabelPart {
-                        value: item.2,
-                        tooltip: None,
-                        location: Some(Location {
-                            uri: params.text_document.uri.clone(),
-                            range: Range {
-                                start: Position::new(0, 4),
-                                end: Position::new(0, 10),
-                            },
-                        }),
-                        command: None,
-                    }]),
-                };
-                Some(inlay_hint)
-            })
-            .collect::<Vec<_>>();
+        // let document = match self.document_map.get(uri.as_str()) {
+        //     Some(rope) => rope,
+        //     None => return Ok(None),
+        // };
+        // let inlay_hint_list = hashmap
+        //     .into_iter()
+        //     .map(|(k, v)| {
+        //         (
+        //             k.start,
+        //             k.end,
+        //             match v {
+        //                 nls::nrs_lang::Value::Null => "null".to_string(),
+        //                 nls::nrs_lang::Value::Bool(_) => "bool".to_string(),
+        //                 nls::nrs_lang::Value::Num(_) => "number".to_string(),
+        //                 nls::nrs_lang::Value::Str(_) => "string".to_string(),
+        //             },
+        //         )
+        //     })
+        //     .filter_map(|item| {
+        //         // let start_position = offset_to_position(item.0, document)?;
+        //         let end_position = offset_to_position(item.1, &document)?;
+        //         let inlay_hint = InlayHint {
+        //             text_edits: None,
+        //             tooltip: None,
+        //             kind: Some(InlayHintKind::TYPE),
+        //             padding_left: None,
+        //             padding_right: None,
+        //             data: None,
+        //             position: end_position,
+        //             label: InlayHintLabel::LabelParts(vec![InlayHintLabelPart {
+        //                 value: item.2,
+        //                 tooltip: None,
+        //                 location: Some(Location {
+        //                     uri: params.text_document.uri.clone(),
+        //                     range: Range {
+        //                         start: Position::new(0, 4),
+        //                         end: Position::new(0, 10),
+        //                     },
+        //                 }),
+        //                 command: None,
+        //             }]),
+        //         };
+        //         Some(inlay_hint)
+        //     })
+        //     .collect::<Vec<_>>();
 
-        Ok(Some(inlay_hint_list))
+        // Ok(Some(inlay_hint_list))
+        Ok(None)
     }
 
     async fn completion(&self, params: CompletionParams) -> Result<Option<CompletionResponse>> {
-        let uri = params.text_document_position.text_document.uri;
-        let position = params.text_document_position.position;
+        let _uri = params.text_document_position.text_document.uri;
+        let _position = params.text_document_position.position;
         let completions = || -> Option<Vec<CompletionItem>> {
-            let rope = self.document_map.get(&uri.to_string())?;
-            let ast = self.ast_map.get(&uri.to_string())?;
-            let char = rope.try_line_to_char(position.line as usize).ok()?;
-            let offset = char + position.character as usize;
-            let completions = completion(&ast, offset);
-            let mut ret = Vec::with_capacity(completions.len());
-            for (_, item) in completions {
-                match item {
-                    nls::completion::ImCompleteCompletionItem::Variable(var) => {
-                        ret.push(CompletionItem {
-                            label: var.clone(),
-                            insert_text: Some(var.clone()),
-                            kind: Some(CompletionItemKind::VARIABLE),
-                            detail: Some(var),
-                            ..Default::default()
-                        });
-                    }
-                    nls::completion::ImCompleteCompletionItem::Function(name, args) => {
-                        ret.push(CompletionItem {
-                            label: name.clone(),
-                            kind: Some(CompletionItemKind::FUNCTION),
-                            detail: Some(name.clone()),
-                            insert_text: Some(format!(
-                                "{}({})",
-                                name,
-                                args.iter()
-                                    .enumerate()
-                                    .map(|(index, item)| { format!("${{{}:{}}}", index + 1, item) })
-                                    .collect::<Vec<_>>()
-                                    .join(",")
-                            )),
-                            insert_text_format: Some(InsertTextFormat::SNIPPET),
-                            ..Default::default()
-                        });
-                    }
-                }
-            }
-            Some(ret)
+            // let rope = self.document_map.get(&uri.to_string())?;
+            // let ast = self.ast_map.get(&uri.to_string())?;
+            // let char = rope.try_line_to_char(position.line as usize).ok()?;
+            // let offset = char + position.character as usize;
+            // let completions = completion(&ast, offset);
+            // let mut ret = Vec::with_capacity(completions.len());
+            // for (_, item) in completions {
+            //     match item {
+            //         nls::completion::ImCompleteCompletionItem::Variable(var) => {
+            //             ret.push(CompletionItem {
+            //                 label: var.clone(),
+            //                 insert_text: Some(var.clone()),
+            //                 kind: Some(CompletionItemKind::VARIABLE),
+            //                 detail: Some(var),
+            //                 ..Default::default()
+            //             });
+            //         }
+            //         nls::completion::ImCompleteCompletionItem::Function(name, args) => {
+            //             ret.push(CompletionItem {
+            //                 label: name.clone(),
+            //                 kind: Some(CompletionItemKind::FUNCTION),
+            //                 detail: Some(name.clone()),
+            //                 insert_text: Some(format!(
+            //                     "{}({})",
+            //                     name,
+            //                     args.iter()
+            //                         .enumerate()
+            //                         .map(|(index, item)| { format!("${{{}:{}}}", index + 1, item) })
+            //                         .collect::<Vec<_>>()
+            //                         .join(",")
+            //                 )),
+            //                 insert_text_format: Some(InsertTextFormat::SNIPPET),
+            //                 ..Default::default()
+            //             });
+            //         }
+            //     }
+            // }
+            // Some(ret)
+            None
         }();
         Ok(completions.map(CompletionResponse::Array))
     }
 
-    async fn rename(&self, params: RenameParams) -> Result<Option<WorkspaceEdit>> {
+    async fn rename(&self, _params: RenameParams) -> Result<Option<WorkspaceEdit>> {
         let workspace_edit = || -> Option<WorkspaceEdit> {
-            let uri = params.text_document_position.text_document.uri;
-            let semantic = self.semantic_map.get(uri.as_str())?;
-            let rope = self.document_map.get(uri.as_str())?;
-            let position = params.text_document_position.position;
-            let offset = position_to_offset(position, &rope)?;
-            let reference_list = get_references(&semantic, offset, offset + 1, true)?;
+            // let uri = params.text_document_position.text_document.uri;
+            // let semantic = self.semantic_map.get(uri.as_str())?;
+            // let rope = self.document_map.get(uri.as_str())?;
+            // let position = params.text_document_position.position;
+            // let offset = position_to_offset(position, &rope)?;
+            // let reference_list = get_references(&semantic, offset, offset + 1, true)?;
 
-            let new_name = params.new_name;
-            (!reference_list.is_empty()).then_some(()).map(|_| {
-                let edit_list = reference_list
-                    .into_iter()
-                    .filter_map(|range| {
-                        let start_position = offset_to_position(range.start, &rope)?;
-                        let end_position = offset_to_position(range.end, &rope)?;
-                        Some(TextEdit::new(
-                            Range::new(start_position, end_position),
-                            new_name.clone(),
-                        ))
-                    })
-                    .collect::<Vec<_>>();
-                let mut map = HashMap::new();
-                map.insert(uri, edit_list);
-                WorkspaceEdit::new(map)
-            })
+            // let new_name = params.new_name;
+            // (!reference_list.is_empty()).then_some(()).map(|_| {
+            //     let edit_list = reference_list
+            //         .into_iter()
+            //         .filter_map(|range| {
+            //             let start_position = offset_to_position(range.start, &rope)?;
+            //             let end_position = offset_to_position(range.end, &rope)?;
+            //             Some(TextEdit::new(Range::new(start_position, end_position), new_name.clone()))
+            //         })
+            //         .collect::<Vec<_>>();
+            //     let mut map = HashMap::new();
+            //     map.insert(uri, edit_list);
+            //     WorkspaceEdit::new(map)
+            // })
+            None
         }();
         Ok(workspace_edit)
     }
@@ -446,7 +473,8 @@ impl LanguageServer for Backend {
         debug!("workspace folders changed!");
     }
 
-    async fn did_change_watched_files(&self, _: DidChangeWatchedFilesParams) {
+    async fn did_change_watched_files(&self, params: DidChangeWatchedFilesParams) {
+        dbg!(params);
         debug!("watched files have changed!");
     }
 
@@ -480,57 +508,78 @@ struct TextDocumentItem<'a> {
 }
 
 impl Backend {
+    // 添加一个辅助方法来根据文件 URI 找到对应的项目
+    fn get_file_project(&self, file_path: &str) -> Option<Project> {
+        // 遍历所有项目，找到包含该文件的项目
+        for entry in self.projects.iter() {
+            let workspace_uri = entry.key();
+            dbg!(&file_path, &workspace_uri, file_path.starts_with(workspace_uri));
+            if file_path.starts_with(workspace_uri) {
+                return Some(entry.value().clone()); // project 中的数据都通过 arc 共享，可以随便 clone
+            }
+        }
+        None
+    }
+
     async fn on_change<'a>(&self, params: TextDocumentItem<'a>) {
-        dbg!(&params.version);
-        debug!(r#"Text content:
+        dbg!(&params.uri);
+        debug!(
+            r#"Text content:
         {}
-        "#, params.text); 
+        "#,
+            params.text
+        );
 
-        let rope = ropey::Rope::from_str(params.text);
-        // uri 是文档的唯一标识
-        self.document_map.insert(params.uri.to_string(), rope.clone());
+        let file_path = params.uri.path();
+        let Some(mut project) = self.get_file_project(&file_path) else {
+            unreachable!()
+        };
 
-        let (sem_tokens, _, analyzer_errors) = Analyzer::analyze(params.text.to_string());
-        dbg!(&analyzer_errors);
+        // package.toml specail handle
+        if file_path.ends_with("package.toml") {
+            match parse_package(&file_path) {
+                Ok(package_conf) => {
+                    project.package_config = Some(Arc::new(Mutex::new(package_conf)));
+                }
+                Err(e) => {
+                    // 创建 rope 用于将偏移量转换为位置
+                    let rope = ropey::Rope::from_str(params.text);
+                    let start_position = offset_to_position(e.start, &rope).unwrap_or(Position::new(0, 0));
 
-        let diagnostics = analyzer_errors // 访问内部的 Vec<AnalyzerError>
-            .into_iter()
-            .filter_map(|error| {
-                let start_position = offset_to_position(error.start, &rope)?;
-                let end_position = offset_to_position(error.end, &rope)?;
-                Some(Diagnostic::new_simple(
-                    Range::new(start_position, end_position),
-                    error.message,
-                ))
-            })
-            .collect::<Vec<_>>();
+                    let end_position = offset_to_position(e.end, &rope).unwrap_or(Position::new(0, 0));
 
-        // if let Some(ast) = ast {
-        //     match analyze_program(&ast) {
-        //         Ok(semantic) => {
-        //             self.semantic_map.insert(params.uri.to_string(), semantic);
-        //         }
-        //         Err(err) => {
-        //             self.semantic_token_map.remove(&params.uri.to_string());
-        //             let span = err.span();
-        //             let start_position = offset_to_position(span.start, &rope);
-        //             let end_position = offset_to_position(span.end, &rope);
-        //             let diag = start_position
-        //                 .and_then(|start| end_position.map(|end| (start, end)))
-        //                 .map(|(start, end)| Diagnostic::new_simple(Range::new(start, end), format!("{:?}", err)));
-        //             if let Some(diag) = diag {
-        //                 diagnostics.push(diag);
-        //             }
-        //         }
-        //     };
-        //     self.ast_map.insert(params.uri.to_string(), ast);
-        // }
+                    let diagnostic = Diagnostic::new_simple(Range::new(start_position, end_position), format!("parser package.toml failed: {}", e.message));
+                    self.client.publish_diagnostics(params.uri.clone(), vec![diagnostic], params.version).await;
+                }
+            }
+            return;
+        }
 
-        self.client
-            .publish_diagnostics(params.uri.clone(), diagnostics, params.version)
-            .await;
+        let module_ident = module_unique_ident(&project.root, &file_path);
+        debug!("will build, module ident: {}", module_ident);
+        //  基于 project path 计算 moudle ident
+        let module_index = project.build(&file_path, &module_ident).await;
+        debug!("build success");
 
-        self.semantic_token_map.insert(params.uri.to_string(), sem_tokens);
+        let diagnostics = {
+            let mut module_db = project.module_db.lock().unwrap();
+            let m = &mut module_db[module_index];
+
+            dbg!(&m.analyzer_errors);
+
+            m.analyzer_errors
+                .clone()
+                .into_iter()
+                .filter_map(|error| {
+                    let start_position = offset_to_position(error.start, &m.rope)?;
+                    let end_position = offset_to_position(error.end, &m.rope)?;
+                    Some(Diagnostic::new_simple(Range::new(start_position, end_position), error.message))
+                })
+                .collect::<Vec<_>>()
+        }; // MutexGuard 在这里被释放
+
+        // 现在可以安全地使用 await
+        self.client.publish_diagnostics(params.uri.clone(), diagnostics, params.version).await;
     }
 }
 
@@ -541,48 +590,12 @@ async fn main() {
     let stdin = tokio::io::stdin();
     let stdout = tokio::io::stdout();
 
-    // 实例化后的 backend 实现了 LanguageServer trait 以及 on change 方法。tower lsp 会调用这些方法
     let (service, socket) = LspService::build(|client| Backend {
         client,
-        ast_map: DashMap::new(),
-        document_map: DashMap::new(),
-        semantic_token_map: DashMap::new(),
-        semantic_map: DashMap::new(),
+        // document_map: DashMap::new(),
+        projects: DashMap::new(),
     })
     .finish();
 
     Server::new(stdin, stdout, socket).serve(service).await;
-}
-
-fn offset_to_position(offset: usize, rope: &Rope) -> Option<Position> {
-    let line = rope.try_char_to_line(offset).ok()?;
-    let first_char_of_line = rope.try_line_to_char(line).ok()?;
-    let column = offset - first_char_of_line;
-    Some(Position::new(line as u32, column as u32))
-}
-
-fn position_to_offset(position: Position, rope: &Rope) -> Option<usize> {
-    let line_char_offset = rope.try_line_to_char(position.line as usize).ok()?;
-    let slice = rope.slice(0..line_char_offset + position.character as usize);
-    Some(slice.len_bytes())
-}
-
-fn get_references(semantic: &Semantic, start: usize, end: usize, include_definition: bool) -> Option<Vec<Span>> {
-    let interval = semantic.ident_range.find(start, end).next()?;
-    let interval_val = interval.val;
-    match interval_val {
-        IdentType::Binding(symbol_id) => {
-            let references = semantic.table.symbol_id_to_references.get(&symbol_id)?;
-            let mut reference_span_list: Vec<Span> = references
-                .iter()
-                .map(|reference_id| semantic.table.reference_id_to_reference[*reference_id].span.clone())
-                .collect();
-            if include_definition {
-                let symbol_range = semantic.table.symbol_id_to_span.get(symbol_id)?;
-                reference_span_list.push(symbol_range.clone());
-            }
-            Some(reference_span_list)
-        }
-        IdentType::Reference(_) => None,
-    }
 }
