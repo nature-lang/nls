@@ -29,7 +29,7 @@ impl LanguageServer for Backend {
             for folder in workspace_folders {
                 // folder.uri 是工作区根目录的 URI
                 let project_root = folder.uri.to_file_path().expect("Failed to convert URI to file path").to_string_lossy().to_string();
-                let project = Project::new(project_root.clone(), self.client.clone());
+                let project = Project::new(project_root.clone(), self.client.clone()).await;
                 project.backend_handle_queue();
 
                 dbg!(&project);

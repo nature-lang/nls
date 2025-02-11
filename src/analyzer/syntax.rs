@@ -278,6 +278,7 @@ impl Syntax {
             type_: Type::default(),
             target_type: Type::default(),
             node: AstNode::None,
+            err: false,
         })
     }
 
@@ -879,11 +880,12 @@ impl Syntax {
             };
 
             t.kind = TypeKind::Fn(Box::new(TypeFn {
-                name: None,
+                name: "".to_string(),
                 param_types,
                 return_type,
                 rest: false,
                 tpl: false,
+                errable: false
             }));
             t.end = self.prev().unwrap().end;
             return Ok(t);
@@ -997,7 +999,7 @@ impl Syntax {
         let alias_ident = ident_token.clone();
 
         // T<arg1, arg2>
-        let mut alias_args = Vec::new();
+        let mut alias_params = Vec::new();
         if self.consume(TokenType::LeftAngle) {
             if self.is(TokenType::RightAngle) {
                 return Err(SyntaxError(self.peek().start, self.peek().end, "type alias params cannot be empty".to_string()));
@@ -1023,7 +1025,7 @@ impl Syntax {
                     }
                 }
 
-                alias_args.push(param);
+                alias_params.push(param);
 
                 self.type_params_table.insert(ident.clone(), ident.clone());
 
@@ -1046,8 +1048,8 @@ impl Syntax {
             ident: alias_ident.literal,
             symbol_start: alias_ident.start,
             symbol_end: alias_ident.end,
-            params: if alias_args.is_empty() { None } else { Some(alias_args) },
-            type_: alias_type,
+            params: alias_params,
+            type_expr: alias_type,
             symbol_id: None,
         })));
         stmt.end = self.prev().unwrap().end;
@@ -2074,7 +2076,7 @@ impl Syntax {
             self.lambda_index += 1;
 
             fndef.symbol_name = name.clone();
-            fndef.fn_name = Some(name);
+            fndef.fn_name = name;
         }
 
         self.parser_params(&mut fndef)?;
@@ -2473,7 +2475,7 @@ impl Syntax {
         let ident = self.must(TokenType::Ident)?;
 
         fndef.symbol_name = ident.literal.clone();
-        fndef.fn_name = Some(ident.literal.clone());
+        fndef.fn_name = ident.literal.clone();
 
         // 处理非实现类型的泛型参数
         if !is_impl_type && self.consume(TokenType::LeftAngle) {
@@ -2875,9 +2877,9 @@ impl Syntax {
         let mut call_stmt = self.stmt_new();
         let call = AstCall {
             return_type: Type::default(),
-            left: Box::new(Expr::ident(fndef.start, fndef.end, "co_return".to_string())),
+            left: Box::new(Expr::ident(fndef.start, fndef.end, "co_return".to_string(), None)),
             args: vec![Box::new(Expr {
-                node: AstNode::Unary(ExprOp::La, Box::new(Expr::ident(fndef.start, fndef.end, "result".to_string()))),
+                node: AstNode::Unary(ExprOp::La, Box::new(Expr::ident(fndef.start, fndef.end, "result".to_string(), None))),
                 ..Default::default()
             })],
             generics_args: Vec::new(),

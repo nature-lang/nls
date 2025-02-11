@@ -1,4 +1,3 @@
-pub mod semantic_token;
 pub mod analyzer;
 pub mod project;
 pub mod utils;

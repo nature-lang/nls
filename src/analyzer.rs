@@ -3,11 +3,13 @@ pub mod lexer; // 声明子模块
 pub mod semantic;
 pub mod symbol;
 pub mod syntax;
+pub mod typesys;
 
 use std::path::Path;
 
 use crate::package::parse_package;
 use crate::project::{Module, DEFAULT_NATURE_ROOT};
+use crate::utils::format_global_ident;
 use common::{AnalyzerError, AstNode, ImportStmt, PackageConfig, Stmt};
 use lazy_static::lazy_static;
 use log::debug;
@@ -379,28 +381,28 @@ pub fn register_global_symbol(m: &Module, symbol_table: &mut SymbolTable, stmts:
             AstNode::VarDecl(var_decl_mutex) => {
                 let var_decl = var_decl_mutex.lock().unwrap();
                 // 构造全局唯一标识符
-                let global_ident = format!("{}.{}", m.ident, var_decl.ident);
+                let global_ident = format_global_ident(m.ident.clone(), var_decl.ident.clone());
                 dbg!(&global_ident);
                 let _ = symbol_table.define_symbol(global_ident, SymbolKind::Var(var_decl_mutex.clone()), var_decl.symbol_start);
             }
             AstNode::VarDef(var_decl_mutex, _) => {
                 let var_decl = var_decl_mutex.lock().unwrap();
                 // 构造全局唯一标识符
-                let global_ident = format!("{}.{}", m.ident, var_decl.ident);
+                let global_ident = format_global_ident(m.ident.clone(), var_decl.ident.clone());
                 dbg!(&global_ident);
                 let _ = symbol_table.define_symbol(global_ident, SymbolKind::Var(var_decl_mutex.clone()), var_decl.symbol_start);
             }
             AstNode::TypeAlias(type_alias_mutex) => {
                 let type_alias = type_alias_mutex.lock().unwrap();
                 // 构造全局唯一标识符
-                let global_ident = format!("{}.{}", m.ident, type_alias.ident);
+                let global_ident = format_global_ident(m.ident.clone(), type_alias.ident.clone());
                 dbg!(&global_ident);
                 let _ = symbol_table.define_symbol(global_ident, SymbolKind::TypeAlias(type_alias_mutex.clone()), type_alias.symbol_start);
             }
             AstNode::FnDef(fndef_mutex) => {
                 let fndef = fndef_mutex.lock().unwrap();
                 // 构造全局唯一标识符
-                let global_ident = format!("{}.{}", m.ident, fndef.symbol_name);
+                let global_ident = format_global_ident(m.ident.clone(), fndef.symbol_name.clone());
                 dbg!(&global_ident);
                 let _ = symbol_table.define_symbol(global_ident, SymbolKind::Fn(fndef_mutex.clone()), fndef.symbol_start);
             }

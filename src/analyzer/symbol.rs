@@ -1,4 +1,4 @@
-use super::common::{AstFnDef, VarDeclExpr, TypeAliasStmt};
+use super::common::{AstFnDef, TypeAliasStmt, VarDeclExpr};
 use std::collections::HashMap;
 use std::num::NonZeroU32;
 use std::sync::{Arc, Mutex};
@@ -37,7 +37,7 @@ impl<T> Arena<T> {
     }
 }
 
-//  引用自 AstNode 
+//  引用自 AstNode
 #[derive(Debug, Clone)]
 pub enum SymbolKind {
     Var(Arc<Mutex<VarDeclExpr>>), // 变量原始定义
@@ -52,10 +52,10 @@ pub struct Symbol {
     pub ident: String,
     pub kind: SymbolKind,
     pub defined_in: NodeId, // defined in scope
-    pub pos: usize, // 符号定义的其实位置
+    pub pos: usize,         // 符号定义的其实位置
 
     // local symbol 需要一些额外信息
-    pub is_capture: bool,     // 如果变量被捕获，则需要分配到堆中，避免作用域问题
+    pub is_capture: bool, // 如果变量被捕获，则需要分配到堆中，避免作用域问题
 }
 
 #[derive(Debug, Clone)]
@@ -83,7 +83,7 @@ pub struct Scope {
     pub children: Vec<NodeId>,               // 子作用域列表
     pub symbol_map: HashMap<String, NodeId>, // 符号名到符号ID的映射
 
-    pub range: (usize, usize),               // 作用域的范围, [start, end)
+    pub range: (usize, usize), // 作用域的范围, [start, end)
 
     // 当前作用域是否为函数级别作用域
     pub kind: ScopeKind,
@@ -175,12 +175,7 @@ impl SymbolTable {
     /**
      * 存在 rebuild 机制，所以同一个符号会被重复定义, 但是定义的位置相同。
      */
-    pub fn define_symbol(
-        &mut self,
-        ident: String,
-        kind: SymbolKind,
-        pos: usize,
-    ) -> Result<NodeId, String> {
+    pub fn define_symbol(&mut self, ident: String, kind: SymbolKind, pos: usize) -> Result<NodeId, String> {
         // 检查当前作用域是否已存在同名符号
         if let Some(scope) = self.scopes.get(self.current_scope_id) {
             if let Some(&existing_symbol_id) = scope.symbol_map.get(&ident) {
@@ -192,7 +187,10 @@ impl SymbolTable {
                         return Ok(existing_symbol_id);
                     } else {
                         // 位置不同，则是真正的重复定义
-                        return Err(format!("symbol '{}' already defined in current scope at position {}", ident, existing_symbol.pos));
+                        return Err(format!(
+                            "symbol '{}' already defined in current scope at position {}",
+                            ident, existing_symbol.pos
+                        ));
                     }
                 }
             }
@@ -238,7 +236,7 @@ impl SymbolTable {
 
     pub fn find_global_fn(&self) -> Option<Arc<Mutex<AstFnDef>>> {
         let mut current = Some(self.current_scope_id);
-        
+
         while let Some(scope_id) = current {
             if let Some(scope) = self.scopes.get(scope_id) {
                 match &scope.kind {
@@ -252,9 +250,17 @@ impl SymbolTable {
         None
     }
 
-    pub fn find_symbol(&self, ident: &str, scope_id: NodeId) -> Option<NodeId> {
+    pub fn find_symbol_id(&self, ident: &str, scope_id: NodeId) -> Option<NodeId> {
         if let Some(scope) = self.scopes.get(scope_id) {
             return scope.symbol_map.get(ident).cloned();
+        } else {
+            return None;
+        }
+    }
+
+    pub fn find_global_symbol(&self, ident: &str) -> Option<&Symbol> {
+        if let Some(symbol_id) = self.find_symbol_id(ident, GLOBAL_SCOPE_ID) {
+            return Some(self.symbols.get(symbol_id).unwrap())
         } else {
             return None;
         }
@@ -276,7 +282,6 @@ impl SymbolTable {
         }
     }
 
-    // 获取符号信息(从当前 作用域)
     pub fn get_symbol(&self, id: NodeId) -> Option<&Symbol> {
         self.symbols.get(id)
     }
@@ -289,12 +294,7 @@ impl SymbolTable {
             // 打印该作用域中的符号
             for &symbol_id in &scope.symbols {
                 if let Some(symbol) = self.symbols.get(symbol_id) {
-                    println!(
-                        "{}  Symbol: {} ({:?})",
-                        " ".repeat(indent),
-                        symbol.ident,
-                        symbol.kind
-                    );
+                    println!("{}  Symbol: {} ({:?})", " ".repeat(indent), symbol.ident, symbol.kind);
                 }
             }
 
@@ -303,5 +303,9 @@ impl SymbolTable {
                 self.print_scope_tree(child_id, indent + 2);
             }
         }
+    }
+
+    pub fn symbol_is_local(&self, symbol: &Symbol) -> bool {
+        return symbol.defined_in != GLOBAL_SCOPE_ID;
     }
 }

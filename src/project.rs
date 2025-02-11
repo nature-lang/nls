@@ -1,9 +1,11 @@
-use crate::analyzer::common::{AnalyzerError, ImportStmt, PackageConfig, Stmt};
+use crate::analyzer::common::{AnalyzerError, AstFnDef, AstNode, ImportStmt, PackageConfig, Stmt};
 use crate::analyzer::lexer::{Lexer, Token};
 use crate::analyzer::semantic::Semantic;
 use crate::analyzer::symbol::SymbolTable;
 use crate::analyzer::syntax::Syntax;
+use crate::analyzer::typesys::Typesys;
 use crate::analyzer::{analyze_imports, register_global_symbol};
+use crate::package::parse_package;
 use ropey::Rope;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
@@ -17,6 +19,7 @@ pub const DEFAULT_NATURE_ROOT: &str = "/Users/weiwenhao/Code/nature";
 // 单个文件称为 module, package 通常是包含 package.toml 的多级目录
 #[derive(Debug, Clone)]
 pub struct Module {
+    pub index: usize,
     pub ident: String,
     pub source: String, //  源码内容
     pub rope: Rope,
@@ -26,6 +29,9 @@ pub struct Module {
     pub token_indexes: Vec<usize>,
     pub sem_token_db: Vec<Token>,
     pub stmts: Vec<Box<Stmt>>,
+    pub global_vardefs: Vec<AstNode>,
+    pub global_fndefs: Vec<Arc<Mutex<AstFnDef>>>,
+    pub all_fndefs: Vec<Arc<Mutex<AstFnDef>>>, // 包含 global 和 local fn def
     pub analyzer_errors: Vec<AnalyzerError>,
 
     pub references: Vec<usize>,        // 哪些模块依赖于当前模块
@@ -33,7 +39,7 @@ pub struct Module {
 }
 
 impl Module {
-    pub fn new(ident: String, source: String, path: String) -> Self {
+    pub fn new(ident: String, source: String, path: String, index: usize) -> Self {
         // 计算 module ident, 和 analyze_import 中的 import.module_ident 需要采取相同的策略
 
         let dir = Path::new(&path).parent().and_then(|p| p.to_str()).unwrap_or("").to_string();
@@ -41,6 +47,7 @@ impl Module {
         let rope = ropey::Rope::from_str(&source);
 
         Self {
+            index,
             ident,
             source,
             path,
@@ -50,6 +57,9 @@ impl Module {
             token_indexes: Vec::new(),
             sem_token_db: Vec::new(),
             stmts: Vec::new(),
+            global_vardefs: Vec::new(),
+            global_fndefs: Vec::new(),
+            all_fndefs: Vec::new(),
             analyzer_errors: Vec::new(),
             references: Vec::new(),
             dependencies: Vec::new(),
@@ -69,6 +79,7 @@ impl Module {
 impl Default for Module {
     fn default() -> Self {
         Self {
+            index: 0,
             ident: "".to_string(),
             source: "".to_string(),
             path: "".to_string(),
@@ -79,6 +90,9 @@ impl Default for Module {
             token_indexes: Vec::new(),
             sem_token_db: Vec::new(),
             stmts: Vec::new(),
+            global_vardefs: Vec::new(),
+            global_fndefs: Vec::new(),
+            all_fndefs: Vec::new(),
             analyzer_errors: Vec::new(),
             rope: Rope::default(),
         }
@@ -106,11 +120,11 @@ pub struct Project {
 }
 
 impl Project {
-    pub fn new(project_root: String, client: Client) -> Self {
+    pub async fn new(project_root: String, client: Client) -> Self {
         // 1. check nature root by env
         let nature_root = std::env::var("NATURE_ROOT").unwrap_or(DEFAULT_NATURE_ROOT.to_string());
 
-        let mut await_queue = Vec::new();
+        let mut builtin_list: Vec<String> = Vec::new();
 
         // 3. builtin package load by nature root std
         let std_dir = Path::new(&nature_root).join("std");
@@ -129,33 +143,39 @@ impl Project {
                 continue;
             }
 
-            // 将 完整文件路径加入到 await_queue 中, 等待解析
+            // 将 完整文件路径加入到 await_queue 中,  进行异步解析
             let file_path = dir_path.to_str().unwrap();
-            await_queue.push(QueueItem {
-                path: file_path.to_string(),
-                notify: None,
-            });
+
+            builtin_list.push(file_path.to_string());
         }
 
-        // 将 package.toml 加入到 await_queue 中, 等待解析
-        let package_path = Path::new(&project_root).join("package.toml");
-        if package_path.exists() {
-            await_queue.push(QueueItem {
-                path: package_path.to_str().unwrap().to_string(),
-                notify: None,
-            });
-        }
+        let package_path = Path::new(&project_root).join("package.toml").to_str().unwrap().to_string();
+        let package_config = match parse_package(&package_path) {
+            Ok(package_config) => {
+                Some(Arc::new(Mutex::new(package_config)))
+            }
+            Err(_e) => {
+                None
+            }
+        };
 
-        Self {
+        let mut project = Self {
             nature_root,
             root: project_root,
             module_db: Arc::new(Mutex::new(Vec::new())),
             module_handled: Arc::new(Mutex::new(HashMap::new())),
-            queue: Arc::new(Mutex::new(await_queue)),
-            package_config: None,
+            queue: Arc::new(Mutex::new(Vec::new())),
+            package_config,
             client: Arc::new(client),
             symbol_table: Arc::new(Mutex::new(SymbolTable::new())),
+        };
+
+        // handle builtin list
+        for file_path in builtin_list {
+            project.build(&file_path, "").await;
         }
+
+        return project;
     }
 
     pub fn backend_handle_queue(&self) {
@@ -187,14 +207,9 @@ impl Project {
             }
 
             let item = item_option.unwrap();
+            dbg!(&item);
 
             if !self.need_build(&item).await {
-                continue;
-            }
-
-            // must .n file
-            if !item.path.ends_with("n") {
-                dbg!("not n file", item.path);
                 continue;
             }
 
@@ -280,19 +295,20 @@ impl Project {
                 }
                 let content = content_option.unwrap();
 
-                let temp = Module::new(import_stmt.module_ident, content, import_stmt.full_path.to_string());
 
                 // push to module_db get index lock
                 let mut module_handled = self.module_handled.lock().unwrap();
                 let mut module_db = self.module_db.lock().unwrap();
-                let i = module_db.len();
+                let index = module_db.len();
+
+                let temp = Module::new(import_stmt.module_ident, content, import_stmt.full_path.to_string(), index);
                 module_db.push(temp);
 
                 // set module_handled
-                module_handled.insert(import_stmt.full_path, i);
+                module_handled.insert(import_stmt.full_path, index);
                 // unlock
 
-                i
+                index
             };
 
             let mut module_db = self.module_db.lock().unwrap();
@@ -351,15 +367,28 @@ impl Project {
 
         dbg!("{} will semantic handle, module_indexes: {:?}", main_path, &module_indexes);
 
-        for index in module_indexes {
+        for index in module_indexes.clone() {
             let mut module_db = self.module_db.lock().unwrap();
             let mut symbol_table = self.symbol_table.lock().unwrap();
             let m = &mut module_db[index];
-            let (stmts, errors) = Semantic::new(m, &mut symbol_table).analyze();
-            m.stmts = stmts;
-            m.analyzer_errors.extend(errors);
+            Semantic::new(m, &mut symbol_table).analyze();
+        }
 
-            // TODO pre infer and infer
+        // all pre infer
+        for index in module_indexes.clone() {
+            let mut module_db = self.module_db.lock().unwrap();
+            let mut symbol_table = self.symbol_table.lock().unwrap();
+            let m = &mut module_db[index];
+            let errors = Typesys::new(&mut symbol_table, m).pre_infer();
+            m.analyzer_errors.extend(errors);
+        }
+
+        for index in module_indexes.clone() {
+            let mut module_db = self.module_db.lock().unwrap();
+            let mut symbol_table = self.symbol_table.lock().unwrap();
+            let m = &mut module_db[index];
+            let errors = Typesys::new(&mut symbol_table, m).infer();
+            m.analyzer_errors.extend(errors);
         }
 
         // handle all refers

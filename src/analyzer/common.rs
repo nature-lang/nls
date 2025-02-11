@@ -1,6 +1,10 @@
 use std::collections::HashMap;
+use std::fmt::{Display, Formatter, Result};
+use std::hash::{DefaultHasher, Hash, Hasher};
 use std::sync::{Arc, Mutex};
 use strum_macros::Display;
+
+use crate::utils::align_up;
 
 use super::symbol::NodeId;
 
@@ -58,10 +62,11 @@ pub struct Type {
     pub origin_type_kind: TypeKind,
 
     pub impl_ident: Option<String>,
-    pub impl_args: Option<Vec<Type>>,
+    pub impl_args: Vec<Type>,
     pub start: usize, // 类型定义开始位置
     pub end: usize,   // 类型定义结束位置
     pub in_heap: bool,
+    pub err: bool,
 }
 
 impl Default for Type {
@@ -72,10 +77,25 @@ impl Default for Type {
             origin_ident: None,
             origin_type_kind: TypeKind::Unknown,
             impl_ident: None,
-            impl_args: None,
+            impl_args: Vec::new(),
             start: 0,
             end: 0,
             in_heap: false,
+            err: false,
+        }
+    }
+}
+
+impl Display for Type {
+    fn fmt(&self, f: &mut Formatter<'_>) -> Result {
+        if let Some(ident) = &self.origin_ident {
+            if let TypeKind::Param(param_ident) = &self.kind {
+                write!(f, "{}", param_ident)
+            } else {
+                write!(f, "{}", ident)
+            }
+        } else {
+            write!(f, "{}", self._type_format())
         }
     }
 }
@@ -88,10 +108,53 @@ impl Type {
             origin_ident: None,
             origin_type_kind: TypeKind::Unknown,
             impl_ident: Some(kind.to_string()),
-            impl_args: None,
+            impl_args: Vec::new(),
             start: 0,
             end: 0,
             in_heap: Self::kind_in_heap(&kind),
+            err: false,
+        }
+    }
+
+    pub fn error() -> Self {
+        let mut result = Self::default();
+        result.err = true;
+        result.status = ReductionStatus::Done;
+        result
+    }
+
+    fn _type_format(&self) -> String {
+        match &self.kind {
+            TypeKind::Vec(element_type) => {
+                format!("vec<{}>", element_type)
+            }
+            TypeKind::Chan(element_type) => {
+                format!("chan<{}>", element_type)
+            }
+            TypeKind::Arr(length, element_type) => {
+                format!("arr<{},{}>", element_type, length)
+            }
+            TypeKind::Map(key_type, value_type) => {
+                format!("map<{},{}>", key_type, value_type)
+            }
+            TypeKind::Set(element_type) => {
+                format!("set<{}>", element_type)
+            }
+            TypeKind::Tuple(_elements, _) => {
+                // 简化版本，可以根据需要实现完整版本
+                "tup<...>".to_string()
+            }
+            TypeKind::Fn(type_fn) => {
+                format!("fn(...):{}", type_fn.return_type)
+            }
+            TypeKind::Ptr(value_type) => {
+                format!("ptr<{}>", value_type)
+            }
+            TypeKind::RawPtr(value_type) => {
+                format!("raw_ptr<{}>", value_type)
+            }
+            TypeKind::Union(any, _) if *any => "any".to_string(),
+            _ => self.kind.to_string(),
         }
     }
 
@@ -109,6 +172,10 @@ impl Type {
                 | TypeKind::CoroutineT
                 | TypeKind::Chan(..)
         )
+    }
+
+    pub fn must_assign_value(kind: &TypeKind) -> bool {
+        matches!(kind, TypeKind::Fn(..) | TypeKind::Ptr(..))
     }
 
     pub fn is_integer(kind: &TypeKind) -> bool {
@@ -131,21 +198,111 @@ impl Type {
         matches!(kind, TypeKind::Float32 | TypeKind::Float64 | TypeKind::Float)
     }
 
+    pub fn is_list_u8(kind: &TypeKind) -> bool {
+        if let TypeKind::Vec(element_type) = kind {
+            matches!(element_type.kind, TypeKind::Uint8)
+        } else {
+            false
+        }
+    }
+
+    pub fn can_type_casting(kind: &TypeKind) -> bool {
+        Self::is_number(kind) || matches!(kind, TypeKind::Bool)
+    }
+
     pub fn is_number(kind: &TypeKind) -> bool {
         Self::is_integer(kind) || Self::is_float(kind)
+    }
+
+    pub fn is_origin_type(kind: &TypeKind) -> bool {
+        Self::is_number(kind)
+            || matches!(
+                kind,
+                TypeKind::VoidPtr | TypeKind::Void | TypeKind::Null | TypeKind::Bool | TypeKind::String | TypeKind::FnT | TypeKind::AllT
+            )
+    }
+
+    pub fn is_map_key_type(kind: &TypeKind) -> bool {
+        Self::is_number(kind)
+            || matches!(
+                kind,
+                TypeKind::Bool
+                    | TypeKind::String
+                    | TypeKind::Ptr(..)
+                    | TypeKind::RawPtr(..)
+                    | TypeKind::VoidPtr
+                    | TypeKind::Chan(..)
+                    | TypeKind::Struct(..)
+                    | TypeKind::Arr(..)
+            )
+    }
+
+    pub fn is_reduction_type(kind: &TypeKind) -> bool {
+        matches!(
+            kind,
+            TypeKind::Struct(..)
+                | TypeKind::Map(..)
+                | TypeKind::Vec(..)
+                | TypeKind::Chan(..)
+                | TypeKind::Arr(..)
+                | TypeKind::Tuple(..)
+                | TypeKind::Set(..)
+                | TypeKind::Fn(..)
+                | TypeKind::Ptr(..)
+                | TypeKind::RawPtr(..)
+        )
+    }
+
+    pub fn type_struct_sizeof(kind: &TypeKind) -> u64 {
+        let TypeKind::Struct(_, align, properties) = kind else { unreachable!() };
+        // 如果 align 为 0,说明结构体没有元素或嵌套结构体也没有元素
+        if *align == 0 {
+            return 0;
+        }
+
+        let mut size: u64 = 0;
+
+        // 遍历所有属性
+        for prop in properties {
+            let element_size = Self::sizeof(&prop.type_.kind);
+            let element_align = Self::alignof(&prop.type_.kind) as u64;
+
+            // 按照元素的对齐要求对当前偏移量进行对齐
+            size = align_up(size, element_align);
+            size += element_size;
+        }
+
+        // 最后按照结构体整体的对齐要求进行对齐
+        size = align_up(size, *align as u64);
+
+        size
+    }
+
+    pub fn sizeof(kind: &TypeKind) -> u64 {
+        match &kind {
+            TypeKind::Struct(..) => Self::type_struct_sizeof(kind),
+            TypeKind::Arr(len, element_type) => len * Self::sizeof(&element_type.kind),
+            _ => kind.sizeof()
+        }
+    }
+
+    pub fn alignof(kind: &TypeKind) -> u8 {
+        match &kind {
+            TypeKind::Struct(_, align, _) => *align as u8,
+            TypeKind::Arr(_, element_type) => Self::alignof(&element_type.kind),
+            _ => kind.sizeof() as u8,
+        }
+    }
+
+    pub fn is_stack_impl(&self) -> bool {
+        Self::is_number(&self.kind) || matches!(self.kind, TypeKind::Bool | TypeKind::Struct(..) | TypeKind::Arr(..))
     }
 
     pub fn is_impl_builtin_type(kind: &TypeKind) -> bool {
         Self::is_number(kind)
             || matches!(
                 kind,
-                TypeKind::Bool
-                    | TypeKind::String
-                    | TypeKind::Map(..)
-                    | TypeKind::Set(..)
-                    | TypeKind::Vec(..)
-                    | TypeKind::Chan(..)
-                    | TypeKind::CoroutineT
+                TypeKind::Bool | TypeKind::String | TypeKind::Map(..) | TypeKind::Set(..) | TypeKind::Vec(..) | TypeKind::Chan(..) | TypeKind::CoroutineT
             )
     }
 
@@ -157,6 +314,127 @@ impl Type {
         ptr_type.origin_ident = None;
         ptr_type.origin_type_kind = TypeKind::Unknown;
         return ptr_type;
+    }
+
+    pub fn raw_ptr_of(t: Type) -> Type {
+        let ptr_kind = TypeKind::RawPtr(Box::new(t.clone()));
+
+        let mut ptr_type = Type::new(ptr_kind);
+        ptr_type.in_heap = false;
+        ptr_type.origin_ident = None;
+        ptr_type.origin_type_kind = TypeKind::Unknown;
+        return ptr_type;
+    }
+
+    pub fn errort() -> Type {
+        let alias = TypeKind::Alias(Box::new(TypeAlias {
+            import_as: None,
+            args: None,
+            ident: "error_t".to_string(),
+        }));
+
+        let mut errort = Type::new(alias.clone());
+        errort.origin_ident = Some("error_t".to_string());
+        errort.origin_type_kind = alias.clone();
+        errort.status = ReductionStatus::Undo;
+
+        return errort;
+    }
+
+    /**
+     * 计算类型 hash 值
+     */
+    pub fn hash(&self) -> u64 {
+        match &self.kind {
+            TypeKind::Vec(element_type) => {
+                let element_hash = element_type.hash();
+                let mut hasher = DefaultHasher::new();
+                format!("{}_{}", self.kind.to_string(), element_hash).hash(&mut hasher);
+                hasher.finish()
+            }
+            TypeKind::Chan(element_type) => {
+                let element_hash = element_type.hash();
+                let mut hasher = DefaultHasher::new();
+                format!("{}_{}", self.kind.to_string(), element_hash).hash(&mut hasher);
+                hasher.finish()
+            }
+            TypeKind::Arr(length, element_type) => {
+                let element_hash = element_type.hash();
+                let mut hasher = DefaultHasher::new();
+                format!("{}_{length}_{}", self.kind.to_string(), element_hash).hash(&mut hasher);
+                hasher.finish()
+            }
+            TypeKind::Map(key_type, value_type) => {
+                let key_hash = key_type.hash();
+                let value_hash = value_type.hash();
+                let mut hasher = DefaultHasher::new();
+                format!("{}_{key_hash}_{value_hash}", self.kind.to_string()).hash(&mut hasher);
+                hasher.finish()
+            }
+            TypeKind::Set(element_type) => {
+                let element_hash = element_type.hash();
+                let mut hasher = DefaultHasher::new();
+                format!("{}_{}", self.kind.to_string(), element_hash).hash(&mut hasher);
+                hasher.finish()
+            }
+            TypeKind::Tuple(elements, _) => {
+                let mut hasher = DefaultHasher::new();
+                let mut str = self.kind.to_string();
+                for element in elements {
+                    str = format!("{}_{}", str, element.hash());
+                }
+                str.hash(&mut hasher);
+                hasher.finish()
+            }
+            TypeKind::Fn(type_fn) => {
+                let mut hasher = DefaultHasher::new();
+                let mut str = self.kind.to_string();
+                str = format!("{}_{}", str, type_fn.return_type.hash());
+                for param_type in &type_fn.param_types {
+                    str = format!("{}_{}", str, param_type.hash());
+                }
+                str.hash(&mut hasher);
+                hasher.finish()
+            }
+            TypeKind::Ptr(value_type) => {
+                let value_hash = value_type.hash();
+                let mut hasher = DefaultHasher::new();
+                format!("{}_{}", self.kind.to_string(), value_hash).hash(&mut hasher);
+                hasher.finish()
+            }
+            TypeKind::RawPtr(value_type) => {
+                let value_hash = value_type.hash();
+                let mut hasher = DefaultHasher::new();
+                format!("{}_{}", self.kind.to_string(), value_hash).hash(&mut hasher);
+                hasher.finish()
+            }
+            TypeKind::Union(any, elements) => {
+                let mut hasher = DefaultHasher::new();
+                let mut str = self.kind.to_string();
+                if *any {
+                    str = format!("{}_any", str);
+                }
+                for element in elements {
+                    str = format!("{}_{}", str, element.hash());
+                }
+                str.hash(&mut hasher);
+                hasher.finish()
+            }
+            TypeKind::Struct(_ident, _, properties) => {
+                let mut hasher = DefaultHasher::new();
+                let mut str = self.kind.to_string();
+                for prop in properties {
+                    str = format!("{}_{}", str, prop.type_.hash());
+                }
+                str.hash(&mut hasher);
+                hasher.finish()
+            }
+            _ => {
+                let mut hasher = DefaultHasher::new();
+                self.kind.to_string().hash(&mut hasher);
+                hasher.finish()
+            }
+        }
     }
 }
 
@@ -170,9 +448,10 @@ pub struct TypeStructProperty {
 
 #[derive(Debug, Clone)]
 pub struct TypeFn {
-    pub name: Option<String>,
+    pub name: String,
     pub return_type: Type,
     pub param_types: Vec<Type>,
+    pub errable: bool,
     pub rest: bool,
     pub tpl: bool,
 }
@@ -277,6 +556,7 @@ pub enum TypeKind {
     Ptr(Box<Type>), // value type
     #[strum(serialize = "raw_ptr")]
     RawPtr(Box<Type>), // value type
+
     #[strum(serialize = "void_ptr")]
     VoidPtr,
 
@@ -328,6 +608,17 @@ impl TypeKind {
 
     pub fn is_exist(&self) -> bool {
         !self.is_unknown()
+    }
+
+    pub fn sizeof(&self) -> u64 {
+        match self {
+            TypeKind::Void => 0,
+            TypeKind::Bool | TypeKind::Int8 | TypeKind::Uint8 => 1,
+            TypeKind::Int16 | TypeKind::Uint16 => 2,
+            TypeKind::Int32 | TypeKind::Uint32 | TypeKind::Float32 => 4,
+            TypeKind::Int64 | TypeKind::Uint64 | TypeKind::Float64 => 8,
+            _ => 8,
+        }
     }
 }
 
@@ -399,6 +690,39 @@ pub enum ExprOp {
     OrOr,
 }
 
+impl ExprOp {
+    pub fn is_integer(&self) -> bool {
+        matches!(
+            self,
+            ExprOp::Rem | ExprOp::Lshift | ExprOp::Rshift | ExprOp::And | ExprOp::Or | ExprOp::Xor | ExprOp::Bnot
+        )
+    }
+
+    pub fn is_logic(&self) -> bool {
+        matches!(
+            self,
+            ExprOp::AndAnd | ExprOp::OrOr | ExprOp::Lt | ExprOp::Le | ExprOp::Gt | ExprOp::Ge | ExprOp::Ee | ExprOp::Ne
+        )
+    }
+
+    pub fn is_arithmetic(&self) -> bool {
+        matches!(
+            self,
+            ExprOp::Add
+                | ExprOp::Sub
+                | ExprOp::Mul
+                | ExprOp::Div
+                | ExprOp::Rem
+                | ExprOp::Lshift
+                | ExprOp::Rshift
+                | ExprOp::And
+                | ExprOp::Or
+                | ExprOp::Xor
+                | ExprOp::Bnot
+        )
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum AstNode {
     None,
@@ -421,12 +745,12 @@ pub enum AstNode {
 
     New(Type, Vec<StructNewProperty>), // (type_, properties)
 
-    MapAccess(Type, Box<Expr>, Box<Expr>),              // (element_type, left, key)
+    MapAccess(Type, Type, Box<Expr>, Box<Expr>),        // (key_type, value_type, left, key)
     VecAccess(Type, Box<Expr>, Box<Expr>),              // (element_type, left, index)
     ArrayAccess(Type, Box<Expr>, Box<Expr>),            // (element_type, left, index)
     TupleAccess(Type, Box<Expr>, u64),                  // (element_type, left, index)
     StructSelect(Box<Expr>, String, StructNewProperty), // (instance, key, property)
-    EnvAccess(u8, String),                              // (index, unique_ident)
+    EnvAccess(u8, String, Option<NodeId>),              // (index, unique_ident)
 
     VecNew(Vec<Box<Expr>>, Option<Box<Expr>>, Option<Box<Expr>>), // (elements, len, cap)
     ArrayNew(Vec<Box<Expr>>),                                     // elements
@@ -439,23 +763,23 @@ pub enum AstNode {
 
     // 未推断出具体表达式类型
     EmptyCurlyNew,
-    AccessExpr(Box<Expr>, Box<Expr>),                // (left, key)
-    SelectExpr(Box<Expr>, String),                   // (left, key)
-    VarDecl(Arc<Mutex<VarDeclExpr>>), 
+    AccessExpr(Box<Expr>, Box<Expr>), // (left, key)
+    SelectExpr(Box<Expr>, String),    // (left, key)
+    VarDecl(Arc<Mutex<VarDeclExpr>>),
 
     // Statements
     Fake(Box<Expr>), // (expr)
 
     Break(Option<Box<Expr>>), // (expr)
     Continue,
-    Import(ImportStmt),                                    // 比较复杂直接保留
-    VarTupleDestr(Vec<Box<Expr>>, Box<Expr>),         // (elements, right)
-    Assign(Box<Expr>, Box<Expr>),                          // (left, right)
-    Return(Option<Box<Expr>>),                             // (expr)
+    Import(ImportStmt),                            // 比较复杂直接保留
+    VarTupleDestr(Vec<Box<Expr>>, Box<Expr>),      // (elements, right)
+    Assign(Box<Expr>, Box<Expr>),                  // (left, right)
+    Return(Option<Box<Expr>>),                     // (expr)
     If(Box<Expr>, Vec<Box<Stmt>>, Vec<Box<Stmt>>), // (condition, consequent, alternate)
     Throw(Box<Expr>),
     TryCatch(Box<Expr>, Arc<Mutex<VarDeclExpr>>, Vec<Box<Stmt>>), // (try_expr, catch_err, catch_body)
-    Let(Box<Expr>),                                   // (expr)
+    Let(Box<Expr>),                                               // (expr)
     ForIterator(Box<Expr>, Arc<Mutex<VarDeclExpr>>, Option<Arc<Mutex<VarDeclExpr>>>, Vec<Box<Stmt>>), // (iterate, first, second, body)
 
     ForCond(Box<Expr>, Vec<Box<Stmt>>),                            // (condition, body)
@@ -464,7 +788,7 @@ pub enum AstNode {
     // 既可以作为表达式，也可以作为语句
     Call(AstCall),
     Catch(Box<Expr>, Arc<Mutex<VarDeclExpr>>, Vec<Box<Stmt>>), // (try_expr, catch_err, catch_body)
-    Match(Option<Box<Expr>>, Vec<MatchCase>),      // (subject, cases)
+    Match(Option<Box<Expr>>, Vec<MatchCase>),                  // (subject, cases)
 
     Select(Vec<SelectCase>, bool, i16, i16), // (cases, has_default, send_count, recv_count)
 
@@ -502,6 +826,7 @@ pub struct Expr {
     pub type_: Type,
     pub target_type: Type,
     pub node: AstNode,
+    pub err: bool,
 }
 
 // default
@@ -513,18 +838,20 @@ impl Default for Expr {
             type_: Type::default(),
             target_type: Type::default(),
             node: AstNode::None,
+            err: false,
         }
     }
 }
 
 impl Expr {
-    pub fn ident(start: usize, end: usize, literal: String) -> Self {
+    pub fn ident(start: usize, end: usize, literal: String, symbol_id_option: Option<NodeId>) -> Self {
         Self {
             start,
             end,
             type_: Type::default(),
             target_type: Type::default(),
-            node: AstNode::Ident(literal, None),
+            node: AstNode::Ident(literal, symbol_id_option),
+            err: false,
         }
     }
 }
@@ -533,8 +860,8 @@ impl Expr {
 pub struct VarDeclExpr {
     pub ident: String,
     pub symbol_id: Option<NodeId>, // unique symbol table id
-    pub symbol_start: usize, // 符号定义位置
-    pub symbol_end: usize,   // 符号定义位置
+    pub symbol_start: usize,       // 符号定义位置
+    pub symbol_end: usize,         // 符号定义位置
     pub type_: Type,
     pub be_capture: bool,
     pub heap_ident: Option<String>,
@@ -596,7 +923,7 @@ pub struct ImportStmt {
     pub package_dir: String,
     pub use_links: bool,
     pub start: usize, // 冗余自 stmt, 用于 analyzer_import  能够快速处理
-    pub end: usize
+    pub end: usize,
 }
 
 impl Default for ImportStmt {
@@ -612,11 +939,10 @@ impl Default for ImportStmt {
             use_links: false,
             module_ident: String::new(),
             start: 0,
-            end: 0
+            end: 0,
         }
     }
 }
-
 
 #[derive(Debug, Clone)]
 pub struct GenericsParam {
@@ -636,8 +962,8 @@ impl GenericsParam {
 #[derive(Debug, Clone)]
 pub struct TypeAliasStmt {
     pub ident: String,
-    pub params: Option<Vec<GenericsParam>>,
-    pub type_: Type,
+    pub params: Vec<GenericsParam>,
+    pub type_expr: Type,
     pub symbol_start: usize,
     pub symbol_end: usize,
     pub symbol_id: Option<NodeId>,
@@ -661,16 +987,16 @@ pub struct SelectCase {
 
 #[derive(Debug, Clone)]
 pub struct AstFnDef {
-    pub symbol_name: String, 
+    pub symbol_name: String,
     pub symbol_id: Option<NodeId>,
     pub return_type: Type,
     pub params: Vec<Arc<Mutex<VarDeclExpr>>>,
     pub rest_param: bool,
     pub body: Vec<Box<Stmt>>,
     pub closure: Option<isize>,
-    pub generics_hash_table: Option<HashMap<String, Type>>,
+    pub generics_hash_table: Option<HashMap<u64, Arc<Mutex<AstFnDef>>>>,
     pub generics_args_table: Option<HashMap<String, Type>>,
-    pub generics_args_hash: Option<String>,
+    pub generics_args_hash: Option<u64>,
     pub generics_params: Option<Vec<GenericsParam>>,
     pub impl_type: Type,
     pub capture_exprs: Vec<Box<Expr>>,
@@ -685,9 +1011,10 @@ pub struct AstFnDef {
     pub is_generics: bool,
     pub is_async: bool,
     pub is_private: bool,
+    pub is_errable: bool, // 当前函数是否返回错误
     pub break_target_types: Vec<Type>,
     pub linkid: Option<String>,
-    pub fn_name: Option<String>,
+    pub fn_name: String, // default empty
     pub rel_path: Option<String>,
 
     // symbol 符号定义位置
@@ -697,6 +1024,7 @@ pub struct AstFnDef {
     // 整个函数的其实与结束位置
     pub start: usize,
     pub end: usize,
+    pub module_index: usize, // belong module index
 }
 
 // ast fn def default
@@ -728,13 +1056,15 @@ impl Default for AstFnDef {
             is_generics: false,
             is_async: false,
             is_private: false,
+            is_errable: false,
             break_target_types: Vec::new(),
-            fn_name: None,
+            fn_name: "".to_string(),
             rel_path: None,
             symbol_start: 0,
             symbol_end: 0,
             start: 0,
             end: 0,
+            module_index: 0,
         }
     }
 }
