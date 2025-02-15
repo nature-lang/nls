@@ -15,6 +15,7 @@ use crate::{
         symbol::{SymbolKind, GLOBAL_SCOPE_ID},
     },
     project::Module,
+    utils::format_generics_ident,
 };
 
 use super::{
@@ -121,10 +122,10 @@ impl GenericSpecialFnClone {
             AstNode::StructSelect(instance, key, property) => AstNode::StructSelect(
                 Box::new(self.clone_expr(instance)),
                 key.clone(),
-                StructNewProperty {
+                TypeStructProperty {
                     type_: property.type_.clone(),
                     key: property.key.clone(),
-                    value: Box::new(self.clone_expr(&property.value)),
+                    value: Some(Box::new(self.clone_expr(&property.value.as_ref().unwrap()))),
                 },
             ),
             AstNode::TupleNew(elements) => AstNode::TupleNew(elements.iter().map(|e| Box::new(self.clone_expr(e))).collect()),
@@ -325,19 +326,10 @@ impl<'a> Typesys<'a> {
         let impl_ident = alias.ident.clone();
 
         // 从符号表中查找类型别名的定义
-        let symbol = match self.symbol_table.find_global_symbol(&alias.ident) {
-            Some(s) => s,
-            None => {
-                self.errors.push(AnalyzerError {
-                    start,
-                    end,
-                    message: format!("type alias '{}' not found", alias.ident),
-                });
-                return Type::error();
-            }
-        };
+        assert!(alias.symbol_id.is_some(), "type alias symbol_id not found");
 
-        // 确保找到的符号是类型别名
+        let symbol= self.symbol_table.get_symbol(alias.symbol_id.unwrap()).unwrap();         // 确保找到的符号是类型别名
+
         let type_alias_stmt_mutex = match symbol.kind.clone() {
             SymbolKind::TypeAlias(stmt) => stmt,
             _ => {
@@ -547,24 +539,35 @@ impl<'a> Typesys<'a> {
             TypeKind::Struct(_ident, align, properties) => {
                 let mut max_align = 0;
 
+                dbg!(&properties);
                 for property in properties.iter_mut() {
                     if !property.type_.kind.is_unknown() {
                         property.type_ = self.reduction_type(property.type_.clone());
                     }
 
                     if let Some(right_value) = &mut property.value {
-                        let right_type = self.infer_right_expr(right_value, property.type_.clone());
-                        if property.type_.kind.is_unknown() {
-                            // 如果属性类型未知,则 必须能够推导其类型
-                            if !self.type_confirm(&right_type) {
+                        match self.infer_right_expr(right_value, property.type_.clone()) {
+                            Ok(right_type) => {
+                                if property.type_.kind.is_unknown() {
+                                    // 如果属性类型未知,则 必须能够推导其类型
+                                    if !self.type_confirm(&right_type) {
+                                        self.errors.push(AnalyzerError {
+                                            start: right_value.start,
+                                            end: right_value.end,
+                                            message: format!("struct property '{}' type not confirmed", property.key),
+                                        });
+                                    }
+
+                                    property.type_ = right_type;
+                                }
+                            }
+                            Err(e) => {
                                 self.errors.push(AnalyzerError {
                                     start: right_value.start,
                                     end: right_value.end,
-                                    message: format!("struct property '{}' type not confirmed", property.key),
+                                    message: e,
                                 });
                             }
-
-                            property.type_ = right_type;
                         }
                     }
 
@@ -580,6 +583,7 @@ impl<'a> Typesys<'a> {
                     }
                 }
 
+                dbg!(&properties);
                 *align = max_align;
             }
 
@@ -593,8 +597,12 @@ impl<'a> Typesys<'a> {
         let origin_ident = t.origin_ident.clone();
         let origin_type_kind = t.origin_type_kind.clone();
 
+        if t.err {
+            return t;
+        }
+
         if t.kind.is_unknown() {
-            return Type::error();
+            return t;
         }
 
         if t.status == ReductionStatus::Done {
@@ -648,11 +656,8 @@ impl<'a> Typesys<'a> {
         let AstNode::As(target_type, src) = &mut expr.node else { unreachable!() };
         *target_type = self.reduction_type(target_type.clone());
 
-        // 推导源表达式类型
-        let src_type = self.infer_right_expr(src, target_type.clone());
-        if src_type.err {
-            return Err(format!("type {} infer err", src_type));
-        }
+        // 推导源表达式类型, 如果存在错误则停止后续比较, 直接返回错误
+        let src_type = self.infer_expr(src, target_type.clone())?;
 
         // 处理raw指针转换的特殊情况
         if matches!(src_type.kind, TypeKind::RawPtr(..)) {
@@ -704,6 +709,7 @@ impl<'a> Typesys<'a> {
             return Err(format!("cannot casting to '{}'", target_type));
         }
 
+        dbg!(&target_type);
         Ok(target_type.clone())
     }
 
@@ -711,9 +717,9 @@ impl<'a> Typesys<'a> {
         // 默认 subject_type 为 bool 类型(用于无 subject 的情况)
         let mut subject_type = Type::new(TypeKind::Bool);
 
-        // 如果存在 subject,推导其类型
+        // 如果存在 subject,推导其类型, 如果推倒错误则停止后续推倒，因为无法识别具体的类型
         if let Some(subject_expr) = subject {
-            subject_type = self.infer_right_expr(subject_expr, Type::default());
+            subject_type = self.infer_right_expr(subject_expr, Type::default())?;
 
             // 确保 subject 类型已确定
             if !self.type_confirm(&subject_type) {
@@ -748,8 +754,7 @@ impl<'a> Typesys<'a> {
                             return Err("only union type can use is assert".to_string());
                         }
 
-                        // 推导条件表达式类型
-                        let cond_type = self.infer_right_expr(cond_expr, subject_type.clone());
+                        let cond_type = self.infer_right_expr(cond_expr, subject_type.clone())?;
                         assert!(matches!(cond_type.kind, TypeKind::Bool));
 
                         let AstNode::MatchIs(target_type) = &cond_expr.node else { unreachable!() };
@@ -758,7 +763,7 @@ impl<'a> Typesys<'a> {
                         union_types.insert(target_type.hash(), true);
                     } else {
                         // 普通值匹配,推导条件表达式类型
-                        self.infer_right_expr(cond_expr, subject_type.clone());
+                        self.infer_right_expr(cond_expr, subject_type.clone())?;
                     }
                 }
             }
@@ -812,7 +817,13 @@ impl<'a> Typesys<'a> {
             exists.insert(property.key.clone(), true);
 
             // 推导属性值的类型
-            self.infer_right_expr(&mut property.value, expect_property.type_.clone());
+            if let Err(e) = self.infer_right_expr(&mut property.value, expect_property.type_.clone()) {
+                self.errors.push(AnalyzerError {
+                    start: property.value.start,
+                    end: property.value.end,
+                    message: e,
+                });
+            }
 
             // 冗余属性类型(用于计算size)
             property.type_ = expect_property.type_.clone();
@@ -855,18 +866,15 @@ impl<'a> Typesys<'a> {
 
     pub fn infer_binary(&mut self, op: ExprOp, left: &mut Box<Expr>, right: &mut Box<Expr>, _infer_target_type: Type) -> Result<Type, String> {
         // 先推导左操作数的类型
-        let left_type = self.infer_right_expr(left, Type::default());
-        if left_type.err {
-            return Err(format!("infer failed"));
-        }
+        let left_type = self.infer_right_expr(left, Type::default())?;
 
         // 推导右操作数的类型
         let right_type = if !matches!(left_type.kind, TypeKind::Union(..)) {
             // 如果左操作数不是联合类型,则基于左操作数类型进行隐式类型转换
-            self.infer_right_expr(right, left_type.clone())
+            self.infer_right_expr(right, left_type.clone())?
         } else {
             // 否则独立推导右操作数类型
-            self.infer_right_expr(right, Type::default())
+            self.infer_right_expr(right, Type::default())?
         };
 
         // 检查左右操作数类型是否一致
@@ -921,14 +929,11 @@ impl<'a> Typesys<'a> {
         // 处理逻辑非运算符
         if op == ExprOp::Not {
             // 对任何类型都可以进行布尔转换
-            return Ok(self.infer_right_expr(operand, Type::new(TypeKind::Bool)));
+            return Ok(self.infer_right_expr(operand, Type::new(TypeKind::Bool))?);
         }
 
         // 获取操作数的类型
-        let operand_type = self.infer_right_expr(operand, Type::default());
-        if operand_type.err {
-            return Err(format!("infer failed"));
-        }
+        let operand_type = self.infer_right_expr(operand, Type::default())?;
 
         // 处理负号运算符
         if op == ExprOp::Neg && !Type::is_number(&operand_type.kind) {
@@ -982,53 +987,44 @@ impl<'a> Typesys<'a> {
         Ok(operand_type)
     }
 
-    // fn rewrite_ident_use(&mut self, ident: &mut String) -> String {
-    //     // current fn
-    //     let current_fn = self.current_fn_mutex.lock().unwrap();
-
-    //     if let Some(args_hash) = current_fn.generics_args_hash {
-    //         // ident 不能包含 @ 符号, repeat rewrite
-    //         assert!(!ident.contains('@'));
-
-    //         return format!("{ident}@{args_hash}");
-    //     } else {
-    //         return ident.clone();
-    //     }
-    // }
-
     pub fn infer_ident(&mut self, ident: &mut String, symbol_id_option: &mut Option<NodeId>) -> Result<Type, String> {
         let Some(symbol_id) = symbol_id_option else {
             panic!("ident {} symbol_id is None", ident);
         };
 
-        let symbol = self.symbol_table.get_symbol(*symbol_id);
+        let symbol = self.symbol_table.get_symbol(*symbol_id).unwrap();
+        assert!(symbol.ident == *ident);
+        let mut symbol_kind = symbol.kind.clone();
+        let is_local = symbol.defined_in != GLOBAL_SCOPE_ID;
 
-        if let Some(symbol) = symbol {
-            assert!(symbol.ident == *ident);
+        // 判断符号是否是 local symbol
+        if is_local {
+            if let Some(hash) = self.current_fn_mutex.lock().unwrap().generics_args_hash {
+                let new_ident = format_generics_ident(ident.clone(), hash);
+                if let Some(new_symbol_id) = symbol.generics_id_map.get(&new_ident) {
+                    *ident = new_ident;
+                    *symbol_id = *new_symbol_id;
 
-            // if self.symbol_table.symbol_is_local(&symbol) {
-            //     *ident = self.rewrite_ident_use(ident);
-
-            //     // 基于重写过后的符号重新定位 symbol? 啊，怎这怎么定位。 没有只通过 ident 定位的方式呀！ 现在不是 global symbol!
-            //     // TODO 暂时不做处理, 因为定位不到符号所在的 local scope, 可能需要将所有的符号进行唯一名称后注册到全局符号表中，或者 hash 包含 scope_id
-            // }
-
-            match symbol.kind.clone() {
-                SymbolKind::Var(var_decl) => {
-                    let mut var_decl = var_decl.lock().unwrap();
-                    var_decl.type_ = self.reduction_type(var_decl.type_.clone());
-
-                    return Ok(var_decl.type_.clone());
-                }
-                SymbolKind::Fn(fndef) => {
-                    return self.infer_fn_decl(fndef.clone());
-                }
-                _ => {
-                    return Err(format!("unknown symbol kind: {:?}", symbol.kind));
+                    symbol_kind = self.symbol_table.get_symbol(*symbol_id).unwrap().kind.clone();
+                } else {
+                    panic!("generics symbol rewrite failed, new ident '{}' not found", new_ident);
                 }
             }
-        } else {
-            return Err(format!("ident {} not found", ident));
+        }
+
+        match symbol_kind {
+            SymbolKind::Var(var_decl) => {
+                let mut var_decl = var_decl.lock().unwrap();
+                var_decl.type_ = self.reduction_type(var_decl.type_.clone());
+
+                return Ok(var_decl.type_.clone());
+            }
+            SymbolKind::Fn(fndef) => {
+                return self.infer_fn_decl(fndef.clone());
+            }
+            _ => {
+                return Err(format!("unknown symbol kind: {:?}", symbol_kind));
+            }
         }
     }
 
@@ -1050,7 +1046,13 @@ impl<'a> Typesys<'a> {
 
             // 对所有元素进行类型推导
             for element in elements {
-                self.infer_right_expr(element, *element_type.clone());
+                if let Err(e) = self.infer_right_expr(element, *element_type.clone()) {
+                    self.errors.push(AnalyzerError {
+                        start: element.start,
+                        end: element.end,
+                        message: e,
+                    });
+                }
             }
 
             return Ok(self.reduction_type(infer_target_type));
@@ -1074,15 +1076,18 @@ impl<'a> Typesys<'a> {
 
         // 如果元素类型未知，使用第一个元素的类型进行推导
         if element_type.kind.is_unknown() {
-            element_type = self.infer_right_expr(&mut elements[0], Type::default());
-            if element_type.err {
-                return Err(format!("infer failed"));
-            }
+            element_type = self.infer_right_expr(&mut elements[0], Type::default())?;
         }
 
         // 对所有元素进行类型推导和检查
         for element in elements.iter_mut() {
-            self.infer_right_expr(element, element_type.clone());
+            if let Err(e) = self.infer_right_expr(element, element_type.clone()) {
+                self.errors.push(AnalyzerError {
+                    start: element.start,
+                    end: element.end,
+                    message: e,
+                });
+            }
         }
 
         // 返回最终的向量类型
@@ -1113,20 +1118,27 @@ impl<'a> Typesys<'a> {
 
         // 如果类型未知，使用第一个元素的类型进行推导
         if key_type.kind.is_unknown() {
-            key_type = self.infer_right_expr(&mut elements[0].key, Type::default());
-            if key_type.err {
-                return Err(format!("infer failed"));
-            }
-            value_type = self.infer_right_expr(&mut elements[0].value, Type::default());
-            if value_type.err {
-                return Err(format!("infer failed"));
-            }
+            key_type = self.infer_right_expr(&mut elements[0].key, Type::default())?;
+            value_type = self.infer_right_expr(&mut elements[0].value, Type::default())?;
         }
 
         // 对所有元素进行类型推导和检查
         for element in elements.iter_mut() {
-            self.infer_right_expr(&mut element.key, key_type.clone());
-            self.infer_right_expr(&mut element.value, value_type.clone());
+            if let Err(e) = self.infer_right_expr(&mut element.key, key_type.clone()) {
+                self.errors.push(AnalyzerError {
+                    start: element.key.start,
+                    end: element.key.end,
+                    message: e,
+                });
+            }
+
+            if let Err(e) = self.infer_right_expr(&mut element.value, value_type.clone()) {
+                self.errors.push(AnalyzerError {
+                    start: element.value.start,
+                    end: element.value.end,
+                    message: e,
+                });
+            }
         }
 
         // 返回最终的Map类型
@@ -1152,12 +1164,18 @@ impl<'a> Typesys<'a> {
 
         // 如果元素类型未知，使用第一个元素的类型进行推导
         if element_type.kind.is_unknown() {
-            element_type = self.infer_right_expr(&mut elements[0], Type::default());
+            element_type = self.infer_right_expr(&mut elements[0], Type::default())?;
         }
 
         // 对所有元素进行类型推导和检查
         for element in elements.iter_mut() {
-            self.infer_right_expr(element, element_type.clone());
+            if let Err(e) = self.infer_right_expr(element, element_type.clone()) {
+                self.errors.push(AnalyzerError {
+                    start: element.start,
+                    end: element.end,
+                    message: e,
+                });
+            }
         }
 
         // 返回最终的Set类型
@@ -1180,7 +1198,7 @@ impl<'a> Typesys<'a> {
             };
 
             // 推导每个元素的类型
-            let expr_type = self.infer_right_expr(expr, element_target_type);
+            let expr_type = self.infer_right_expr(expr, element_target_type)?;
 
             // 检查元素类型是否已确定
             if !self.type_confirm(&expr_type) {
@@ -1198,15 +1216,12 @@ impl<'a> Typesys<'a> {
         let AstNode::AccessExpr(left, key) = &mut expr.node else { unreachable!() };
 
         // 推导左侧表达式的类型
-        let left_type = self.infer_right_expr(left, Type::default());
-        if left_type.err {
-            return Err(format!("infer failed"));
-        }
+        let left_type = self.infer_right_expr(left, Type::default())?;
 
         // 处理 Map 类型访问
         if let TypeKind::Map(key_type, value_type) = &left_type.kind {
             // 推导 key 表达式的类型
-            self.infer_right_expr(key, *key_type.clone());
+            self.infer_right_expr(key, *key_type.clone())?;
 
             // 重写为 MapAccess 节点
             expr.node = AstNode::MapAccess(*key_type.clone(), *value_type.clone(), left.clone(), key.clone());
@@ -1217,7 +1232,7 @@ impl<'a> Typesys<'a> {
         // 处理 Vec 和 String 类型访问
         if matches!(left_type.kind, TypeKind::Vec(_) | TypeKind::String) {
             // key 必须是整数类型
-            self.infer_right_expr(key, Type::new(TypeKind::Int));
+            self.infer_right_expr(key, Type::new(TypeKind::Int))?;
 
             let element_type = if let TypeKind::Vec(element_type) = &left_type.kind {
                 *element_type.clone()
@@ -1234,7 +1249,7 @@ impl<'a> Typesys<'a> {
         // 处理 Array 类型访问
         if let TypeKind::Arr(_, element_type) = &left_type.kind {
             // key 必须是整数类型
-            self.infer_right_expr(key, Type::new(TypeKind::Int));
+            self.infer_right_expr(key, Type::new(TypeKind::Int))?;
 
             // 重写为 ArrayAccess 节点
             expr.node = AstNode::ArrayAccess(*element_type.clone(), left.clone(), key.clone());
@@ -1245,7 +1260,7 @@ impl<'a> Typesys<'a> {
         // 处理 Tuple 类型访问
         if let TypeKind::Tuple(elements, _) = &left_type.kind {
             // key 必须是整数字面量
-            self.infer_right_expr(key, Type::new(TypeKind::Int));
+            self.infer_right_expr(key, Type::new(TypeKind::Int))?;
 
             // 获取索引值
             let index: u64 = if let AstNode::Literal(kind, value) = &key.node {
@@ -1283,10 +1298,7 @@ impl<'a> Typesys<'a> {
         let AstNode::SelectExpr(left, key) = &mut expr.node else { unreachable!() };
 
         // 先推导左侧表达式的类型
-        let left_type = self.infer_right_expr(left, Type::default());
-        if left_type.err {
-            return Err(format!("infer failed"));
-        }
+        let left_type = self.infer_right_expr(left, Type::default())?;
 
         // 处理自动解引用 - 如果是指针类型且指向结构体，则获取结构体类型
         let mut deref_type = match &left_type.kind {
@@ -1312,10 +1324,10 @@ impl<'a> Typesys<'a> {
                 expr.node = AstNode::StructSelect(
                     left.clone(),
                     key.clone(),
-                    StructNewProperty {
+                    TypeStructProperty {
                         type_: property_type.clone(),
                         key: property.key.clone(),
-                        value: property.value.clone().unwrap(),
+                        value: property.value.clone(),
                     },
                 );
 
@@ -1349,11 +1361,17 @@ impl<'a> Typesys<'a> {
 
         // 推导 flag_expr 类型
         if let Some(flag_expr) = &mut async_expr.flag_expr {
-            self.infer_right_expr(flag_expr, Type::new(TypeKind::Int));
+            if let Err(e) = self.infer_right_expr(flag_expr, Type::new(TypeKind::Int)) {
+                self.errors.push(AnalyzerError {
+                    start: flag_expr.start,
+                    end: flag_expr.end,
+                    message: e,
+                });
+            }
         }
 
         // 检查原始调用
-        let fn_type = self.infer_right_expr(&mut async_expr.origin_call.left, Type::default());
+        let fn_type = self.infer_right_expr(&mut async_expr.origin_call.left, Type::default())?;
 
         if let TypeKind::Fn(type_fn) = fn_type.kind {
             async_expr.return_type = type_fn.return_type.clone();
@@ -1417,7 +1435,7 @@ impl<'a> Typesys<'a> {
 
         expr.node = AstNode::Call(call);
 
-        return Ok(self.infer_right_expr(expr, Type::default()));
+        return Ok(self.infer_right_expr(expr, Type::default())?);
     }
 
     pub fn infer_expr(&mut self, expr: &mut Box<Expr>, infer_target_type: Type) -> Result<Type, String> {
@@ -1429,14 +1447,11 @@ impl<'a> Typesys<'a> {
             AstNode::As(_, _) => self.infer_as_expr(expr),
             AstNode::Catch(try_expr, catch_err_mutex, catch_body) => {
                 self.be_caught = true;
-                let try_expr_type = self.infer_right_expr(try_expr, Type::default());
-                if try_expr_type.err {
-                    return Err(format!("infer failed"));
-                }
+                let try_expr_type = self.infer_right_expr(try_expr, Type::default())?;
                 self.be_caught = false;
 
                 {
-                    let mut errort = Type::errort();
+                    let mut errort = Type::errort(self.symbol_table);
                     errort = self.reduction_type(errort);
                     let mut catch_err = catch_err_mutex.lock().unwrap();
                     catch_err.type_ = errort;
@@ -1454,10 +1469,8 @@ impl<'a> Typesys<'a> {
                 return Ok(Type::new(TypeKind::Bool));
             }
             AstNode::Is(target_type, src) => {
-                let src_type = self.infer_right_expr(src, Type::default());
-                if src_type.err {
-                    return Err(format!("infer failed"));
-                }
+                let src_type = self.infer_right_expr(src, Type::default())?;
+
                 *target_type = self.reduction_type(target_type.clone());
                 if !matches!(src_type.kind, TypeKind::Union(..)) {
                     return Err(format!("{} cannot use 'is' operator", src_type));
@@ -1474,10 +1487,7 @@ impl<'a> Typesys<'a> {
                 Ok(Type::new(TypeKind::Int))
             }
             AstNode::MacroUla(src) => {
-                let src_type = self.infer_right_expr(src, Type::default());
-                if src_type.err {
-                    return Err(format!("infer failed"));
-                }
+                let src_type = self.infer_right_expr(src, Type::default())?;
                 return Ok(Type::ptr_of(src_type));
             }
             AstNode::MacroDefault => {
@@ -1520,6 +1530,7 @@ impl<'a> Typesys<'a> {
             AstNode::StructNew(_ident, type_, properties) => {
                 *type_ = self.reduction_type(type_.clone());
 
+                dbg!(&type_);
                 if let TypeKind::Struct(_, _, type_properties) = &mut type_.kind {
                     *properties = self.infer_struct_properties(type_properties, properties)?;
                 } else {
@@ -1550,7 +1561,7 @@ impl<'a> Typesys<'a> {
         }
     }
 
-    fn literal_integer_casting(&mut self, expr: &mut Box<Expr>, target_type: Type) -> Result<(), AnalyzerError> {
+    fn literal_integer_casting(&mut self, expr: &mut Box<Expr>, target_type: Type) -> Result<(), String> {
         if let AstNode::Literal(kind, value) = &mut expr.node {
             let mut target_kind = target_type.kind.clone();
 
@@ -1559,25 +1570,14 @@ impl<'a> Typesys<'a> {
             }
 
             if !Type::is_integer(&kind) {
-                return Err(AnalyzerError {
-                    start: expr.start,
-                    end: expr.end,
-                    message: format!("type inconsistency: expect={}, actual={}", target_type, expr.type_),
-                });
+                return Err(format!("type inconsistency: expect={}, actual={}", target_type, expr.type_));
             }
 
-            let i = value.parse::<i64>().map_err(|_| AnalyzerError {
-                start: expr.start,
-                end: expr.end,
-                message: "invalid integer literal".to_string(),
-            })?;
+            let i = value.parse::<i64>().map_err(|_| "invalid integer literal".to_string())?;
+
             let target_kind = self.cross_kind_trans(&target_kind);
             if !self.integer_range_check(&target_kind, i) {
-                return Err(AnalyzerError {
-                    start: expr.start,
-                    end: expr.end,
-                    message: "integer out of range".to_string(),
-                });
+                return Err("integer out of range".to_string());
             }
 
             *kind = target_kind;
@@ -1585,45 +1585,29 @@ impl<'a> Typesys<'a> {
 
             Ok(())
         } else {
-            Err(AnalyzerError {
-                start: expr.start,
-                end: expr.end,
-                message: "integer casting only support literal".to_string(),
-            })
+            Err("integer casting only support literal".to_string())
         }
     }
 
-    fn literal_float_casting(&mut self, expr: &mut Box<Expr>, target_type: Type) -> Result<(), AnalyzerError> {
+    fn literal_float_casting(&mut self, expr: &mut Box<Expr>, target_type: Type) -> Result<(), String> {
         // 检查是否为字面量表达式
         if let AstNode::Literal(kind, value) = &mut expr.node {
             let target_kind = target_type.kind.clone();
 
             // 检查源类型是否为数字类型
             if !Type::is_number(kind) {
-                return Err(AnalyzerError {
-                    start: expr.start,
-                    end: expr.end,
-                    message: format!("type inconsistency: '{}' cannot casting float", expr.type_),
-                });
+                return Err(format!("type inconsistency: '{}' cannot casting float", expr.type_));
             }
 
             // 将字符串解析为浮点数
-            let f = value.parse::<f64>().map_err(|_| AnalyzerError {
-                start: expr.start,
-                end: expr.end,
-                message: "invalid float literal".to_string(),
-            })?;
+            let f = value.parse::<f64>().map_err(|_| "invalid float literal".to_string())?;
 
             // 获取目标类型的标准形式(处理类型别名等)
             let target_kind = self.cross_kind_trans(&target_kind);
 
             // 检查值是否在目标类型的范围内
             if !self.float_range_check(&target_kind, f) {
-                return Err(AnalyzerError {
-                    start: expr.start,
-                    end: expr.end,
-                    message: "float out of range".to_string(),
-                });
+                return Err("float out of range".to_string());
             }
 
             // 更新类型信息
@@ -1633,11 +1617,7 @@ impl<'a> Typesys<'a> {
             Ok(())
         } else {
             // 如果不是字面量表达式，返回错误
-            Err(AnalyzerError {
-                start: expr.start,
-                end: expr.end,
-                message: "float casting only support literal".to_string(),
-            })
+            Err("float casting only support literal".to_string())
         }
     }
 
@@ -1679,59 +1659,29 @@ impl<'a> Typesys<'a> {
         union.1.iter().any(|item| self.type_compare(item, sub, None))
     }
 
-    pub fn infer_right_expr(&mut self, expr: &mut Box<Expr>, target_type: Type) -> Type {
-        if expr.err {
-            return Type::error();
-        }
-
+    pub fn infer_right_expr(&mut self, expr: &mut Box<Expr>, target_type: Type) -> Result<Type, String> {
         if expr.type_.kind.is_unknown() {
-            match self.infer_expr(expr, target_type.clone()) {
-                Ok(type_) => {
-                    expr.type_ = type_.clone();
-                    if expr.type_.err {
-                        return expr.type_.clone();
-                    }
-                }
-                Err(e) => {
-                    self.errors.push(AnalyzerError {
-                        start: expr.start,
-                        end: expr.end,
-                        message: e,
-                    });
-                    return Type::error();
-                }
-            }
+            expr.type_ = self.infer_expr(expr, target_type.clone())?;
             expr.target_type = self.reduction_type(target_type.clone());
         }
 
         if target_type.kind.is_unknown() {
-            return expr.type_.clone();
+            return Ok(expr.type_.clone());
         }
 
         if (Type::is_integer(&target_type.kind) || matches!(target_type.kind, TypeKind::VoidPtr)) && matches!(expr.node, AstNode::Literal(..)) {
-            if let Err(e) = self.literal_integer_casting(expr, target_type.clone()) {
-                self.errors.push(e);
-                return Type::error();
-            }
+            self.literal_integer_casting(expr, target_type.clone())?;
         }
 
         // 处理浮点数字面量
         if Type::is_float(&target_type.kind) && matches!(expr.node, AstNode::Literal(..)) {
-            if let Err(e) = self.literal_float_casting(expr, target_type.clone()) {
-                self.errors.push(e);
-                return Type::error();
-            }
+            self.literal_float_casting(expr, target_type.clone())?;
         }
 
         if matches!(target_type.kind, TypeKind::Union(..)) && self.can_assign_to_union(&expr.type_) {
             let TypeKind::Union(any, elements) = &target_type.kind else { unreachable!() };
             if !self.union_type_contains(&(*any, elements.clone()), &expr.type_) {
-                self.errors.push(AnalyzerError {
-                    start: expr.start,
-                    end: expr.end,
-                    message: format!("union type not contains '{}'", expr.type_),
-                });
-                return Type::error();
+                return Err(format!("union type not contains '{}'", expr.type_));
             }
 
             // expr 改成成 union 类型
@@ -1742,22 +1692,13 @@ impl<'a> Typesys<'a> {
 
         // 最后进行类型比较
         if !self.type_compare(&target_type, &expr.type_, None) {
-            self.errors.push(AnalyzerError {
-                start: expr.start,
-                end: expr.end,
-                message: format!("type inconsistency: expect={}, actual={}", target_type, expr.type_),
-            });
-            return Type::error();
+            return Err(format!("type inconsistency: expect={}, actual={}", target_type, expr.type_));
         }
 
-        return expr.type_.clone();
+        Ok(expr.type_.clone())
     }
 
     pub fn infer_left_expr(&mut self, expr: &mut Box<Expr>) -> Type {
-        if expr.err {
-            return Type::error();
-        }
-
         let type_result = match &mut expr.node {
             // 标识符
             AstNode::Ident(ident, symbol_id) => self.infer_ident(ident, symbol_id),
@@ -1832,38 +1773,40 @@ impl<'a> Typesys<'a> {
         let mut var_decl = var_decl_mutex.lock().unwrap();
 
         // 推导右值表达式的类型
-        let right_type = self.infer_right_expr(right_expr, var_decl.type_.clone());
+        match self.infer_right_expr(right_expr, var_decl.type_.clone()) {
+            Ok(right_type) => {
+                // 检查右值类型是否为void
+                if matches!(right_type.kind, TypeKind::Void) {
+                    self.errors.push(AnalyzerError {
+                        start: right_expr.start,
+                        end: right_expr.end,
+                        message: "cannot assign void to var".to_string(),
+                    });
+                    return;
+                }
 
-        if var_decl.ident.contains("result") {
-            dbg!(&right_expr, &right_type);
-        }
-        if right_type.err {
-            return;
-        }
+                if matches!(var_decl.type_.kind, TypeKind::Unknown) {
+                    // 检查右值类型是否已确定
+                    if !self.type_confirm(&right_type) {
+                        self.errors.push(AnalyzerError {
+                            start: right_expr.start,
+                            end: right_expr.end,
+                            message: "type inference error, right type not confirmed".to_string(),
+                        });
+                        return;
+                    }
 
-        // 检查右值类型是否为void
-        if matches!(right_type.kind, TypeKind::Void) {
-            self.errors.push(AnalyzerError {
-                start: right_expr.start,
-                end: right_expr.end,
-                message: "cannot assign void to var".to_string(),
-            });
-            return;
-        }
-
-        if matches!(var_decl.type_.kind, TypeKind::Unknown) {
-            // 检查右值类型是否已确定
-            if !self.type_confirm(&right_type) {
+                    // 使用右值类型作为变量类型
+                    var_decl.type_ = right_type;
+                }
+            }
+            Err(e) => {
                 self.errors.push(AnalyzerError {
                     start: right_expr.start,
                     end: right_expr.end,
-                    message: "type inference error, right type not confirmed".to_string(),
+                    message: e,
                 });
-                return;
             }
-
-            // 使用右值类型作为变量类型
-            var_decl.type_ = right_type;
         }
     }
 
@@ -1915,15 +1858,24 @@ impl<'a> Typesys<'a> {
         }
     }
 
-    pub fn infer_catch(&mut self, try_expr: &mut Box<Expr>, catch_err_mutex: &Arc<Mutex<VarDeclExpr>>, catch_body: &mut Vec<Box<Stmt>>) -> Type {
+    pub fn infer_catch(&mut self, try_expr: &mut Box<Expr>, catch_err_mutex: &Arc<Mutex<VarDeclExpr>>, catch_body: &mut Vec<Box<Stmt>>) {
         self.be_caught = true;
-        let right_type = self.infer_right_expr(try_expr, Type::default());
-        if right_type.err {
-            return right_type;
-        }
+
+        let right_type = match self.infer_right_expr(try_expr, Type::default()) {
+            Ok(right_type) => right_type,
+            Err(e) => {
+                self.errors.push(AnalyzerError {
+                    start: try_expr.start,
+                    end: try_expr.end,
+                    message: e,
+                });
+                return;
+            }
+        };
+
         self.be_caught = false;
 
-        let mut errort = Type::errort();
+        let mut errort = Type::errort(self.symbol_table);
 
         // reduction errort
         {
@@ -1937,7 +1889,7 @@ impl<'a> Typesys<'a> {
         // set break target types
         self.break_target_types.push(right_type);
         self.infer_body(catch_body);
-        return self.break_target_types.pop().unwrap();
+        self.break_target_types.pop().unwrap();
     }
 
     pub fn generics_impl_args_hash(&mut self, args: &Vec<Type>) -> u64 {
@@ -1957,17 +1909,14 @@ impl<'a> Typesys<'a> {
         hasher.finish()
     }
 
-    pub fn infer_select_call_rewrite(&mut self, call: &mut AstCall) -> bool {
+    pub fn infer_select_call_rewrite(&mut self, call: &mut AstCall) -> Result<bool, String> {
         // 获取select表达式
         let AstNode::SelectExpr(left, key) = &mut call.left.node else {
             unreachable!()
         };
 
         // 获取left的类型(已经在之前推导过)
-        let select_left_type = self.infer_right_expr(left, Type::default());
-        if select_left_type.err {
-            return false;
-        }
+        let select_left_type = self.infer_right_expr(left, Type::default())?;
 
         // 解构类型判断
         let destr_type = if matches!(select_left_type.kind, TypeKind::Ptr(_) | TypeKind::RawPtr(_)) {
@@ -1982,7 +1931,7 @@ impl<'a> Typesys<'a> {
         // 如果是 struct 类型且 key 是其属性,不需要重写
         if let TypeKind::Struct(_, _, properties) = &destr_type.kind {
             if properties.iter().any(|p| p.key == *key) {
-                return false;
+                return Ok(false);
             }
         }
 
@@ -2005,13 +1954,7 @@ impl<'a> Typesys<'a> {
                 if let Some(symbol_id) = self.symbol_table.find_symbol_id(&impl_symbol_name, GLOBAL_SCOPE_ID) {
                     (impl_symbol_name, Some(symbol_id.clone()))
                 } else {
-                    // 最终没有找到，说明 type 没有该属性
-                    self.errors.push(AnalyzerError {
-                        start: call.left.start,
-                        end: call.left.end,
-                        message: format!("type {} no property '{}'", select_left_type, key),
-                    });
-                    return false;
+                    return Err(format!("type {} no property '{}'", select_left_type, key));
                 }
             }
         } else {
@@ -2019,12 +1962,7 @@ impl<'a> Typesys<'a> {
             if let Some(symbol_id) = self.symbol_table.find_symbol_id(&impl_symbol_name, GLOBAL_SCOPE_ID) {
                 (impl_symbol_name, Some(symbol_id.clone()))
             } else {
-                self.errors.push(AnalyzerError {
-                    start: call.left.start,
-                    end: call.left.end,
-                    message: format!("type {} no property '{}'", select_left_type, key),
-                });
-                return false;
+                return Err(format!("type {} no property '{}'", select_left_type, key));
             }
         };
 
@@ -2047,7 +1985,7 @@ impl<'a> Typesys<'a> {
         // 设置泛型参数
         call.generics_args = select_left_type.impl_args;
 
-        return true;
+        Ok(true)
     }
 
     fn generics_args_table(
@@ -2079,10 +2017,8 @@ impl<'a> Typesys<'a> {
                 let is_spread = spread && (i == args_len - 1);
 
                 // 获取实参类型 (arg 在 infer right expr 中会被修改 type_ 和 target_type 字段)
-                let arg_type = self.infer_right_expr(arg, Type::default());
-                if arg_type.err {
-                    return Err(format!("infer failed"));
-                }
+                let arg_type = self.infer_right_expr(arg, Type::default())?;
+                
 
                 let formal_type = self.select_generics_fn_param(temp_fndef.clone(), i, is_spread);
                 if formal_type.err {
@@ -2209,7 +2145,6 @@ impl<'a> Typesys<'a> {
             GenericSpecialFnClone { global_parent: None }.deep_clone(&tpl_fn_mutex)
         };
 
-
         {
             let mut tpl_fn = tpl_fn_mutex.lock().unwrap();
             let mut special_fn = special_fn_mutex.lock().unwrap();
@@ -2222,7 +2157,7 @@ impl<'a> Typesys<'a> {
             tpl_fn.generics_hash_table.as_mut().unwrap().insert(args_hash, special_fn_mutex.clone());
 
             // 注册到全局符号表
-             match self.symbol_table.define_symbol(
+            match self.symbol_table.define_symbol(
                 special_fn.symbol_name.clone(),
                 SymbolKind::Fn(special_fn_mutex.clone()),
                 special_fn.symbol_start,
@@ -2287,12 +2222,14 @@ impl<'a> Typesys<'a> {
     /**
      * 整个 infer 都是在 global scope 中进行的，泛型函数也同样只能在全局函数中生命
      */
-    fn infer_generics_special(&mut self, target_type: Type, symbol_id: NodeId, call_data: (Vec<Box<Expr>>, Vec<Type>, bool)) -> Result<Option<Arc<Mutex<AstFnDef>>>, String> {
+    fn infer_generics_special(
+        &mut self,
+        target_type: Type,
+        symbol_id: NodeId,
+        call_data: (Vec<Box<Expr>>, Vec<Type>, bool),
+    ) -> Result<Option<Arc<Mutex<AstFnDef>>>, String> {
         let symbol = self.symbol_table.get_symbol(symbol_id).unwrap();
-        if symbol.defined_in != GLOBAL_SCOPE_ID {
-            return Err("generic special fn must be defined in global scope".to_string());
-        }
-
+     
         if let SymbolKind::Fn(fndef_mutex) = symbol.kind.clone() {
             {
                 let fndef = fndef_mutex.lock().unwrap();
@@ -2303,6 +2240,11 @@ impl<'a> Typesys<'a> {
                 if !fndef.is_generics {
                     return Ok(None);
                 }
+
+            }
+
+            if symbol.defined_in != GLOBAL_SCOPE_ID {
+                return Err("generic special fn must be defined in global scope".to_string());
             }
 
             // 由于存在简单的函数重载，所以需要进行多次批评找到合适的函数， 如果没有重载， fndef 就是目标函数
@@ -2386,7 +2328,13 @@ impl<'a> Typesys<'a> {
 
             let formal_type = self.select_fn_param(i, target_type_fn.clone(), is_spread);
 
-            self.infer_right_expr(arg, formal_type);
+            if let Err(e) = self.infer_right_expr(arg, formal_type) {
+                self.errors.push(AnalyzerError {
+                    start: arg.start,
+                    end: arg.end,
+                    message: e,
+                });
+            }
         }
     }
 
@@ -2396,13 +2344,17 @@ impl<'a> Typesys<'a> {
         }
 
         if matches!(call.left.node, AstNode::SelectExpr(_, _)) {
-            let _ = self.infer_select_call_rewrite(call);
+            let _ = self.infer_select_call_rewrite(call)?;
         }
 
         if let AstNode::Ident(ident, symbol_id_option) = &mut call.left.node {
             let symbol_id = symbol_id_option.unwrap();
             // let new_ident = self.infer_generics_special(target_type, symbol_id, (call.args.clone(), call.generics_args.clone(), call.spread.clone()))?;
-            let special_fn = match self.infer_generics_special(target_type.clone(), symbol_id, (call.args.clone(), call.generics_args.clone(), call.spread.clone())) {
+            let special_fn = match self.infer_generics_special(
+                target_type.clone(),
+                symbol_id,
+                (call.args.clone(), call.generics_args.clone(), call.spread.clone()),
+            ) {
                 Ok(result) => result,
                 Err(e) => {
                     debug!("infer_generics_special failed: {}, ident={}", e, ident);
@@ -2421,7 +2373,7 @@ impl<'a> Typesys<'a> {
             }
         }
 
-        let left_type = self.infer_right_expr(&mut call.left, Type::default());
+        let left_type = self.infer_right_expr(&mut call.left, Type::default())?;
 
         if !matches!(left_type.kind, TypeKind::Fn(..)) {
             return Err("cannot call non-fn".to_string());
@@ -2453,7 +2405,18 @@ impl<'a> Typesys<'a> {
         second: &mut Option<Arc<Mutex<VarDeclExpr>>>,
         body: &mut Vec<Box<Stmt>>,
     ) {
-        let iterate_type = self.infer_right_expr(iterate, Type::default());
+        let iterate_type = match self.infer_right_expr(iterate, Type::default()) {
+            Ok(iterate_type) => iterate_type,
+            Err(e) => {
+                self.errors.push(AnalyzerError {
+                    start: iterate.start,
+                    end: iterate.end,
+                    message: e,
+                });
+                return;
+            }
+        };
+        
 
         // 检查迭代类型
         match iterate_type.kind {
@@ -2539,13 +2502,30 @@ impl<'a> Typesys<'a> {
     pub fn infer_stmt(&mut self, stmt: &mut Box<Stmt>) {
         match &mut stmt.node {
             AstNode::Fake(expr) => {
-                self.infer_right_expr(expr, Type::default());
+                if let Err(e) = self.infer_right_expr(expr, Type::default()) {
+                    self.errors.push(AnalyzerError {
+                        start: expr.start,
+                        end: expr.end,
+                        message: e,
+                    });
+                }
             }
             AstNode::VarDef(var_decl_mutex, expr) => {
                 self.infer_vardef(var_decl_mutex, expr);
             }
             AstNode::VarTupleDestr(elements, expr) => {
-                let right_type = self.infer_right_expr(expr, Type::default());
+                let right_type = match self.infer_right_expr(expr, Type::default()) {
+                    Ok(right_type) => right_type,
+                    Err(e) => {
+                        self.errors.push(AnalyzerError {
+                            start: expr.start,
+                            end: expr.end,
+                            message: e,
+                        });
+                        return;
+                    }
+                };
+
                 if !matches!(right_type.kind, TypeKind::Tuple(..)) {
                     self.errors.push(AnalyzerError {
                         start: expr.start,
@@ -2565,7 +2545,13 @@ impl<'a> Typesys<'a> {
                     });
                     return;
                 }
-                self.infer_right_expr(right, left_type);
+                if let Err(e) = self.infer_right_expr(right, left_type) {
+                    self.errors.push(AnalyzerError {
+                        start: right.start,
+                        end: right.end,
+                        message: e,
+                    });
+                }
             }
             AstNode::FnDef(_) => {}
             AstNode::Call(call) => {
@@ -2616,13 +2602,25 @@ impl<'a> Typesys<'a> {
                 }
             }
             AstNode::If(cond, consequent, alternate) => {
-                self.infer_right_expr(cond, Type::new(TypeKind::Bool));
+                if let Err(e) = self.infer_right_expr(cond, Type::new(TypeKind::Bool)) {
+                    self.errors.push(AnalyzerError {
+                        start: cond.start,
+                        end: cond.end,
+                        message: e,
+                    });
+                }
 
                 self.infer_body(consequent);
                 self.infer_body(alternate);
             }
             AstNode::ForCond(condition, body) => {
-                self.infer_right_expr(condition, Type::new(TypeKind::Bool));
+                if let Err(e) = self.infer_right_expr(condition, Type::new(TypeKind::Bool)) {
+                    self.errors.push(AnalyzerError {
+                        start: condition.start,
+                        end: condition.end,
+                        message: e,
+                    });
+                }
 
                 let t = Type::new(TypeKind::Void);
 
@@ -2635,7 +2633,13 @@ impl<'a> Typesys<'a> {
             }
             AstNode::ForTradition(init, condition, update, body) => {
                 self.infer_stmt(init);
-                self.infer_right_expr(condition, Type::new(TypeKind::Bool));
+                if let Err(e) = self.infer_right_expr(condition, Type::new(TypeKind::Bool)) {
+                    self.errors.push(AnalyzerError {
+                        start: condition.start,
+                        end: condition.end,
+                        message: e,
+                    });
+                }
                 self.infer_stmt(update);
 
                 let t = Type::new(TypeKind::Void);
@@ -2666,7 +2670,13 @@ impl<'a> Typesys<'a> {
                 };
 
                 if let Some(expr) = expr_option {
-                    self.infer_right_expr(expr, target_type);
+                    if let Err(e) = self.infer_right_expr(expr, target_type) {
+                        self.errors.push(AnalyzerError {
+                            start: expr.start,
+                            end: expr.end,
+                            message: e,
+                        });
+                    }
                 } else {
                     // target_type kind mut void
                     if !matches!(target_type.kind, TypeKind::Void) {
@@ -2683,10 +2693,17 @@ impl<'a> Typesys<'a> {
 
                 // get break target type by break_target_types top
                 if let Some(expr) = expr_option {
-                    let new_handle_type = self.infer_right_expr(expr, target_type.clone());
-                    if new_handle_type.err {
-                        return;
-                    }
+                    let new_handle_type = match self.infer_right_expr(expr, target_type.clone()) {
+                        Ok(new_handle_type) => new_handle_type,
+                        Err(e) => {
+                            self.errors.push(AnalyzerError {
+                                start: expr.start,
+                                end: expr.end,
+                                message: e,
+                            });
+                            return;
+                        }
+                    };
 
                     if target_type.kind.is_unknown() {
                         let ptr = self.break_target_types.last_mut().unwrap();
@@ -2943,7 +2960,17 @@ impl<'a> Typesys<'a> {
         let mut var_decl = var_decl_mutex.lock().unwrap();
         var_decl.type_ = self.reduction_type(var_decl.type_.clone());
 
-        let right_expr_type = self.infer_right_expr(right_expr, var_decl.type_.clone());
+        let right_expr_type = match self.infer_right_expr(right_expr, var_decl.type_.clone()) {
+            Ok(right_expr_type) => right_expr_type,
+            Err(e) => {
+                self.errors.push(AnalyzerError {
+                    start: right_expr.start,
+                    end: right_expr.end,
+                    message: e,
+                });
+                return;
+            }
+        };
 
         if var_decl.type_.kind.is_unknown() {
             if !self.type_confirm(&right_expr_type) {
@@ -2970,31 +2997,54 @@ impl<'a> Typesys<'a> {
 
     pub fn rewrite_type_alias(&mut self, type_alias_mutex: &Arc<Mutex<TypeAliasStmt>>) {
         // 如果不存在 params_hash 表示当前 fndef 不存在基于泛型的重写，所以 alias 也不需要进行重写
-        let current_fn = self.current_fn_mutex.lock().unwrap();
-
-        if let Some(hash) = current_fn.generics_args_hash {
+        if let Some(hash) = self.current_fn_mutex.lock().unwrap().generics_args_hash {
             // alias.ident@hash
             let mut type_alias = type_alias_mutex.lock().unwrap();
-            type_alias.ident = format!("{}@{}", type_alias.ident, hash);
 
-            // reset symbol table
-            let _ = self.symbol_table.define_symbol(
+            type_alias.ident = format_generics_ident(type_alias.ident.clone(), hash);
+
+            match self.symbol_table.define_symbol(
                 type_alias.ident.clone(),
                 SymbolKind::TypeAlias(type_alias_mutex.clone()),
                 type_alias.symbol_start,
-            );
+            ) {
+                Ok(symbol_id) => {
+                    let original_symbol = self.symbol_table.get_symbol(type_alias.symbol_id.unwrap()).unwrap();
+                    original_symbol.generics_id_map.insert(type_alias.ident.clone(), symbol_id);
+
+                    type_alias.symbol_id = Some(symbol_id);
+                }
+                Err(e) => {
+                    panic!("rewrite_type_alias failed: {}", e);
+                }
+            }
         }
     }
 
     pub fn rewrite_var_decl(&mut self, var_decl_mutex: Arc<Mutex<VarDeclExpr>>) {
         if let Some(hash) = self.current_fn_mutex.lock().unwrap().generics_args_hash {
             let mut var_decl = var_decl_mutex.lock().unwrap();
+            assert!(var_decl.symbol_id.is_some(), "var_decl must have symbol_id");
+
             // ident@arg_hash
-            var_decl.ident = format!("{}@{}", var_decl.ident, hash);
+            var_decl.ident = format_generics_ident(var_decl.ident.clone(), hash);
+
             // symbol register
-            let _ = self
+            match self
                 .symbol_table
-                .define_symbol(var_decl.ident.clone(), SymbolKind::Var(var_decl_mutex.clone()), var_decl.symbol_start);
+                .define_symbol(var_decl.ident.clone(), SymbolKind::Var(var_decl_mutex.clone()), var_decl.symbol_start)
+            {
+                Ok(symbol_id) => {
+                    // 基于 old symbol id 获取 symbol 并建立 generics_id_map 映射
+                    let original_symbol = self.symbol_table.get_symbol(var_decl.symbol_id.unwrap()).unwrap();
+                    original_symbol.generics_id_map.insert(var_decl.ident.clone(), symbol_id);
+
+                    var_decl.symbol_id = Some(symbol_id);
+                }
+                Err(e) => {
+                    panic!("rewrite_var_decl failed: {}", e);
+                }
+            }
         }
     }
 
@@ -3032,7 +3082,10 @@ impl<'a> Typesys<'a> {
             // handle body - 修改这部分
             let mut body = {
                 let mut fndef = self.current_fn_mutex.lock().unwrap();
-                debug!("will infer body {} {} {} {}", &self.module.ident, &fndef.symbol_name, &fndef.fn_name, &fndef.is_generics);
+                debug!(
+                    "will infer body {} {} {} {}",
+                    &self.module.ident, &fndef.symbol_name, &fndef.fn_name, &fndef.is_generics
+                );
 
                 std::mem::take(&mut fndef.body) // 临时取出 body 的所有权
             };

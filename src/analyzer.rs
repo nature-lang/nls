@@ -375,6 +375,7 @@ pub fn analyze_imports(package_config: &Option<Arc<Mutex<PackageConfig>>>, m: &m
  */
 pub fn register_global_symbol(m: &Module, symbol_table: &mut SymbolTable, stmts: &Vec<Box<Stmt>>) {
     debug!("register global symbol, module {}", &m.ident);
+    dbg!(&stmts);
 
     for stmt in stmts {
         match &stmt.node {

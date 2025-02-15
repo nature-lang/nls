@@ -21,7 +21,14 @@ pub fn format_global_ident(prefix: String, ident: String)->String {
     if prefix.is_empty() {
         return ident;
     }
+
     format!("{prefix}.{ident}")
+}
+
+pub fn format_generics_ident(ident: String, hash: u64) -> String {
+    assert!(hash != 0, "hash must not be 0");
+
+    format!("{ident}@{}", hash)
 }
 
 pub fn calculate_hash<T: Hash>(t: &T) -> u64 {

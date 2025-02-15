@@ -56,6 +56,8 @@ pub struct Symbol {
 
     // local symbol 需要一些额外信息
     pub is_capture: bool, // 如果变量被捕获，则需要分配到堆中，避免作用域问题
+
+    pub generics_id_map: HashMap<String, NodeId>, // new ident -> new symbol id
 }
 
 #[derive(Debug, Clone)]
@@ -202,6 +204,7 @@ impl SymbolTable {
             defined_in: self.current_scope_id,
             pos,
             is_capture: false,
+            generics_id_map: HashMap::new(),
         };
 
         let symbol_id = self.symbols.alloc(symbol);
@@ -260,7 +263,7 @@ impl SymbolTable {
 
     pub fn find_global_symbol(&self, ident: &str) -> Option<&Symbol> {
         if let Some(symbol_id) = self.find_symbol_id(ident, GLOBAL_SCOPE_ID) {
-            return Some(self.symbols.get(symbol_id).unwrap())
+            return Some(self.symbols.get(symbol_id).unwrap());
         } else {
             return None;
         }
@@ -282,8 +285,8 @@ impl SymbolTable {
         }
     }
 
-    pub fn get_symbol(&self, id: NodeId) -> Option<&Symbol> {
-        self.symbols.get(id)
+    pub fn get_symbol(&mut self, id: NodeId) -> Option<&mut Symbol> {
+        self.symbols.get_mut(id)
     }
 
     // 打印作用域树（用于调试）
@@ -303,9 +306,5 @@ impl SymbolTable {
                 self.print_scope_tree(child_id, indent + 2);
             }
         }
-    }
-
-    pub fn symbol_is_local(&self, symbol: &Symbol) -> bool {
-        return symbol.defined_in != GLOBAL_SCOPE_ID;
     }
 }

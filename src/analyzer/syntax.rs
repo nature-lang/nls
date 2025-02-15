@@ -635,7 +635,7 @@ impl Syntax {
         t.status = ReductionStatus::Undo;
         t.start = self.peek().start;
 
-        // union type
+        // any union type
         if self.consume(TokenType::Any) {
             t.kind = TypeKind::Union(true, Vec::new());
             t.end = self.prev().unwrap().end;
@@ -856,7 +856,7 @@ impl Syntax {
             return Ok(t);
         }
 
-        // fn(Type, Type, ...):ReturnType
+        // fn(Type, Type, ...):T!
         if self.consume(TokenType::Fn) {
             self.must(TokenType::LeftParen)?;
             let mut param_types = Vec::new();
@@ -879,13 +879,19 @@ impl Syntax {
                 Type::new(TypeKind::Void)
             };
 
+            let errable = if self.consume(TokenType::Not) {
+                true
+            } else {
+                false
+            };
+
             t.kind = TypeKind::Fn(Box::new(TypeFn {
                 name: "".to_string(),
                 param_types,
                 return_type,
                 rest: false,
                 tpl: false,
-                errable: false
+                errable
             }));
             t.end = self.prev().unwrap().end;
             return Ok(t);
@@ -919,7 +925,7 @@ impl Syntax {
             let mut alias = TypeAlias {
                 ident: ident.literal,
                 import_as: if second.is_some() { Some(first.literal.clone()) } else { None },
-
+                symbol_id: None,
                 args: None,
             };
             t.origin_ident = Some(alias.ident.clone());
@@ -956,38 +962,28 @@ impl Syntax {
             return Ok(t);
         }
 
-        // handle union type
-        let mut union_t = Type::default();
-        union_t.status = ReductionStatus::Undo;
-        union_t.start = self.peek().start;
-
-        let mut elements = Vec::new();
-
-        elements.push(t);
-
+        // T?, T? 后面不在允许直接携带 |
         if self.consume(TokenType::Question) {
-            let t2 = Type::new(TypeKind::Null);
-            elements.push(t2);
+            let mut union_t = Type::default();
+            union_t.status = ReductionStatus::Undo;
+            union_t.start = self.peek().start;
+            let mut elements = Vec::new();
+            elements.push(t);
+
+            let null_type = Type::new(TypeKind::Null);
+            elements.push(null_type);
 
             union_t.kind = TypeKind::Union(false, elements);
             union_t.end = self.prev().unwrap().end;
             return Ok(union_t);
         }
 
-        // T|E
-        self.must(TokenType::Or)?;
-        loop {
-            let t2 = self.parser_single_type()?;
-            elements.push(t2);
-
-            if !self.consume(TokenType::Or) {
-                break;
-            }
+        if self.is(TokenType::Or) {
+            return Err(SyntaxError(self.peek().start, self.peek().end, "union type only be declared in type alias".to_string()));
         }
 
-        union_t.kind = TypeKind::Union(false, elements);
-        union_t.end = self.prev().unwrap().end;
-        return Ok(union_t);
+
+        return Ok(t);
     }
 
     fn parser_type_alias_stmt(&mut self) -> Result<Box<Stmt>, SyntaxError> {
@@ -1039,7 +1035,77 @@ impl Syntax {
 
         self.must(TokenType::Equal)?;
 
-        let alias_type = self.parser_type()?;
+        let type_expr= if self.consume(TokenType::Struct) {
+            self.must(TokenType::LeftCurly)?;
+
+            let mut properties = Vec::new();
+            while !self.is(TokenType::RightCurly) {
+                let field_type = self.parser_type()?;
+                let field_name = self.must(TokenType::Ident)?.literal.clone();
+
+                let mut default_value = None;
+
+                // 默认值支持
+                if self.consume(TokenType::Equal) {
+                    let expr = self.parser_expr()?;
+
+                    // 不允许是函数定义
+                    if let AstNode::FnDef(_) = expr.node {
+                        return Err(SyntaxError(
+                            expr.start,
+                            expr.end,
+                            "struct field default value cannot be a function definition".to_string(),
+                        ));
+                    }
+
+                    default_value = Some(expr);
+                }
+
+                properties.push(TypeStructProperty {
+                    type_: field_type,
+                    key: field_name,
+                    value: default_value,
+                });
+
+                self.must_stmt_end()?;
+            }
+
+            self.must(TokenType::RightCurly)?;
+
+
+            Type::undo_new(TypeKind::Struct("".to_string(), 0, properties))
+        } else {
+            let mut alias_type = self.parser_single_type()?;
+
+             if self.consume(TokenType::Question) {
+                let mut elements = Vec::new();
+                elements.push(alias_type);
+                elements.push(Type::new(TypeKind::Null));
+
+                // 不能再接 |
+                if self.is(TokenType::Or) {
+                    return Err(SyntaxError(self.peek().start, self.peek().end, "union type declaration cannot use '?'".to_string()));
+                }
+
+                alias_type = Type::undo_new(TypeKind::Union(false, elements));
+            } else if self.consume(TokenType::Or) {
+                let mut elements = Vec::new();
+                elements.push(alias_type);
+
+                loop {
+                    let t = self.parser_single_type()?;
+                    elements.push(t);
+
+                    if !self.consume(TokenType::Or) {
+                        break;
+                    }
+                }
+
+                alias_type = Type::undo_new(TypeKind::Union(false, elements));
+            }
+
+            alias_type
+        };
 
         // 恢复之前的 type_params_table
         self.type_params_table = HashMap::new();
@@ -1049,7 +1115,7 @@ impl Syntax {
             symbol_start: alias_ident.start,
             symbol_end: alias_ident.end,
             params: alias_params,
-            type_expr: alias_type,
+            type_expr,
             symbol_id: None,
         })));
         stmt.end = self.prev().unwrap().end;
@@ -1073,6 +1139,7 @@ impl Syntax {
                 TypeAlias {
                     ident: ident.clone(),
                     import_as: None,
+                    symbol_id: None,
                     args: generics_args,
                 }
             }
@@ -1086,6 +1153,7 @@ impl Syntax {
                     TypeAlias {
                         ident: key.clone(),
                         import_as: Some(left_ident.clone()),
+                        symbol_id: None,
                         args: generics_args,
                     }
                 } else {
@@ -2088,6 +2156,10 @@ impl Syntax {
             fndef.return_type = Type::new(TypeKind::Void);
         }
 
+        if self.consume(TokenType::Not) {
+            fndef.is_errable = true;
+        }
+
         fndef.body = self.parser_body()?;
         expr.node = AstNode::FnDef(Arc::new(Mutex::new(fndef)));
 
@@ -2413,6 +2485,7 @@ impl Syntax {
                 t.kind = TypeKind::Alias(Box::new(TypeAlias {
                     import_as: None,
                     ident: first_token.literal.clone(),
+                    symbol_id: None,
                     args: None,
                 }));
                 t.impl_ident = Some(self.must(TokenType::Ident)?.literal.clone());
@@ -2520,6 +2593,10 @@ impl Syntax {
             fndef.return_type = Type::new(TypeKind::Void);
             fndef.return_type.start = self.peek().start;
             fndef.return_type.end = self.peek().end;
+        }
+
+        if self.consume(TokenType::Not) {
+            fndef.is_errable = true;
         }
 
         // tpl fn not body;
@@ -2690,7 +2767,7 @@ impl Syntax {
             return Err(SyntaxError(
                 self.peek().start,
                 self.peek().end,
-                format!("statement cannot start with '{}'", self.peek().literal),
+                format!("local statement cannot start with '{}'", self.peek().literal),
             ));
         };
 

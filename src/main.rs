@@ -32,8 +32,6 @@ impl LanguageServer for Backend {
                 let project = Project::new(project_root.clone(), self.client.clone()).await;
                 project.backend_handle_queue();
 
-                dbg!(&project);
-
                 // 多工作区处理
                 self.projects.insert(project_root, project);
             }

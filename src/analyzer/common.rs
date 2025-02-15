@@ -6,7 +6,7 @@ use strum_macros::Display;
 
 use crate::utils::align_up;
 
-use super::symbol::NodeId;
+use super::symbol::{NodeId, SymbolTable, GLOBAL_SCOPE_ID};
 
 use serde::Deserialize;
 
@@ -105,6 +105,21 @@ impl Type {
         Self {
             kind: kind.clone(),
             status: ReductionStatus::Done,
+            origin_ident: None,
+            origin_type_kind: TypeKind::Unknown,
+            impl_ident: Some(kind.to_string()),
+            impl_args: Vec::new(),
+            start: 0,
+            end: 0,
+            in_heap: Self::kind_in_heap(&kind),
+            err: false,
+        }
+    }
+
+    pub fn undo_new(kind: TypeKind) -> Self {
+        Self {
+            kind: kind.clone(),
+            status: ReductionStatus::Undo,
             origin_ident: None,
             origin_type_kind: TypeKind::Unknown,
             impl_ident: Some(kind.to_string()),
@@ -326,11 +341,12 @@ impl Type {
         return ptr_type;
     }
 
-    pub fn errort() -> Type {
+    pub fn errort(symbol_table: &SymbolTable) -> Type {
         let alias = TypeKind::Alias(Box::new(TypeAlias {
             import_as: None,
             args: None,
             ident: "error_t".to_string(),
+            symbol_id: symbol_table.find_symbol_id("error_t", GLOBAL_SCOPE_ID),
         }));
 
         let mut errort = Type::new(alias.clone());
@@ -460,6 +476,7 @@ pub struct TypeFn {
 pub struct TypeAlias {
     pub import_as: Option<String>,
     pub ident: String,
+    pub symbol_id: Option<NodeId>, 
     pub args: Option<Vec<Type>>,
 }
 
@@ -468,6 +485,7 @@ impl TypeAlias {
         Self {
             import_as: None,
             ident: String::new(),
+            symbol_id: None,
             args: None,
         }
     }
@@ -749,7 +767,7 @@ pub enum AstNode {
     VecAccess(Type, Box<Expr>, Box<Expr>),              // (element_type, left, index)
     ArrayAccess(Type, Box<Expr>, Box<Expr>),            // (element_type, left, index)
     TupleAccess(Type, Box<Expr>, u64),                  // (element_type, left, index)
-    StructSelect(Box<Expr>, String, StructNewProperty), // (instance, key, property)
+    StructSelect(Box<Expr>, String, TypeStructProperty), // (instance, key, property)
     EnvAccess(u8, String, Option<NodeId>),              // (index, unique_ident)
 
     VecNew(Vec<Box<Expr>>, Option<Box<Expr>>, Option<Box<Expr>>), // (elements, len, cap)

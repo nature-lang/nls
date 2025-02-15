@@ -128,35 +128,42 @@ impl<'a> Semantic<'a> {
 
                 // 处理导入的全局模式别名，例如 type a = package.foo
                 if let Some(import_as) = &type_alias.import_as {
-                    // 在导入表中查找对应的导入
-                    for import in &self.imports {
-                        if import.as_name != *import_as {
-                            continue;
-                        }
-
-                        // 更新标识符指向
-                        let global_pkg_ident = format_global_ident(import.module_ident.clone(), ident.clone());
-
-                        // check exists
-                        if !self.symbol_table.symbol_exists_in_scope(&global_pkg_ident, GLOBAL_SCOPE_ID) {
-                            self.errors.push(AnalyzerError {
-                                start: t.start,
-                                end: t.end,
-                                message: format!("type alias '{}' undeclared", ident),
-                            });
-                            t.err = true;
-                            return;
-                        }
-
-                        type_alias.ident = global_pkg_ident;
-                        type_alias.import_as = None;
-
-                        break;
+                    // 只要存在 import as, 就必须能够在 导入表中找到对应的导入, 放在直接抛出异常
+                    let import_ident = self.imports.iter().find(|i| i.as_name == *import_as);
+                    if import_ident.is_none() {
+                        self.errors.push(AnalyzerError {
+                            start: t.start,
+                            end: t.end,
+                            message: format!("import type alias '{}' undeclared", ident),
+                        });
+                        t.err = true;
+                        return;
                     }
+
+                    let import_ident = import_ident.unwrap();
+                    let global_pkg_ident = format_global_ident(import_ident.module_ident.clone(), ident.clone());
+
+                    // 从 symbol table 中查找相关的 global symbol id
+                    let symbol_id = self.symbol_table.find_symbol_id(&global_pkg_ident, GLOBAL_SCOPE_ID);
+                    if symbol_id.is_none() {
+                        self.errors.push(AnalyzerError {
+                            start: t.start,
+                            end: t.end,
+                            message: format!("global ident '{}' undeclared in {} module", global_pkg_ident, import_ident.module_ident),
+                        });
+                        t.err = true;
+                        return;
+                    }
+
+                    type_alias.ident = global_pkg_ident;
+                    type_alias.symbol_id = symbol_id;
+                    type_alias.import_as = None;
                 } else {
+                    dbg!(&type_alias);
                     // no import as
-                    if let Some(unique_alias_ident) = self.resolve_type_alias(&type_alias.ident, self.symbol_table.current_scope_id) {
-                        type_alias.ident = unique_alias_ident;
+                    if let Some((symbol_id, unique_ident)) = self.resolve_type_alias(&type_alias.ident) {
+                        type_alias.symbol_id = Some(symbol_id);
+                        type_alias.ident = unique_ident;
                     } else {
                         // check is special type ident
                         if self.analyze_special_type_rewrite(t) {
@@ -400,37 +407,36 @@ impl<'a> Semantic<'a> {
         self.module.analyzer_errors.extend(self.errors.clone());
     }
 
-    pub fn resolve_type_alias(&mut self, ident: &str, scope_id: NodeId) -> Option<String> {
-        if scope_id == GLOBAL_SCOPE_ID {
-            let curent_package_ident = format_global_ident(self.module.ident.clone(), ident.to_string().clone());
-
-            // check global symbol map
-            if self.symbol_table.symbol_exists_in_scope(&curent_package_ident, scope_id) {
-                return Some(curent_package_ident);
-            }
-
-            // import x as * 产生的全局符号
-            for i in &self.imports {
-                if i.as_name != "*" {
-                    continue;
-                };
-
-                let temp_package_ident = format_global_ident(i.module_ident.clone(), ident.to_string().clone());
-                if self.symbol_table.symbol_exists_in_scope(&temp_package_ident, scope_id) {
-                    return Some(temp_package_ident);
-                }
-            }
-
-            // builtin 全局符号，不需要进行 format 链接，直接读取 global 符号表
-            if self.symbol_table.symbol_exists_in_scope(ident, scope_id) {
-                return Some(ident.to_string());
-            }
-
-            return None;
+    pub fn resolve_type_alias(&mut self, ident: &str) -> Option<(NodeId, String)> {
+        // 首先尝试在当前作用域和父级作用域中直接查找该符号
+        if let Some(symbol_id)  = self.symbol_table.lookup_symbol(ident) {
+            return Some((symbol_id, ident.to_string()));
         }
 
-        let scope_option = self.symbol_table.find_scope(scope_id);
-        return self.resolve_type_alias(ident, scope_option.unwrap().parent.unwrap());
+        // 当前 module 的全局符号，此时省略了 module ident
+        let curent_package_ident = format_global_ident(self.module.ident.clone(), ident.to_string().clone());
+        if let Some(symbol_id) = self.symbol_table.find_symbol_id(&curent_package_ident, GLOBAL_SCOPE_ID) {
+            return Some((symbol_id, curent_package_ident));
+        } 
+
+         // import x as * 产生的全局符号
+         for i in &self.imports {
+            if i.as_name != "*" {
+                continue;
+            };
+
+            let temp_package_ident = format_global_ident(i.module_ident.clone(), ident.to_string().clone());
+            if let Some(symbol_id) = self.symbol_table.find_symbol_id(&temp_package_ident, GLOBAL_SCOPE_ID) {
+                return Some((symbol_id, temp_package_ident));
+            }
+        }
+
+          // builtin 全局符号，不需要进行 format 链接，直接读取 global 符号表
+          if let Some(symbol_id) = self.symbol_table.find_symbol_id(ident, GLOBAL_SCOPE_ID) {
+            return Some((symbol_id, ident.to_string()));
+        }
+
+        return None;
     }
 
     pub fn analyze_global_fn(&mut self, fndef_mutex: Arc<Mutex<AstFnDef>>) {
@@ -455,11 +461,13 @@ impl<'a> Semantic<'a> {
                 let Some(impl_ident) = &fndef.impl_type.impl_ident else {
                     panic!("impl ident empty")
                 };
-                if let Some(unique_alias_ident) = self.resolve_type_alias(impl_ident, GLOBAL_SCOPE_ID) {
-                    fndef.impl_type.impl_ident = Some(unique_alias_ident.clone());
+                if let Some((_symbol_id, unique_ident)) = self.resolve_type_alias(impl_ident) {
+                    // fndef.impl_type.symbol_id = Some(symbol_id);
+                    fndef.impl_type.impl_ident = Some(unique_ident.clone());
+
                     // fndef.impl_type.kind
                     if let TypeKind::Alias(ref mut alias_box) = fndef.impl_type.kind {
-                        alias_box.ident = unique_alias_ident.clone();
+                        alias_box.ident = unique_ident.clone();
                     }
                 } else {
                     self.errors.push(AnalyzerError {
@@ -697,8 +705,10 @@ impl<'a> Semantic<'a> {
                 let Some(subject_literal) = subject_ident.clone() else { unreachable!() };
                 let Some(cond_expr) = case.cond_list.first() else { unreachable!() };
                 let AstNode::Is(target_type, _) = &cond_expr.node else { unreachable!() };
-                case.handle_body
-                    .insert(0, self.auto_as_stmt(cond_expr.start, cond_expr.end, &subject_literal, subject_symbol_id, target_type));
+                case.handle_body.insert(
+                    0,
+                    self.auto_as_stmt(cond_expr.start, cond_expr.end, &subject_literal, subject_symbol_id, target_type),
+                );
             }
 
             self.symbol_table.enter_create_scope(ScopeKind::Local);
