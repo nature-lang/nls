@@ -160,7 +160,7 @@ impl Type {
                 "tup<...>".to_string()
             }
             TypeKind::Fn(type_fn) => {
-                format!("fn(...):{}", type_fn.return_type)
+                format!("fn(...):{}{}", type_fn.return_type, if type_fn.errable { "!" } else { "" })
             }
             TypeKind::Ptr(value_type) => {
                 format!("ptr<{}>", value_type)
@@ -297,7 +297,7 @@ impl Type {
         match &kind {
             TypeKind::Struct(..) => Self::type_struct_sizeof(kind),
             TypeKind::Arr(len, element_type) => len * Self::sizeof(&element_type.kind),
-            _ => kind.sizeof()
+            _ => kind.sizeof(),
         }
     }
 
@@ -460,6 +460,8 @@ pub struct TypeStructProperty {
     pub type_: Type,
     pub key: String,
     pub value: Option<Box<Expr>>,
+    pub start: usize,
+    pub end: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -476,7 +478,7 @@ pub struct TypeFn {
 pub struct TypeAlias {
     pub import_as: Option<String>,
     pub ident: String,
-    pub symbol_id: Option<NodeId>, 
+    pub symbol_id: Option<NodeId>,
     pub args: Option<Vec<Type>>,
 }
 
@@ -763,12 +765,12 @@ pub enum AstNode {
 
     New(Type, Vec<StructNewProperty>), // (type_, properties)
 
-    MapAccess(Type, Type, Box<Expr>, Box<Expr>),        // (key_type, value_type, left, key)
-    VecAccess(Type, Box<Expr>, Box<Expr>),              // (element_type, left, index)
-    ArrayAccess(Type, Box<Expr>, Box<Expr>),            // (element_type, left, index)
-    TupleAccess(Type, Box<Expr>, u64),                  // (element_type, left, index)
+    MapAccess(Type, Type, Box<Expr>, Box<Expr>),         // (key_type, value_type, left, key)
+    VecAccess(Type, Box<Expr>, Box<Expr>),               // (element_type, left, index)
+    ArrayAccess(Type, Box<Expr>, Box<Expr>),             // (element_type, left, index)
+    TupleAccess(Type, Box<Expr>, u64),                   // (element_type, left, index)
     StructSelect(Box<Expr>, String, TypeStructProperty), // (instance, key, property)
-    EnvAccess(u8, String, Option<NodeId>),              // (index, unique_ident)
+    EnvAccess(u8, String, Option<NodeId>),               // (index, unique_ident)
 
     VecNew(Vec<Box<Expr>>, Option<Box<Expr>>, Option<Box<Expr>>), // (elements, len, cap)
     ArrayNew(Vec<Box<Expr>>),                                     // elements
@@ -899,6 +901,8 @@ pub struct StructNewProperty {
     pub type_: Type,
     pub key: String,
     pub value: Box<Expr>,
+    pub start: usize,
+    pub end: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -992,6 +996,8 @@ pub struct MatchCase {
     pub cond_list: Vec<Box<Expr>>,
     pub is_default: bool,
     pub handle_body: Vec<Box<Stmt>>,
+    pub start: usize,
+    pub end: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -1001,6 +1007,8 @@ pub struct SelectCase {
     pub is_recv: bool,
     pub is_default: bool,
     pub handle_body: Vec<Box<Stmt>>,
+    pub start: usize,
+    pub end: usize,
 }
 
 #[derive(Debug, Clone)]

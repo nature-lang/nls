@@ -159,7 +159,6 @@ impl<'a> Semantic<'a> {
                     type_alias.symbol_id = symbol_id;
                     type_alias.import_as = None;
                 } else {
-                    dbg!(&type_alias);
                     // no import as
                     if let Some((symbol_id, unique_ident)) = self.resolve_type_alias(&type_alias.ident) {
                         type_alias.symbol_id = Some(symbol_id);
@@ -223,6 +222,7 @@ impl<'a> Semantic<'a> {
             }
             TypeKind::Fn(fn_type) => {
                 self.analyze_type(&mut fn_type.return_type);
+
                 for param_type in &mut fn_type.param_types {
                     self.analyze_type(param_type);
                 }
@@ -272,19 +272,20 @@ impl<'a> Semantic<'a> {
                 AstNode::FnDef(fndef_mutex) => {
                     let mut fndef = fndef_mutex.lock().unwrap();
                     let mut symbol_name = fndef.symbol_name.clone();
-                    if symbol_name.contains("reverse") {
-                        dbg!(&fndef.symbol_name, &fndef.generics_params, &self.module.ident);
-                    }
 
                     // fn string<T>.len() -> fn <T>.string_len to symbol_table
                     if !fndef.impl_type.kind.is_unknown() {
                         assert!(fndef.impl_type.impl_ident != None);
-                        symbol_name = format!("{}_{}", fndef.impl_type.impl_ident.as_ref().unwrap(), symbol_name)
+                        symbol_name = format!("{}_{}", fndef.impl_type.impl_ident.as_ref().unwrap(), symbol_name);
                     }
 
                     // fndef 的 symbol_name 需要包含 package name 来构成全局搜索名称
                     // package_name.symbol_name
-                    fndef.symbol_name = format_global_ident(self.module.ident.clone(), symbol_name.clone());
+                    if Type::is_impl_builtin_type(&fndef.impl_type.kind) {
+                        fndef.symbol_name = symbol_name;
+                    } else {
+                        fndef.symbol_name = format_global_ident(self.module.ident.clone(), symbol_name.clone());
+                    }
 
                     if let Err(e) = self
                         .symbol_table
@@ -409,7 +410,7 @@ impl<'a> Semantic<'a> {
 
     pub fn resolve_type_alias(&mut self, ident: &str) -> Option<(NodeId, String)> {
         // 首先尝试在当前作用域和父级作用域中直接查找该符号
-        if let Some(symbol_id)  = self.symbol_table.lookup_symbol(ident) {
+        if let Some(symbol_id) = self.symbol_table.lookup_symbol(ident) {
             return Some((symbol_id, ident.to_string()));
         }
 
@@ -417,10 +418,10 @@ impl<'a> Semantic<'a> {
         let curent_package_ident = format_global_ident(self.module.ident.clone(), ident.to_string().clone());
         if let Some(symbol_id) = self.symbol_table.find_symbol_id(&curent_package_ident, GLOBAL_SCOPE_ID) {
             return Some((symbol_id, curent_package_ident));
-        } 
+        }
 
-         // import x as * 产生的全局符号
-         for i in &self.imports {
+        // import x as * 产生的全局符号
+        for i in &self.imports {
             if i.as_name != "*" {
                 continue;
             };
@@ -431,8 +432,8 @@ impl<'a> Semantic<'a> {
             }
         }
 
-          // builtin 全局符号，不需要进行 format 链接，直接读取 global 符号表
-          if let Some(symbol_id) = self.symbol_table.find_symbol_id(ident, GLOBAL_SCOPE_ID) {
+        // builtin 全局符号，不需要进行 format 链接，直接读取 global 符号表
+        if let Some(symbol_id) = self.symbol_table.find_symbol_id(ident, GLOBAL_SCOPE_ID) {
             return Some((symbol_id, ident.to_string()));
         }
 
@@ -440,93 +441,108 @@ impl<'a> Semantic<'a> {
     }
 
     pub fn analyze_global_fn(&mut self, fndef_mutex: Arc<Mutex<AstFnDef>>) {
-        let mut fndef = fndef_mutex.lock().unwrap();
+        {
+            let mut fndef = fndef_mutex.lock().unwrap();
 
-        fndef.is_local = false;
-        fndef.module_index = self.module.index;
-        if fndef.generics_params.is_some() {
-            fndef.is_generics = true;
-        }
-
-        if fndef.is_tpl {
-            assert!(fndef.body.len() == 0);
-        }
-
-        self.analyze_type(&mut fndef.return_type);
-
-        // 如果 impl type 是 type alias, 则从符号表中获取当前的 type alias 的全称进行更新
-        // fn vec<T>.len() -> fn vec_len(vec<T> self)
-        if fndef.impl_type.kind.is_exist() {
-            if matches!(fndef.impl_type.kind, TypeKind::Alias(..)) {
-                let Some(impl_ident) = &fndef.impl_type.impl_ident else {
-                    panic!("impl ident empty")
-                };
-                if let Some((_symbol_id, unique_ident)) = self.resolve_type_alias(impl_ident) {
-                    // fndef.impl_type.symbol_id = Some(symbol_id);
-                    fndef.impl_type.impl_ident = Some(unique_ident.clone());
-
-                    // fndef.impl_type.kind
-                    if let TypeKind::Alias(ref mut alias_box) = fndef.impl_type.kind {
-                        alias_box.ident = unique_ident.clone();
-                    }
-                } else {
-                    self.errors.push(AnalyzerError {
-                        start: fndef.symbol_start,
-                        end: fndef.symbol_end,
-                        message: format!("type alias '{}' undeclared", impl_ident),
-                    });
-                };
+            fndef.is_local = false;
+            fndef.module_index = self.module.index;
+            if fndef.generics_params.is_some() {
+                fndef.is_generics = true;
             }
 
-            // 重构 params 的位置, 新增 self param
-            let mut new_params = Vec::new();
-            let param_type = fndef.impl_type.clone();
-            let self_vardecl = VarDeclExpr {
-                ident: String::from("self"),
-                type_: param_type,
-                be_capture: false,
-                heap_ident: None,
-                symbol_start: fndef.symbol_start,
-                symbol_end: fndef.symbol_end,
-                symbol_id: None,
+            if fndef.is_tpl {
+                assert!(fndef.body.len() == 0);
+            }
+
+            self.analyze_type(&mut fndef.return_type);
+
+            // 如果 impl type 是 type alias, 则从符号表中获取当前的 type alias 的全称进行更新
+            // fn vec<T>.len() -> fn vec_len(vec<T> self)
+            if fndef.impl_type.kind.is_exist() {
+                if matches!(fndef.impl_type.kind, TypeKind::Alias(..)) {
+                    let Some(impl_ident) = &fndef.impl_type.impl_ident else {
+                        panic!("impl ident empty")
+                    };
+                    if let Some((_symbol_id, unique_ident)) = self.resolve_type_alias(impl_ident) {
+                        // fndef.impl_type.symbol_id = Some(symbol_id);
+                        fndef.impl_type.impl_ident = Some(unique_ident.clone());
+
+                        // fndef.impl_type.kind
+                        if let TypeKind::Alias(ref mut alias_box) = fndef.impl_type.kind {
+                            alias_box.ident = unique_ident.clone();
+                        }
+                    } else {
+                        self.errors.push(AnalyzerError {
+                            start: fndef.symbol_start,
+                            end: fndef.symbol_end,
+                            message: format!("type alias '{}' undeclared", impl_ident),
+                        });
+                    };
+                }
+
+                // 重构 params 的位置, 新增 self param
+                let mut new_params = Vec::new();
+                let param_type = fndef.impl_type.clone();
+                let self_vardecl = VarDeclExpr {
+                    ident: String::from("self"),
+                    type_: param_type,
+                    be_capture: false,
+                    heap_ident: None,
+                    symbol_start: fndef.symbol_start,
+                    symbol_end: fndef.symbol_end,
+                    symbol_id: None,
+                };
+
+                new_params.push(Arc::new(Mutex::new(self_vardecl)));
+                new_params.extend(fndef.params.iter().cloned());
+                fndef.params = new_params;
+            }
+
+            self.symbol_table.enter_create_scope(ScopeKind::GlobalFn(fndef_mutex.clone()));
+
+            // 函数形参处理
+            for param_mutex in &fndef.params {
+                let mut param = param_mutex.lock().unwrap();
+                self.analyze_type(&mut param.type_);
+
+                // 将参数添加到符号表中
+                match self
+                    .symbol_table
+                    .define_symbol(param.ident.clone(), SymbolKind::Var(param_mutex.clone()), param.symbol_start)
+                {
+                    Ok(symbol_id) => {
+                        param.symbol_id = Some(symbol_id);
+                    }
+                    Err(e) => {
+                        self.errors.push(AnalyzerError {
+                            start: param.symbol_start,
+                            end: param.symbol_end,
+                            message: e,
+                        });
+                    }
+                }
+            }
+        }
+
+        {
+            let mut body = {
+                let mut fndef = fndef_mutex.lock().unwrap();
+                std::mem::take(&mut fndef.body)
             };
 
-            new_params.push(Arc::new(Mutex::new(self_vardecl)));
-            new_params.extend(fndef.params.iter().cloned());
-            fndef.params = new_params;
-        }
+            if body.len() > 0 {
+                self.analyze_body(&mut body);
+            }
 
-        self.symbol_table.enter_create_scope(ScopeKind::GlobalFn(fndef_mutex.clone()));
-
-        // 函数形参处理
-        for param_mutex in &fndef.params {
-            let mut param = param_mutex.lock().unwrap();
-            self.analyze_type(&mut param.type_);
-
-            // 将参数添加到符号表中
-            match self
-                .symbol_table
-                .define_symbol(param.ident.clone(), SymbolKind::Var(param_mutex.clone()), param.symbol_start)
+            // 将当前的 fn 添加到 global fn 的 local_children 中
             {
-                Ok(symbol_id) => {
-                    param.symbol_id = Some(symbol_id);
-                }
-                Err(e) => {
-                    self.errors.push(AnalyzerError {
-                        start: param.symbol_start,
-                        end: param.symbol_end,
-                        message: e,
-                    });
-                }
+                let mut fndef = fndef_mutex.lock().unwrap();
+
+                // 归还 body
+                fndef.body = body;
+                fndef.local_children = self.current_local_fn_list.clone();
             }
         }
-
-        if fndef.body.len() > 0 {
-            self.analyze_body(&mut fndef.body);
-        }
-
-        // 将当前的 fn 添加到 global fn 的 local_children 中
-        fndef.local_children = self.current_local_fn_list.clone();
 
         // 清空 self.current_local_fn_list, 进行重新计算
         self.current_local_fn_list.clear();
@@ -690,7 +706,7 @@ impl<'a> Semantic<'a> {
                         case.is_default = true;
                         continue;
                     }
-                } else if let AstNode::Is(_, _) = &cond.node {
+                } else if let AstNode::MatchIs(..) = &cond.node {
                     is_cond = true;
                 }
 
@@ -704,7 +720,7 @@ impl<'a> Semantic<'a> {
             if is_cond && subject_ident.is_some() {
                 let Some(subject_literal) = subject_ident.clone() else { unreachable!() };
                 let Some(cond_expr) = case.cond_list.first() else { unreachable!() };
-                let AstNode::Is(target_type, _) = &cond_expr.node else { unreachable!() };
+                let AstNode::MatchIs(target_type) = &cond_expr.node else { unreachable!() };
                 case.handle_body.insert(
                     0,
                     self.auto_as_stmt(cond_expr.start, cond_expr.end, &subject_literal, subject_symbol_id, target_type),
@@ -722,13 +738,16 @@ impl<'a> Semantic<'a> {
         self.analyze_local_fndef(&async_expr.closure_fn);
         self.analyze_local_fndef(&async_expr.closure_fn_void);
 
-        // closure_fn 的 fn_name 需要继承当前 fn 的 fn_name, 这样报错才会更加的精准
+        // closure_fn 的 fn_name 需要继承当前 fn 的 fn_name, 这样报错才会更加的精准, 当前 global 以及是 unlock 状态了，不太妥当
         let mut fndef = async_expr.closure_fn.lock().unwrap();
         let Some(global_fn_mutex) = self.symbol_table.find_global_fn() else {
             panic!("global fn not found")
         };
-        let global_fn = global_fn_mutex.lock().unwrap();
-        fndef.fn_name = global_fn.fn_name.clone();
+
+        fndef.fn_name = {
+            let global_fn = global_fn_mutex.lock().unwrap();
+            global_fn.fn_name.clone()
+        };
 
         self.analyze_call(&mut async_expr.origin_call);
         if let Some(flag_expr) = &mut async_expr.flag_expr {
@@ -923,6 +942,8 @@ impl<'a> Semantic<'a> {
             });
         }
 
+        self.analyze_type(&mut fndef.return_type);
+
         self.symbol_table.enter_create_scope(ScopeKind::LocalFn(fndef_mutex.clone()));
 
         // 形参处理
@@ -1094,8 +1115,9 @@ impl<'a> Semantic<'a> {
             }
             AstNode::Catch(try_expr, catch_err, catch_body) => {
                 self.analyze_expr(try_expr);
-                self.analyze_var_decl(&catch_err);
+
                 self.symbol_table.enter_create_scope(ScopeKind::Local);
+                self.analyze_var_decl(&catch_err);
                 self.analyze_body(catch_body);
                 self.symbol_table.exit_scope();
             }

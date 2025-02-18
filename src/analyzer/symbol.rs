@@ -174,12 +174,9 @@ impl SymbolTable {
         }
     }
 
-    /**
-     * 存在 rebuild 机制，所以同一个符号会被重复定义, 但是定义的位置相同。
-     */
-    pub fn define_symbol(&mut self, ident: String, kind: SymbolKind, pos: usize) -> Result<NodeId, String> {
+    pub fn define_symbol_in_scope(&mut self, ident: String, kind: SymbolKind, pos: usize, scope_id: NodeId) -> Result<NodeId, String> {
         // 检查当前作用域是否已存在同名符号
-        if let Some(scope) = self.scopes.get(self.current_scope_id) {
+        if let Some(scope) = self.scopes.get(scope_id) {
             if let Some(&existing_symbol_id) = scope.symbol_map.get(&ident) {
                 // 获取已存在的符号
                 if let Some(existing_symbol) = self.symbols.get_mut(existing_symbol_id) {
@@ -189,10 +186,7 @@ impl SymbolTable {
                         return Ok(existing_symbol_id);
                     } else {
                         // 位置不同，则是真正的重复定义
-                        return Err(format!(
-                            "symbol '{}' already defined in current scope at position {}",
-                            ident, existing_symbol.pos
-                        ));
+                        return Err(format!("redeclare ident '{}'", ident));
                     }
                 }
             }
@@ -210,12 +204,19 @@ impl SymbolTable {
         let symbol_id = self.symbols.alloc(symbol);
 
         // 将符号添加到当前作用域
-        if let Some(scope) = self.scopes.get_mut(self.current_scope_id) {
+        if let Some(scope) = self.scopes.get_mut(scope_id) {
             scope.symbols.push(symbol_id);
             scope.symbol_map.insert(ident, symbol_id);
         }
 
         Ok(symbol_id)
+    }
+
+    /**
+     * 存在 rebuild 机制，所以同一个符号会被重复定义, 但是定义的位置相同。
+     */
+    pub fn define_symbol(&mut self, ident: String, kind: SymbolKind, pos: usize) -> Result<NodeId, String> {
+        return self.define_symbol_in_scope(ident, kind, pos, self.current_scope_id);
     }
 
     // 查找符号（包括父作用域）

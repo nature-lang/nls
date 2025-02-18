@@ -10,7 +10,6 @@ use ropey::Rope;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
-use tower_lsp::Client;
 
 // TODO
 // const DEFAULT_NATURE_ROOT: &str = "/usr/local/nature";
@@ -115,12 +114,11 @@ pub struct Project {
     // queue 中的每一个 module 都可以视为 main.n 来编译，主要是由于用户打开文件 A import B or C 产生的 B 和 C 注册到 queue 中进行处理
     pub queue: Arc<Mutex<Vec<QueueItem>>>,
     pub package_config: Option<Arc<Mutex<PackageConfig>>>, // 当前 project 如果包含 package.toml, 则可以解析出 package_config 等信息，import 需要借助该信息进行解析
-    pub client: Arc<Client>, // 使用 Arc 包装 Client
     pub symbol_table: Arc<Mutex<SymbolTable>>,
 }
 
 impl Project {
-    pub async fn new(project_root: String, client: Client) -> Self {
+    pub async fn new(project_root: String) -> Self {
         // 1. check nature root by env
         let nature_root = std::env::var("NATURE_ROOT").unwrap_or(DEFAULT_NATURE_ROOT.to_string());
 
@@ -166,7 +164,6 @@ impl Project {
             module_handled: Arc::new(Mutex::new(HashMap::new())),
             queue: Arc::new(Mutex::new(Vec::new())),
             package_config,
-            client: Arc::new(client),
             symbol_table: Arc::new(Mutex::new(SymbolTable::new())),
         };
 
@@ -207,7 +204,6 @@ impl Project {
             }
 
             let item = item_option.unwrap();
-            dbg!(&item);
 
             if !self.need_build(&item).await {
                 continue;
@@ -263,9 +259,6 @@ impl Project {
         main_import.full_path = main_path.to_string();
         main_import.module_ident = module_ident.to_string();
 
-        // TODO 怎么计算 ident? 我甚至都不知道 main_path 是怎么来，又怎么能计算出 ident 呢？ 我可能就是 std 呀！
-        // 一开始可能就是 builtin 模块，builtin 模块的 module ident  是空的
-
         worklist.push(main_import);
         handled.insert(main_path.to_string());
 
@@ -313,7 +306,6 @@ impl Project {
 
             let mut module_db = self.module_db.lock().unwrap();
             let m = &mut module_db[index];
-            dbg!("current handle",&m.ident, &m.path);
 
             // - lexer
             let (token_db, token_indexes, lexer_errors) = Lexer::new(m.source.clone()).scan();
@@ -426,7 +418,6 @@ impl Project {
         // 然后处理 module_db
         let mut module_db = self.module_db.lock().unwrap();
         let m = &mut module_db[module_index];
-        dbg!(&m.dependencies);
 
         // 将当前的依赖转换为 HashSet
         let old_deps: HashSet<String> = m.dependencies.iter().map(|dep| dep.full_path.clone()).collect();
@@ -442,7 +433,6 @@ impl Project {
 
         // 更新当前模块的依赖列表
         module_db[module_index].dependencies = imports.clone();
-        dbg!(&module_db[module_index].dependencies);
 
         // 添加反向引用关系
         for import in imports {

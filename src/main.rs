@@ -29,7 +29,7 @@ impl LanguageServer for Backend {
             for folder in workspace_folders {
                 // folder.uri 是工作区根目录的 URI
                 let project_root = folder.uri.to_file_path().expect("Failed to convert URI to file path").to_string_lossy().to_string();
-                let project = Project::new(project_root.clone(), self.client.clone()).await;
+                let project = Project::new(project_root.clone()).await;
                 project.backend_handle_queue();
 
                 // 多工作区处理
@@ -132,7 +132,6 @@ impl LanguageServer for Backend {
     }
 
     async fn did_save(&self, params: DidSaveTextDocumentParams) {
-        dbg!(&params.text);
         if let Some(text) = params.text {
             let item = TextDocumentItem {
                 uri: params.text_document.uri,
@@ -563,11 +562,12 @@ impl Backend {
             let mut module_db = project.module_db.lock().unwrap();
             let m = &mut module_db[module_index];
 
-            dbg!(&m.analyzer_errors);
+            dbg!(&m.ident, &m.analyzer_errors);
 
             m.analyzer_errors
                 .clone()
                 .into_iter()
+                .filter(|error|  error.end > 0)  // 过滤掉 start = end = 0 的错误
                 .filter_map(|error| {
                     let start_position = offset_to_position(error.start, &m.rope)?;
                     let end_position = offset_to_position(error.end, &m.rope)?;

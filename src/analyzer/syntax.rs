@@ -6,7 +6,7 @@ use std::collections::HashMap;
 use std::error::Error;
 use std::fmt;
 use std::sync::{Arc, Mutex};
-use tower_lsp::lsp_types::SemanticTokenType; 
+use tower_lsp::lsp_types::SemanticTokenType;
 
 const LOCAL_FN_NAME: &str = "lambda";
 
@@ -206,6 +206,13 @@ impl Syntax {
         return &self.token_db[self.token_indexes[self.current]];
     }
 
+    fn peek_mut(&mut self) -> &mut Token {
+        if self.current >= self.token_indexes.len() {
+            panic!("syntax::peek: current index out of range");
+        }
+        return &mut self.token_db[self.token_indexes[self.current]];
+    }
+
     fn prev(&self) -> Option<&Token> {
         if self.current == 0 {
             return None;
@@ -325,7 +332,7 @@ impl Syntax {
             },
             Dot => ParserRule {
                 prefix: None,
-                infix: Some(Self::parser_select),
+                infix: Some(Self::parser_select_expr),
                 infix_precedence: SyntaxPrecedence::Call,
             },
             Minus => ParserRule {
@@ -368,6 +375,11 @@ impl Syntax {
                 infix: Some(Self::parser_binary),
                 infix_precedence: SyntaxPrecedence::Shift,
             },
+            Percent => ParserRule {
+                prefix: None,
+                infix: Some(Self::parser_binary),
+                infix_precedence: SyntaxPrecedence::Factor,
+            },
             Star => ParserRule {
                 prefix: Some(Self::parser_unary),
                 infix: Some(Self::parser_binary),
@@ -393,6 +405,7 @@ impl Syntax {
                 infix: Some(Self::parser_binary),
                 infix_precedence: SyntaxPrecedence::CmpEqual,
             },
+
             RightShift => ParserRule {
                 prefix: None,
                 infix: Some(Self::parser_binary),
@@ -443,12 +456,17 @@ impl Syntax {
 
         // 处理 < 的歧义
         if infix_token == TokenType::LeftAngle && !self.parser_left_angle_is_type_args(expr) {
+            let token = self.peek_mut();
+            token.token_type = TokenType::LessThan;
             infix_token = TokenType::LessThan;
         }
 
         // 处理连续的 >> 合并
         if infix_token == TokenType::RightAngle && self.next_is(1, TokenType::RightAngle) {
             self.advance();
+
+            let token = self.peek_mut();
+            token.token_type = TokenType::RightShift;
             infix_token = TokenType::RightShift;
         }
 
@@ -535,8 +553,8 @@ impl Syntax {
         while !self.is(TokenType::RightCurly) {
             if self.is(TokenType::Eof) {
                 return Err(SyntaxError(
-                    self.peek().start,
-                    self.peek().end,
+                    self.prev().unwrap().start,
+                    self.prev().unwrap().end,
                     "unexpected end of file, expected '}'".to_string(),
                 ));
             }
@@ -561,7 +579,6 @@ impl Syntax {
 
         return Ok(stmt_list);
     }
-
 
     fn synchronize(&mut self, current_brace_level: isize) -> bool {
         let mut brace_level = current_brace_level;
@@ -601,8 +618,7 @@ impl Syntax {
                                 | TokenType::Break
                                 | TokenType::Import
                                 | TokenType::Type
-                        ) || self.is_basic_type()
-                        {
+                        ) {
                             return true;
                         }
                     }
@@ -841,9 +857,11 @@ impl Syntax {
                 }
 
                 properties.push(TypeStructProperty {
-                    type_: field_type,
+                    type_: field_type.clone(),
                     key: field_name,
                     value: default_value,
+                    start: field_type.start,
+                    end: field_type.end,
                 });
 
                 self.must_stmt_end()?;
@@ -879,11 +897,7 @@ impl Syntax {
                 Type::new(TypeKind::Void)
             };
 
-            let errable = if self.consume(TokenType::Not) {
-                true
-            } else {
-                false
-            };
+            let errable = if self.consume(TokenType::Not) { true } else { false };
 
             t.kind = TypeKind::Fn(Box::new(TypeFn {
                 name: "".to_string(),
@@ -891,7 +905,7 @@ impl Syntax {
                 return_type,
                 rest: false,
                 tpl: false,
-                errable
+                errable,
             }));
             t.end = self.prev().unwrap().end;
             return Ok(t);
@@ -979,9 +993,12 @@ impl Syntax {
         }
 
         if self.is(TokenType::Or) {
-            return Err(SyntaxError(self.peek().start, self.peek().end, "union type only be declared in type alias".to_string()));
+            return Err(SyntaxError(
+                self.peek().start,
+                self.peek().end,
+                "union type only be declared in type alias".to_string(),
+            ));
         }
-
 
         return Ok(t);
     }
@@ -1035,7 +1052,7 @@ impl Syntax {
 
         self.must(TokenType::Equal)?;
 
-        let type_expr= if self.consume(TokenType::Struct) {
+        let type_expr = if self.consume(TokenType::Struct) {
             self.must(TokenType::LeftCurly)?;
 
             let mut properties = Vec::new();
@@ -1062,9 +1079,11 @@ impl Syntax {
                 }
 
                 properties.push(TypeStructProperty {
-                    type_: field_type,
+                    type_: field_type.clone(),
                     key: field_name,
                     value: default_value,
+                    start: field_type.start,
+                    end: field_type.end,
                 });
 
                 self.must_stmt_end()?;
@@ -1072,19 +1091,22 @@ impl Syntax {
 
             self.must(TokenType::RightCurly)?;
 
-
             Type::undo_new(TypeKind::Struct("".to_string(), 0, properties))
         } else {
             let mut alias_type = self.parser_single_type()?;
 
-             if self.consume(TokenType::Question) {
+            if self.consume(TokenType::Question) {
                 let mut elements = Vec::new();
                 elements.push(alias_type);
                 elements.push(Type::new(TypeKind::Null));
 
                 // 不能再接 |
                 if self.is(TokenType::Or) {
-                    return Err(SyntaxError(self.peek().start, self.peek().end, "union type declaration cannot use '?'".to_string()));
+                    return Err(SyntaxError(
+                        self.peek().start,
+                        self.peek().end,
+                        "union type declaration cannot use '?'".to_string(),
+                    ));
                 }
 
                 alias_type = Type::undo_new(TypeKind::Union(false, elements));
@@ -1228,6 +1250,7 @@ impl Syntax {
 
         // 获取运算符优先级
         let precedence = self.find_rule(operator_token.token_type.clone()).infix_precedence;
+
         let right = self.parser_precedence_expr(precedence.next().unwrap(), TokenType::Unknown)?;
 
         expr.node = AstNode::Binary(token_to_expr_op(&operator_token.token_type), left, right);
@@ -1361,6 +1384,8 @@ impl Syntax {
                 properties.push(StructNewProperty {
                     type_: Type::default(), // 类型会在语义分析阶段填充
                     key,
+                    start: value.start,
+                    end: value.end,
                     value,
                 });
 
@@ -1431,7 +1456,7 @@ impl Syntax {
             ident: error_ident.literal.clone(),
             symbol_start: error_ident.start,
             symbol_end: error_ident.end,
-            type_: Type::new(TypeKind::Unknown), // 实际上就是 error type
+            type_: Type::default(), // 实际上就是 error type
             be_capture: false,
             heap_ident: None,
             symbol_id: None,
@@ -1601,7 +1626,7 @@ impl Syntax {
         Ok(expr)
     }
 
-    fn parser_select(&mut self, left: Box<Expr>) -> Result<Box<Expr>, SyntaxError> {
+    fn parser_select_expr(&mut self, left: Box<Expr>) -> Result<Box<Expr>, SyntaxError> {
         let mut expr = self.expr_new();
 
         self.must(TokenType::Dot)?;
@@ -1624,6 +1649,10 @@ impl Syntax {
         }
 
         loop {
+            if self.is(TokenType::RightParen) {
+                break;
+            }
+
             if self.consume(TokenType::Ellipsis) {
                 call.spread = true;
             }
@@ -1640,8 +1669,11 @@ impl Syntax {
                 ));
             }
 
-            if !self.consume(TokenType::Comma) {
+            // call args 结尾可能存在 , 或者 ) 可以避免换行符识别异常，所以 parser 需要支持最后一个 TokenComma 可选情况
+            if self.is(TokenType::RightParen) {
                 break;
+            } else {
+                self.must(TokenType::Comma)?;
             }
         }
 
@@ -1820,13 +1852,13 @@ impl Syntax {
         // 通过找 ; 号的形式判断, 必须要有两个 ; 才会是 tradition
         // for int i = 1; i <= 10; i+=1
         if self.is_for_tradition_stmt()? {
-            let init = self.parser_stmt()?;
+            let init = self.parser_for_init_stmt()?;
             self.must(TokenType::StmtEof)?;
 
             let cond = self.parser_expr_with_precedence()?;
             self.must(TokenType::StmtEof)?;
 
-            let update = self.parser_stmt()?;
+            let update = self.parser_for_init_stmt()?;
 
             let body = self.parser_body()?;
 
@@ -1840,7 +1872,7 @@ impl Syntax {
         if self.is(TokenType::Ident) && (self.next_is(1, TokenType::Comma) || self.next_is(1, TokenType::In)) {
             let first_ident = self.must(TokenType::Ident)?;
             let first = VarDeclExpr {
-                type_: Type::new(TypeKind::Unknown),
+                type_: Type::default(),
                 ident: first_ident.literal.clone(),
                 symbol_start: first_ident.start,
                 symbol_end: first_ident.end,
@@ -1852,7 +1884,7 @@ impl Syntax {
             let second = if self.consume(TokenType::Comma) {
                 let second_ident = self.must(TokenType::Ident)?;
                 Some(Arc::new(Mutex::new(VarDeclExpr {
-                    type_: Type::new(TypeKind::Unknown),
+                    type_: Type::default(),
                     ident: second_ident.literal.clone(),
                     symbol_start: second_ident.start,
                     symbol_end: second_ident.end,
@@ -1998,8 +2030,7 @@ impl Syntax {
 
     fn parser_import_stmt(&mut self) -> Result<Box<Stmt>, SyntaxError> {
         let mut stmt = self.stmt_new();
-        self.must(TokenType::Import)?; 
-
+        self.must(TokenType::Import)?;
 
         let token = self.safe_advance()?.clone();
         let mut import_end = token.end;
@@ -2026,8 +2057,7 @@ impl Syntax {
             }
             t.literal.clone()
         } else {
-            // 使用 ast_package 的最后一个元素作为 as_name
-            ast_package.as_ref().unwrap().last().unwrap().clone()
+            "".to_string()
         };
 
         stmt.node = AstNode::Import(ImportStmt {
@@ -2041,7 +2071,7 @@ impl Syntax {
             use_links: false,
             module_ident: String::new(),
             start: stmt.start,
-            end: import_end
+            end: import_end,
         });
 
         stmt.end = self.prev().unwrap().end;
@@ -2189,7 +2219,40 @@ impl Syntax {
         let mut expr = self.expr_new();
         self.must(TokenType::New)?;
 
-        expr.node = AstNode::New(self.parser_type()?, Vec::new());
+        let t = self.parser_type()?;
+        self.must(TokenType::LeftParen)?;
+        let mut properties: Vec<StructNewProperty> = Vec::new();
+
+        if !self.consume(TokenType::RightParen) {
+            loop {
+                if self.is(TokenType::RightParen) {
+                    break;
+                }
+
+                let start = self.peek().start;
+                let key = self.must(TokenType::Ident)?.clone();
+                self.must(TokenType::Equal)?;
+                let value = self.parser_expr()?;
+                let end = value.end;
+
+                properties.push(StructNewProperty {
+                    type_: Type::default(),
+                    key: key.literal,
+                    value,
+                    start,
+                    end,
+                });
+
+                if self.is(TokenType::RightParen) {
+                    break;
+                } else {
+                    self.must(TokenType::Comma)?;
+                }
+            }
+            self.must(TokenType::RightParen)?;
+        }
+
+        expr.node = AstNode::New(t, properties);
         expr.end = self.prev().unwrap().end;
 
         Ok(expr)
@@ -2247,7 +2310,7 @@ impl Syntax {
                 let mut expr = self.expr_new();
 
                 expr.node = AstNode::VarDecl(Arc::new(Mutex::new(VarDeclExpr {
-                    type_: Type::new(TypeKind::Unknown),
+                    type_: Type::default(),
                     ident: ident_token.literal.clone(),
                     symbol_start: ident_token.start,
                     symbol_end: ident_token.end,
@@ -2362,14 +2425,14 @@ impl Syntax {
 
         if self.is(TokenType::Ident) && self.next_is(1, TokenType::LeftAngle) {
             let mut close = 1;
-            let mut pos = self.current + 1;
-            let current_line = self.token_db[self.token_indexes[pos]].line;
+            let mut pos = self.current + 2;
+            let current_line = self.token_db[self.token_indexes[self.current]].line;
 
             while pos < self.token_indexes.len() {
                 let t = &self.token_db[self.token_indexes[pos]];
 
                 if t.token_type == TokenType::Eof || t.token_type == TokenType::StmtEof || t.line != current_line {
-                    break;
+                    return false;
                 }
 
                 if t.token_type == TokenType::LeftAngle {
@@ -2387,6 +2450,11 @@ impl Syntax {
             }
 
             if close > 0 {
+                return false;
+            }
+
+            // 检查下一个 token
+            if pos + 1 >= self.token_indexes.len() {
                 return false;
             }
 
@@ -2617,7 +2685,7 @@ impl Syntax {
         Ok(stmt)
     }
 
-    fn parser_fn_label(&mut self) -> Result<Box<Stmt>, SyntaxError> {
+    fn parser_label(&mut self) -> Result<Box<Stmt>, SyntaxError> {
         let mut fndef = AstFnDef::default();
 
         while self.is(TokenType::Label) {
@@ -2633,14 +2701,27 @@ impl Syntax {
                 }
             } else if token.literal == "local" {
                 fndef.is_private = true;
+            } else if token.literal == "runtime_use" {
+                self.must(TokenType::Ident)?;
             } else {
+                // TODO 不认识的 label 进行 advance 直到下一个 label 开始
                 return Err(SyntaxError(token.start, token.end, format!("unknown fn label '{}'", token.literal)));
             }
         }
 
         self.must(TokenType::StmtEof)?;
 
-        self.parser_fndef_stmt(fndef)
+        if self.is(TokenType::Type) {
+            self.parser_type_alias_stmt()
+        } else if self.is(TokenType::Fn) {
+            self.parser_fndef_stmt(fndef)
+        } else {
+            Err(SyntaxError(
+                self.peek().start,
+                self.peek().end,
+                format!("the label can only be used in type alias or fn"),
+            ))
+        }
     }
 
     fn parser_let_stmt(&mut self) -> Result<Box<Stmt>, SyntaxError> {
@@ -2705,7 +2786,7 @@ impl Syntax {
         } else if self.is_type_begin_stmt() {
             self.parser_type_begin_stmt()?
         } else if self.is(TokenType::Label) {
-            self.parser_fn_label()?
+            self.parser_label()?
         } else if self.is(TokenType::Fn) {
             self.parser_fndef_stmt(AstFnDef::default())?
         } else if self.is(TokenType::Import) {
@@ -2716,11 +2797,39 @@ impl Syntax {
             return Err(SyntaxError(
                 self.peek().start,
                 self.peek().end,
-                format!("statement cannot start with '{}'", self.peek().literal),
+                format!("global statement cannot start with '{}'", self.peek().literal),
             ));
         };
 
         self.must_stmt_end()?;
+
+        Ok(stmt)
+    }
+
+    /**
+     * for (init_stmt; condition_expr; post_stmt)  
+     * init 和 condition 是 stmt 结构，当前函数解析 init 和 condition 支持的所有类型的 stmt
+     */
+    fn parser_for_init_stmt(&mut self) -> Result<Box<Stmt>, SyntaxError> {
+        let stmt = if self.is(TokenType::Var) {
+            // var 声明语句
+            self.parser_var_begin_stmt()?
+        } else if self.is_type_begin_stmt() {
+            // 类型声明语句
+            self.parser_type_begin_stmt()?
+        } else if self.is(TokenType::LeftParen) {
+            // 元组解构赋值语句
+            self.parser_left_paren_begin_stmt()?
+        } else if self.is(TokenType::Ident) {
+            // 普通赋值语句
+            self.parser_expr_begin_stmt()?
+        } else {
+            return Err(SyntaxError(
+                self.peek().start,
+                self.peek().end,
+                format!("for init statement cannot start with '{}'", self.peek().literal),
+            ));
+        };
 
         Ok(stmt)
     }
@@ -2739,7 +2848,7 @@ impl Syntax {
         } else if self.is(TokenType::Ident) {
             self.parser_expr_begin_stmt()?
         } else if self.is(TokenType::Label) {
-            self.parser_fn_label()?
+            self.parser_label()?
         } else if self.is(TokenType::If) {
             self.parser_if_stmt()?
         } else if self.is(TokenType::For) {
@@ -2760,6 +2869,8 @@ impl Syntax {
         } else if self.is(TokenType::Match) {
             let expr = self.parser_match_expr()?;
             self.fake_new(expr)
+        } else if self.is(TokenType::Select) {
+            self.parser_select_stmt()?
         } else if self.is(TokenType::MacroIdent) {
             let expr = self.parser_expr_with_precedence()?;
             self.fake_new(expr)
@@ -2929,6 +3040,7 @@ impl Syntax {
     fn coroutine_fn_closure(&mut self, call_expr: &Box<Expr>) -> AstFnDef {
         let mut fndef = AstFnDef::default();
         fndef.is_async = true;
+        fndef.is_errable = true;
         fndef.params = Vec::new();
         fndef.return_type = Type::new(TypeKind::Void);
 
@@ -2938,7 +3050,7 @@ impl Syntax {
         let mut vardef_stmt = self.stmt_new();
         vardef_stmt.node = AstNode::VarDef(
             Arc::new(Mutex::new(VarDeclExpr {
-                type_: Type::new(TypeKind::Unknown),
+                type_: Type::default(),
                 ident: "result".to_string(),
                 symbol_start: 0,
                 symbol_end: 0,
@@ -2975,6 +3087,7 @@ impl Syntax {
     fn coroutine_fn_void_closure(&mut self, call_expr: &Box<Expr>) -> AstFnDef {
         let mut fndef = AstFnDef::default();
         fndef.is_async = true;
+        fndef.is_errable = true;
         fndef.params = Vec::new();
         fndef.return_type = Type::new(TypeKind::Void);
 
@@ -2989,6 +3102,116 @@ impl Syntax {
         stmt_list.push(call_stmt);
         fndef.body = stmt_list;
         fndef
+    }
+
+    fn parser_select_stmt(&mut self) -> Result<Box<Stmt>, SyntaxError> {
+        let mut stmt = self.stmt_new();
+        self.must(TokenType::Select)?;
+        self.must(TokenType::LeftCurly)?;
+
+        let mut cases = Vec::new();
+        let mut has_default = false;
+        let mut recv_count = 0;
+        let mut send_count = 0;
+
+        while !self.consume(TokenType::RightCurly) {
+            let start = self.peek().start;
+            let mut select_case = SelectCase {
+                on_call: None,
+                recv_var: None,
+                handle_body: Vec::new(),
+                is_recv: false,
+                is_default: false,
+                start,
+                end: 0,
+            };
+
+            // 处理默认分支 _ -> { ... }
+            if self.is(TokenType::Ident) && self.peek().literal == "_" {
+                if has_default {
+                    return Err(SyntaxError(
+                        self.peek().start,
+                        self.peek().end,
+                        "select statement can only have one default case".to_string(),
+                    ));
+                }
+                self.advance();
+                self.must(TokenType::RightArrow)?;
+
+                select_case.is_default = true;
+                select_case.handle_body = self.parser_body()?;
+                has_default = true;
+
+                select_case.end = self.prev().unwrap().end;
+                cases.push(select_case);
+
+                self.must_stmt_end()?;
+                continue;
+            }
+
+            // 解析通道操作调用
+            let call_expr = self.parser_expr_with_precedence()?;
+
+            if let AstNode::Call(call) = &call_expr.node {
+                if let AstNode::SelectExpr(_left, key) = &call.left.node {
+                    match key.as_str() {
+                        "on_recv" => {
+                            recv_count += 1;
+                            select_case.is_recv = true;
+                        }
+                        "on_send" => {
+                            send_count += 1;
+                            select_case.is_recv = false;
+                        }
+                        _ => {
+                            return Err(SyntaxError(
+                                call_expr.start,
+                                call_expr.end,
+                                "only on_recv or on_send can be used in select case".to_string(),
+                            ));
+                        }
+                    }
+                    select_case.on_call = Some(call.clone());
+                } else {
+                    return Err(SyntaxError(call_expr.start, call_expr.end, "select case must be chan select call".to_string()));
+                }
+            } else {
+                return Err(SyntaxError(call_expr.start, call_expr.end, "select case must be chan select call".to_string()));
+            }
+
+            self.must(TokenType::RightArrow)?;
+
+            // 处理接收变量声明 -> msg { ... }
+            if self.is(TokenType::Ident) {
+                let ident_token = self.must(TokenType::Ident)?;
+                select_case.recv_var = Some(Arc::new(Mutex::new(VarDeclExpr {
+                    type_: Type::default(),
+                    ident: ident_token.literal.clone(),
+                    symbol_start: ident_token.start,
+                    symbol_end: ident_token.end,
+                    be_capture: false,
+                    heap_ident: None,
+                    symbol_id: None,
+                })));
+            }
+
+            select_case.handle_body = self.parser_body()?;
+            select_case.end = self.prev().unwrap().end;
+            cases.push(select_case);
+
+            self.must_stmt_end()?;
+        }
+
+        // 检查是否只有default分支
+        if has_default && cases.len() == 1 {
+            return Err(SyntaxError(self.peek().start, self.peek().end, "select must contains on_call case".to_string()));
+        }
+
+        //     Select(Vec<SelectCase>, bool, i16, i16), // (cases, has_default, send_count, recv_count)
+        stmt.node = AstNode::Select(cases, has_default, send_count, recv_count);
+        stmt.end = self.prev().unwrap().end;
+
+        Ok(stmt)
     }
 
     fn parser_match_expr(&mut self) -> Result<Box<Expr>, SyntaxError> {
@@ -3008,6 +3231,7 @@ impl Syntax {
         while !self.consume(TokenType::RightCurly) {
             self.match_cond = true;
 
+            let start = self.peek().start;
             let mut cond_list = Vec::new();
 
             if subject.is_some() {
@@ -3032,7 +3256,7 @@ impl Syntax {
 
                 // gen retrun stmt
                 let mut stmt = self.stmt_new();
-                stmt.node = AstNode::Return(Some(exec_expr.clone()));
+                stmt.node = AstNode::Break(Some(exec_expr.clone()));
                 stmt.start = exec_expr.start.clone();
                 stmt.end = exec_expr.end.clone();
                 vec![stmt]
@@ -3044,6 +3268,8 @@ impl Syntax {
                 cond_list,
                 handle_body: exec_body,
                 is_default: false,
+                start,
+                end: self.prev().unwrap().end,
             });
         }
 

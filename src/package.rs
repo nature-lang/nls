@@ -5,7 +5,6 @@ use crate::analyzer::common::{AnalyzerError, PackageConfig};
  * 解析 toml 解析正确返回 package config, 如果解析错误则返回 AnalyzerError 错误信息
  */
 pub fn parse_package(path: &str) -> Result<PackageConfig, AnalyzerError> {
-    dbg!("parse_package", path);
     let content = std::fs::read_to_string(path).map_err(|e| AnalyzerError {
         start: 0,
         end: 0,

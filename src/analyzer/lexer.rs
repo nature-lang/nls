@@ -92,8 +92,10 @@ pub enum TokenType {
     NotEqual,
     #[strum(serialize = "=")]
     Equal,
+
     #[strum(serialize = "==")]
     EqualEqual,
+
     #[strum(serialize = ">=")]
     GreaterEqual,
     #[strum(serialize = "<=")]
@@ -228,6 +230,8 @@ pub enum TokenType {
     Catch,
     #[strum(serialize = "match")]
     Match,
+    #[strum(serialize = "select")]
+    Select,
     #[strum(serialize = "continue")]
     Continue,
     #[strum(serialize = "break")]
@@ -370,6 +374,7 @@ impl Token {
             | TokenType::Try
             | TokenType::Catch
             | TokenType::Match
+            | TokenType::Select
             | TokenType::Is
             | TokenType::As
             | TokenType::New
@@ -506,6 +511,7 @@ impl Lexer {
             "let" => TokenType::Let,
             "map" => TokenType::Map,
             "match" => TokenType::Match,
+            "select" => TokenType::Select,
             "new" => TokenType::New,
             "null" => TokenType::Null,
             "ptr" => TokenType::Ptr,
@@ -627,6 +633,7 @@ impl Lexer {
 
     fn is_float(&self, word: &str) -> bool {
         let dot_count = word.chars().filter(|&c| c == '.').count();
+
         if word.ends_with('.') || dot_count > 1 {
             false
         } else {
@@ -724,19 +731,19 @@ impl Lexer {
                 if let Some(next_char) = self.peek_next() {
                     match next_char {
                         'x' => {
-                            let num = self.hex_number_advance();
-                            let decimal = self.number_convert(&num, 16);
-                            word = decimal.to_string();
+                            word = self.hex_number_advance();
                         }
                         'o' => {
                             let num = self.oct_number_advance();
-                            let decimal = self.number_convert(&num, 8);
-                            word = decimal.to_string();
+                            // let decimal = self.number_convert(&num, 8);
+                            // word = decimal.to_string();
+                            word = num;
                         }
                         'b' => {
                             let num = self.bin_number_advance();
-                            let decimal = self.number_convert(&num, 2);
-                            word = decimal.to_string();
+                            // let decimal = self.number_convert(&num, 2);
+                            // word = decimal.to_string();
+                            word = num;
                         }
                         _ => {
                             word = self.number_advance();
@@ -884,16 +891,16 @@ impl Lexer {
             }
             '>' => {
                 if self.match_char('=') {
-                    TokenType::GreaterEqual
-                } else if self.match_char('>') {
-                    if self.match_char('=') {
-                        TokenType::RightShiftEqual
-                    } else {
-                        TokenType::RightShift
-                    }
-                } else {
-                    TokenType::RightAngle
+                    return TokenType::GreaterEqual;
+                } 
+
+                if self.peek_guard_optional() == Some('>') && self.peek_next() == Some('=') {
+                    self.guard_advance();
+                    self.guard_advance();
+                    return TokenType::RightShiftEqual;
                 }
+
+                return TokenType::RightAngle;
             }
             '&' => {
                 if self.match_char('&') {
@@ -1006,17 +1013,6 @@ impl Lexer {
         result
     }
 
-    fn number_convert(&mut self, word: &str, base: u32) -> i64 {
-        i64::from_str_radix(word, base).unwrap_or_else(|_| {
-            self.errors.push(AnalyzerError {
-                start: self.offset,
-                end: self.guard,
-                message: format!("Invalid number `{}`", word),
-            });
-            return 0;
-        })
-    }
-
     fn need_stmt_end(&self, prev_token: &Token) -> bool {
         matches!(
             prev_token.token_type,
@@ -1050,18 +1046,29 @@ impl Lexer {
                 | TokenType::U64
                 | TokenType::String
                 | TokenType::Null
+                | TokenType::Not
         )
     }
 
     // 添加缺失的数字处理函数
     fn hex_number_advance(&mut self) -> String {
+        // 跳过开始的 0x
+        self.guard_advance();
+        self.guard_advance();
+
+
         while !self.at_eof() && self.is_hex_number(self.peek_guard()) {
             self.guard_advance();
         }
+
         self.gen_word()
     }
 
     fn oct_number_advance(&mut self) -> String {
+        // 跳过开始的 0o
+        self.guard_advance();
+        self.guard_advance();
+
         while !self.at_eof() && self.is_oct_number(self.peek_guard()) {
             self.guard_advance();
         }
@@ -1069,6 +1076,10 @@ impl Lexer {
     }
 
     fn bin_number_advance(&mut self) -> String {
+        // 跳过开始的 0b
+        self.guard_advance();
+        self.guard_advance();
+
         while !self.at_eof() && self.is_bin_number(self.peek_guard()) {
             self.guard_advance();
         }
@@ -1087,7 +1098,12 @@ impl Lexer {
             panic!("unexpected end of file: guard index {} exceeds source length {}", self.guard, self.source.len());
         }
 
-        self.source[self.guard]
+        // self.source[self.guard]
+        self.source.get(self.guard).copied().unwrap()
+    }
+
+    fn peek_guard_optional(&self) -> Option<char> {
+        self.source.get(self.guard).copied()
     }
 
     fn peek_next(&self) -> Option<char> {

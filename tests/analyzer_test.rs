@@ -1,3 +1,4 @@
+use nls::project::Project;
 use ropey::Rope;
 
 #[test]
@@ -8,4 +9,19 @@ fn test_rope() {
     assert_eq!(rope.try_byte_to_line(0).unwrap(), 0);  // 第一行
     assert_eq!(rope.try_byte_to_line(7).unwrap(), 1);  // 第二行
     assert!(rope.try_byte_to_line(14).is_err());       // 超出范围，应该返回错误
+}
+
+
+#[tokio::test]
+async fn test_project() {
+    let project_root = "/Users/weiwenhao/Code/nature-test";
+
+    let mut project = Project::new(project_root.to_string()).await;
+    project.backend_handle_queue();
+
+    let module_ident = "nature-test.main";
+    let file_path = "/Users/weiwenhao/Code/nature-test/main.n";
+
+    let module_index = project.build(&file_path, &module_ident).await;
+    dbg!(module_index);
 }

@@ -12,7 +12,6 @@ use crate::project::{Module, DEFAULT_NATURE_ROOT};
 use crate::utils::format_global_ident;
 use common::{AnalyzerError, AstNode, ImportStmt, PackageConfig, Stmt};
 use lazy_static::lazy_static;
-use log::debug;
 use std::collections::HashSet;
 use std::env;
 use std::fs;
@@ -271,7 +270,24 @@ pub fn module_unique_ident(root: &str, full_path: &str) -> String {
  */
 pub fn analyze_import(package_config_mutex: &Option<Arc<Mutex<PackageConfig>>>, m: &mut Module, import: &mut ImportStmt) -> Result<(), AnalyzerError> {
     if let Some(file) = &import.file {
+        // file 不能以 . 或者 / 开头
+        if file.starts_with(".") || file.starts_with("/") {
+            return Err(AnalyzerError {
+                start: import.start,
+                end: import.end,
+                message: format!("import file cannot start with . or /"),
+            });
+        }
+
         import.full_path = Path::new(&m.dir).join(file).to_string_lossy().into_owned();
+
+        if !import.full_path.ends_with(".n") {
+            return Err(AnalyzerError {
+                start: import.start,
+                end: import.end,
+                message: format!("import file suffix must .n"),
+            });
+        }
 
         // check file exist
         if !Path::new(&import.full_path).exists() {
@@ -281,6 +297,16 @@ pub fn analyze_import(package_config_mutex: &Option<Arc<Mutex<PackageConfig>>>, 
                 message: format!("import file {} not found", file.clone()),
             });
         }
+
+        // 如果 import as empty, 则使用 import 的 file  的文件名称去除后缀作为 import as
+        if import.as_name.is_empty() {
+            import.as_name = Path::new(&file)
+                .file_stem() // 获取文件名并去除后缀
+                .and_then(|name| name.to_str())
+                .unwrap_or("")
+                .to_string();
+        }
+
         return Ok(());
     }
 
@@ -303,12 +329,20 @@ pub fn analyze_import(package_config_mutex: &Option<Arc<Mutex<PackageConfig>>>, 
             return Err(AnalyzerError {
                 start: import.start,
                 end: import.end,
-                message: format!("import package {} not found", package_ident),
+                message: format!("package '{}' not found", package_ident),
             });
         }
     } else {
-        // only import std package
-        analyze_import_std(m, import)?;
+        if is_std_package(&package_ident) {
+            // only import std package
+            analyze_import_std(m, import)?;
+        } else {
+            return Err(AnalyzerError {
+                start: import.start,
+                end: import.end,
+                message: format!("package '{}' not found", package_ident),
+            });
+        }
     }
 
     // calc full path
@@ -317,7 +351,7 @@ pub fn analyze_import(package_config_mutex: &Option<Arc<Mutex<PackageConfig>>>, 
 
         // check full_path exists
         if !Path::new(&import.full_path).exists() {
-            m.analyzer_errors.push(AnalyzerError {
+            return Err(AnalyzerError {
                 start: import.start,
                 end: import.end,
                 message: format!("cannot import '{}': file not found", import.full_path.clone()),
@@ -326,7 +360,7 @@ pub fn analyze_import(package_config_mutex: &Option<Arc<Mutex<PackageConfig>>>, 
 
         // check file is n file
         if !import.full_path.ends_with(".n") {
-            m.analyzer_errors.push(AnalyzerError {
+            return Err(AnalyzerError {
                 start: import.start,
                 end: import.end,
                 message: format!("import file suffix must .n"),
@@ -374,37 +408,30 @@ pub fn analyze_imports(package_config: &Option<Arc<Mutex<PackageConfig>>>, m: &m
  *  后续的统一 analyzer 时会全部进行解析, 是对原始 nature 编译器的 can_import_symbol_table 字段的优化
  */
 pub fn register_global_symbol(m: &Module, symbol_table: &mut SymbolTable, stmts: &Vec<Box<Stmt>>) {
-    debug!("register global symbol, module {}", &m.ident);
-    dbg!(&stmts);
-
     for stmt in stmts {
         match &stmt.node {
             AstNode::VarDecl(var_decl_mutex) => {
                 let var_decl = var_decl_mutex.lock().unwrap();
                 // 构造全局唯一标识符
                 let global_ident = format_global_ident(m.ident.clone(), var_decl.ident.clone());
-                dbg!(&global_ident);
                 let _ = symbol_table.define_symbol(global_ident, SymbolKind::Var(var_decl_mutex.clone()), var_decl.symbol_start);
             }
             AstNode::VarDef(var_decl_mutex, _) => {
                 let var_decl = var_decl_mutex.lock().unwrap();
                 // 构造全局唯一标识符
                 let global_ident = format_global_ident(m.ident.clone(), var_decl.ident.clone());
-                dbg!(&global_ident);
                 let _ = symbol_table.define_symbol(global_ident, SymbolKind::Var(var_decl_mutex.clone()), var_decl.symbol_start);
             }
             AstNode::TypeAlias(type_alias_mutex) => {
                 let type_alias = type_alias_mutex.lock().unwrap();
                 // 构造全局唯一标识符
                 let global_ident = format_global_ident(m.ident.clone(), type_alias.ident.clone());
-                dbg!(&global_ident);
                 let _ = symbol_table.define_symbol(global_ident, SymbolKind::TypeAlias(type_alias_mutex.clone()), type_alias.symbol_start);
             }
             AstNode::FnDef(fndef_mutex) => {
                 let fndef = fndef_mutex.lock().unwrap();
                 // 构造全局唯一标识符
                 let global_ident = format_global_ident(m.ident.clone(), fndef.symbol_name.clone());
-                dbg!(&global_ident);
                 let _ = symbol_table.define_symbol(global_ident, SymbolKind::Fn(fndef_mutex.clone()), fndef.symbol_start);
             }
             AstNode::Import(..) => {
