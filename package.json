@@ -4,11 +4,15 @@
   "license": "MIT",
   "version": "0.1.0",
   "categories": [],
+  "publisher": "weiwenhao",
   "keywords": [
-    "nature-language-server"
+    "nature-language-server",
+    "nature-language",
+    "nature",
+    "nature-lsp"
   ],
   "repository": {
-    "url": "https://github.com/weiwenhao/nls"
+    "url": "https://github.com/nature-lang/nls"
   },
   "engines": {
     "vscode": "^1.66.0"

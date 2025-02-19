@@ -3436,7 +3436,7 @@ impl<'a> Typesys<'a> {
                         } else {
                             for arg_hash in generics_args {
                                 // new symbol_name  symbol_name@arg_hash in symbol_table
-                                let symbol_name = format!("{}@{}", fndef.symbol_name, arg_hash);
+                                let symbol_name = format_generics_ident(fndef.symbol_name.clone(), arg_hash);
                                 let _ = self
                                     .symbol_table
                                     .define_symbol(symbol_name, SymbolKind::Fn(fndef_mutex.clone()), fndef.symbol_start);

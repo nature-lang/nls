@@ -11,9 +11,8 @@ use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
-// TODO
-// const DEFAULT_NATURE_ROOT: &str = "/usr/local/nature";
-pub const DEFAULT_NATURE_ROOT: &str = "/Users/weiwenhao/Code/nature";
+pub const DEFAULT_NATURE_ROOT: &str = "/usr/local/nature";
+// pub const DEFAULT_NATURE_ROOT: &str = "/Users/weiwenhao/Code/nature";
 
 // 单个文件称为 module, package 通常是包含 package.toml 的多级目录
 #[derive(Debug, Clone)]
