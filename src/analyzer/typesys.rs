@@ -6,8 +6,6 @@ use std::{
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 
-use log::debug;
-
 use crate::{
     analyzer::{
         common::*,
@@ -2535,7 +2533,6 @@ impl<'a> Typesys<'a> {
         if matches!(call.left.node, AstNode::SelectExpr(_, _)) {
             let _is_rewrite = self.infer_select_call_rewrite(call)?;
         }
-        let call_clone = call.clone();
 
         if let AstNode::Ident(ident, symbol_id_option) = &mut call.left.node {
             if symbol_id_option.is_none() {
