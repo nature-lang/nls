@@ -2167,7 +2167,7 @@ impl Syntax {
 
         if self.is(TokenType::Ident) {
             // fn expr 不能包含名称
-            return Err(SyntaxError(self.peek().start, self.peek().end, "local fn must be anonymous".to_string()));
+            return Err(SyntaxError(self.peek().start, self.peek().end, "closure fn cannot have a name".to_string()));
         } else {
             // gen unique lambda name
             let name = format!("{}{}", LOCAL_FN_NAME, self.lambda_index);

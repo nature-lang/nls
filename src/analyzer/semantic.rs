@@ -1067,8 +1067,6 @@ impl<'a> Semantic<'a> {
     }
 
     pub fn analyze_if(&mut self, cond: &mut Box<Expr>, consequent: &mut Vec<Box<Stmt>>, alternate: &mut Vec<Box<Stmt>>) {
-        self.analyze_expr(cond);
-
         // if has is expr push T e = e as T
         if let Some(is_expr) = self.extract_is_expr(cond) {
             assert!(matches!(is_expr.node, AstNode::Is(..)));
@@ -1080,6 +1078,8 @@ impl<'a> Semantic<'a> {
             // insert ast_stmt to consequent first
             consequent.insert(0, ast_stmt);
         }
+
+        self.analyze_expr(cond);
 
         self.symbol_table.enter_create_scope(ScopeKind::Local);
         self.analyze_body(consequent);
