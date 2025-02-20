@@ -18,7 +18,7 @@
         "script": "watch"
       },
       "env": {
-        "SERVER_PATH": "${workspaceRoot}/target/debug/nls"
+        // "SERVER_PATH": "${workspaceRoot}/target/debug/nls"
       }
     },
     // {

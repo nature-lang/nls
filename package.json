@@ -1,12 +1,12 @@
 {
-  "name": "nls",
-  "description": "nature language server",
+  "name": "nature-language",
+  "displayName": "Nature Language",
+  "description": "Language support for the Nature programming language",
   "license": "MIT",
   "version": "0.1.0",
   "categories": [],
   "publisher": "weiwenhao",
   "keywords": [
-    "nature-language-server",
     "nature-language",
     "nature",
     "nature-lsp"
@@ -17,7 +17,6 @@
   "engines": {
     "vscode": "^1.66.0"
   },
-  "enabledApiProposals": [],
   "activationEvents": [
     "workspaceContains:package.toml",
     "workspaceContains:*/package.toml",

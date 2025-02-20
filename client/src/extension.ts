@@ -21,6 +21,7 @@ import {
     TextEdit,
     Selection,
     Uri,
+    FileType,
 } from "vscode";
 
 import {
@@ -29,19 +30,47 @@ import {
     LanguageClient,
     LanguageClientOptions,
     ServerOptions,
+    Trace,
+    TransportKind
 } from "vscode-languageclient/node";
 
 let client: LanguageClient;
 // type a = Parameters<>;
 
+// 添加这个辅助函数来检查文件是否存在
+async function exists(uri: Uri): Promise<boolean> {
+    try {
+        await workspace.fs.stat(uri);
+        return true;
+    } catch {
+        return false;
+    }
+}
+
 export async function activate(context: ExtensionContext) {
-    const traceOutputChannel = window.createOutputChannel("Nature Language Server trace");
+    const traceOutputChannel = window.createOutputChannel("Nature Language Server");
     traceOutputChannel.show(); // 强制显示输出通道
 
-    const command = process.env.SERVER_PATH || "nls";
+    // 按优先级检查服务器路径
+    let serverPath: string;
+    const defaultPath = "/usr/local/nature/bin/nls";
 
-    // Log server command
-    traceOutputChannel.appendLine(`[LSP] Server command: ${command}`);
+    if (process.env.SERVER_PATH) {
+        // 1. 首先检查环境变量
+        serverPath = process.env.SERVER_PATH;
+        traceOutputChannel.appendLine(`[LSP] Using server from SERVER_PATH: ${serverPath}`);
+    } else if (await exists(Uri.file(defaultPath))) {
+        // 2. 检查默认安装路径
+        serverPath = defaultPath;
+        traceOutputChannel.appendLine(`[LSP] Using server from default path: ${serverPath}`);
+    } else {
+        // 3. 最后使用 PATH 中的 nls
+        serverPath = 'nls';
+        traceOutputChannel.appendLine(`[LSP] Using 'nls' from PATH`);
+    }
+
+    const command = serverPath;
+    traceOutputChannel.appendLine(`[LSP] Version: 0.1.2,  Final server command: ${command}`);
 
     const run: Executable = {
         command,
@@ -54,9 +83,10 @@ export async function activate(context: ExtensionContext) {
             },
         },
     };
+
     const serverOptions: ServerOptions = {
         run,
-        debug: run,
+        debug: run
     };
     // If the extension is launched in debug mode then the debug server options are used
     // Otherwise the run options are used
@@ -69,12 +99,25 @@ export async function activate(context: ExtensionContext) {
             fileEvents: workspace.createFileSystemWatcher("**/package.toml"),
         },
         traceOutputChannel,
+        outputChannel: traceOutputChannel,
     };
 
-    // Create the language client and start the client.
-    client = new LanguageClient("nature-language-server", "nature language server", serverOptions, clientOptions);
-    // activateInlayHints(context);
-    client.start();
+    try {
+        // Create the language client and start the client.
+        client = new LanguageClient("nature-language-server", "Nature Language Server", serverOptions, clientOptions);
+        // activateInlayHints(context);
+         // 启用详细日志
+        client.setTrace(Trace.Verbose);
+
+        await client.start();
+        traceOutputChannel.appendLine('[LSP] Language server started successfully');
+    } catch (error) {
+        traceOutputChannel.appendLine(`[LSP] Server start failed: ${error}`);
+        if (error instanceof Error) {
+            traceOutputChannel.appendLine(`Stack: ${error.stack}`);  // 添加堆栈信息
+        }
+        throw error;
+    }
 }
 
 export function deactivate(): Thenable<void> | undefined {
@@ -93,55 +136,6 @@ export function activateInlayHints(ctx: ExtensionContext) {
             this.dispose();
 
             const event = this.updateHintsEventEmitter.event;
-            // this.hintsProvider = languages.registerInlayHintsProvider(
-            //   { scheme: "file", language: "nrs" },
-            //   // new (class implements InlayHintsProvider {
-            //   //   onDidChangeInlayHints = event;
-            //   //   resolveInlayHint(hint: InlayHint, token: CancellationToken): ProviderResult<InlayHint> {
-            //   //     const ret = {
-            //   //       label: hint.label,
-            //   //       ...hint,
-            //   //     };
-            //   //     return ret;
-            //   //   }
-            //   //   async provideInlayHints(
-            //   //     document: TextDocument,
-            //   //     range: Range,
-            //   //     token: CancellationToken
-            //   //   ): Promise<InlayHint[]> {
-            //   //     const hints = (await client
-            //   //       .sendRequest("custom/inlay_hint", { path: document.uri.toString() })
-            //   //       .catch(err => null)) as [number, number, string][];
-            //   //     if (hints == null) {
-            //   //       return [];
-            //   //     } else {
-            //   //       return hints.map(item => {
-            //   //         const [start, end, label] = item;
-            //   //         let startPosition = document.positionAt(start);
-            //   //         let endPosition = document.positionAt(end);
-            //   //         return {
-            //   //           position: endPosition,
-            //   //           paddingLeft: true,
-            //   //           label: [
-            //   //             {
-            //   //               value: `${label}`,
-            //   //               // location: {
-            //   //               //   uri: document.uri,
-            //   //               //   range: new Range(1, 0, 1, 0)
-            //   //               // }
-            //   //               command: {
-            //   //                 title: "hello world",
-            //   //                 command: "helloworld.helloWorld",
-            //   //                 arguments: [document.uri],
-            //   //               },
-            //   //             },
-            //   //           ],
-            //   //         };
-            //   //       });
-            //   //     }
-            //   //   }
-            //   // })()
-            // );
         },
 
         onDidChangeTextDocument({ contentChanges, document }: TextDocumentChangeEvent) {
