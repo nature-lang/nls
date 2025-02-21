@@ -1121,6 +1121,16 @@ impl<'a> Semantic<'a> {
                 self.analyze_body(catch_body);
                 self.symbol_table.exit_scope();
             }
+            AstNode::TryCatch(try_body, catch_err, catch_body) => {
+                self.symbol_table.enter_create_scope(ScopeKind::Local);
+                self.analyze_body(try_body);
+                self.symbol_table.exit_scope();
+
+                self.symbol_table.enter_create_scope(ScopeKind::Local);
+                self.analyze_var_decl(&catch_err);
+                self.analyze_body(catch_body);
+                self.symbol_table.exit_scope();
+            }
             AstNode::Select(cases, _has_default, _send_count, _recv_count) => {
                 let len = cases.len();
                 for (i, case) in cases.iter_mut().enumerate() {

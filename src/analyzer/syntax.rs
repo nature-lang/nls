@@ -613,7 +613,6 @@ impl Syntax {
                                 | TokenType::For
                                 | TokenType::Match
                                 | TokenType::Try
-                                | TokenType::Catch
                                 | TokenType::Continue
                                 | TokenType::Break
                                 | TokenType::Import
@@ -2871,6 +2870,8 @@ impl Syntax {
             self.fake_new(expr)
         } else if self.is(TokenType::Select) {
             self.parser_select_stmt()?
+        } else if self.is(TokenType::Try) {
+            self.parser_try_catch_stmt()?
         } else if self.is(TokenType::MacroIdent) {
             let expr = self.parser_expr_with_precedence()?;
             self.fake_new(expr)
@@ -2903,13 +2904,14 @@ impl Syntax {
             return Ok(expr);
         }
 
-        let mut infix_rule = self.find_rule(token_type);
+        let mut infix_rule = self.find_rule(token_type.clone());
 
         while infix_rule.infix_precedence >= precedence {
             let infix_fn = if let Some(infix) = infix_rule.infix {
                 infix
             } else {
-                panic!("invalid infix expression");
+                let token = self.peek();
+                return Err(SyntaxError(token.start, token.end, format!("invalid infix expression: {}", token.literal)));
             };
 
             expr = infix_fn(self, expr)?;
@@ -3102,6 +3104,34 @@ impl Syntax {
         stmt_list.push(call_stmt);
         fndef.body = stmt_list;
         fndef
+    }
+
+    fn parser_try_catch_stmt(&mut self) -> Result<Box<Stmt>, SyntaxError> {
+        let mut stmt = self.stmt_new();
+        self.must(TokenType::Try)?;
+
+        let try_body = self.parser_body()?;
+
+        self.must(TokenType::Catch)?;
+
+        let error_ident = self.must(TokenType::Ident)?;
+
+        let catch_err = Arc::new(Mutex::new(VarDeclExpr {
+            type_: Type::default(),
+            ident: error_ident.literal.clone(),
+            symbol_start: error_ident.start,
+            symbol_end: error_ident.end,
+            be_capture: false,
+            heap_ident: None,
+            symbol_id: None,
+        }));
+
+        let catch_body = self.parser_body()?;
+
+        stmt.node = AstNode::TryCatch(try_body, catch_err, catch_body);
+        stmt.end = self.prev().unwrap().end;
+
+        Ok(stmt)
     }
 
     fn parser_select_stmt(&mut self) -> Result<Box<Stmt>, SyntaxError> {

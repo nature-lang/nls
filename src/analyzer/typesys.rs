@@ -231,8 +231,8 @@ impl GenericSpecialFnClone {
             }
             AstNode::Match(subject, cases) => AstNode::Match(subject.as_ref().map(|s| Box::new(self.clone_expr(s))), self.clone_match_cases(cases)),
 
-            AstNode::TryCatch(try_expr, catch_err, catch_body) => AstNode::TryCatch(
-                Box::new(self.clone_expr(try_expr)),
+            AstNode::TryCatch(try_body, catch_err, catch_body) => AstNode::TryCatch(
+                self.clone_body(try_body),
                 Arc::new(Mutex::new(catch_err.lock().unwrap().clone())),
                 self.clone_body(catch_body),
             ),
@@ -294,7 +294,7 @@ pub struct Typesys<'a> {
     current_fn_mutex: Arc<Mutex<AstFnDef>>,
     worklist: Vec<Arc<Mutex<AstFnDef>>>,
     generics_args_stack: Vec<HashMap<String, Type>>,
-    be_caught: bool,
+    be_caught: usize,
     break_target_types: Vec<Type>,
     errors: Vec<AnalyzerError>,
 }
@@ -309,7 +309,7 @@ impl<'a> Typesys<'a> {
             worklist: Vec::new(),
             generics_args_stack: Vec::new(),
             current_fn_mutex: Arc::new(Mutex::new(AstFnDef::default())),
-            be_caught: false,
+            be_caught: 0,
             break_target_types: Vec::new(),
             errors: Vec::new(),
         }
@@ -1582,22 +1582,7 @@ impl<'a> Typesys<'a> {
         return match &mut expr.node {
             AstNode::As(_, _) => self.infer_as_expr(expr),
             AstNode::Catch(try_expr, catch_err_mutex, catch_body) => {
-                self.be_caught = true;
-                let try_expr_type = self.infer_right_expr(try_expr, Type::default())?;
-                self.be_caught = false;
-
-                {
-                    let mut errort = Type::errort(self.symbol_table);
-                    errort = self.reduction_type(errort)?;
-                    let mut catch_err = catch_err_mutex.lock().unwrap();
-                    catch_err.type_ = errort;
-                }
-
-                self.rewrite_var_decl(catch_err_mutex.clone());
-
-                self.break_target_types.push(try_expr_type);
-                self.infer_body(catch_body);
-                return Ok(self.break_target_types.pop().unwrap());
+                self.infer_catch(try_expr, catch_err_mutex, catch_body)
             }
             AstNode::Match(subject, cases) => self.infer_match(subject, cases, infer_target_type, expr.start, expr.end),
             AstNode::MatchIs(target_type) => {
@@ -2056,17 +2041,47 @@ impl<'a> Typesys<'a> {
         Ok(())
     }
 
+    pub fn infer_try_catch(
+        &mut self,
+        try_body: &mut Vec<Box<Stmt>>,
+        catch_err_mutex: &Arc<Mutex<VarDeclExpr>>,
+        catch_body: &mut Vec<Box<Stmt>>,
+    ) -> Result<(), AnalyzerError> {
+        self.be_caught += 1;
+
+        self.infer_body(try_body);
+
+        self.be_caught -= 1;
+
+        let mut errort = Type::errort(self.symbol_table);
+
+        {
+            errort = self.reduction_type(errort)?;
+            let mut catch_err = catch_err_mutex.lock().unwrap();
+            catch_err.type_ = errort;
+        }
+
+        self.rewrite_var_decl(catch_err_mutex.clone());
+
+        // set break target types
+        self.break_target_types.push(Type::new(TypeKind::Void));
+        self.infer_body(catch_body);
+        self.break_target_types.pop().unwrap();
+
+        Ok(())
+    }
+
     pub fn infer_catch(
         &mut self,
         try_expr: &mut Box<Expr>,
         catch_err_mutex: &Arc<Mutex<VarDeclExpr>>,
         catch_body: &mut Vec<Box<Stmt>>,
-    ) -> Result<(), AnalyzerError> {
-        self.be_caught = true;
+    ) -> Result<Type, AnalyzerError> {
+        self.be_caught += 1;
 
         let right_type = self.infer_right_expr(try_expr, Type::default())?;
 
-        self.be_caught = false;
+        self.be_caught -= 1;
 
         let mut errort = Type::errort(self.symbol_table);
 
@@ -2082,9 +2097,7 @@ impl<'a> Typesys<'a> {
         // set break target types
         self.break_target_types.push(right_type);
         self.infer_body(catch_body);
-        self.break_target_types.pop().unwrap();
-
-        Ok(())
+        return Ok(self.break_target_types.pop().unwrap());
     }
 
     pub fn generics_impl_args_hash(&mut self, args: &Vec<Type>) -> Result<u64, AnalyzerError> {
@@ -2583,7 +2596,7 @@ impl<'a> Typesys<'a> {
         if type_fn.errable {
             // 当前 fn 必须允许 is_errable 或者当前位于 be_caught 中
             let current_fn = self.current_fn_mutex.lock().unwrap();
-            if !self.be_caught && !current_fn.is_errable {
+            if self.be_caught == 0 && !current_fn.is_errable {
                 return Err(AnalyzerError {
                     start,
                     end,
@@ -2733,6 +2746,9 @@ impl<'a> Typesys<'a> {
             AstNode::FnDef(_) => {}
             AstNode::Call(call) => {
                 self.infer_call(call, Type::new(TypeKind::Void), stmt.start, stmt.end)?;
+            }
+            AstNode::TryCatch(try_body, catch_err_mutex, catch_body) => {
+                self.infer_try_catch(try_body, catch_err_mutex, catch_body)?;
             }
             AstNode::Catch(try_expr, catch_err_mutex, catch_body) => {
                 self.infer_catch(try_expr, catch_err_mutex, catch_body)?;

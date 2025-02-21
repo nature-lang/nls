@@ -779,7 +779,6 @@ pub enum AstNode {
     TupleNew(Vec<Box<Expr>>),                                     // elements
     TupleDestr(Vec<Box<Expr>>),                                   // elements
     StructNew(String, Type, Vec<StructNewProperty>),              // (ident, type_, properties)
-    Try(Box<Expr>, VarDeclExpr, Vec<Box<Stmt>>),                  // (try_expr, catch_err, catch_body)
 
     // 未推断出具体表达式类型
     EmptyCurlyNew,
@@ -798,7 +797,7 @@ pub enum AstNode {
     Return(Option<Box<Expr>>),                     // (expr)
     If(Box<Expr>, Vec<Box<Stmt>>, Vec<Box<Stmt>>), // (condition, consequent, alternate)
     Throw(Box<Expr>),
-    TryCatch(Box<Expr>, Arc<Mutex<VarDeclExpr>>, Vec<Box<Stmt>>), // (try_expr, catch_err, catch_body)
+    TryCatch(Vec<Box<Stmt>>, Arc<Mutex<VarDeclExpr>>, Vec<Box<Stmt>>), // (try_body, catch_err, catch_body)
     Let(Box<Expr>),                                               // (expr)
     ForIterator(Box<Expr>, Arc<Mutex<VarDeclExpr>>, Option<Arc<Mutex<VarDeclExpr>>>, Vec<Box<Stmt>>), // (iterate, first, second, body)
 
