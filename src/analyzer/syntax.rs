@@ -282,8 +282,8 @@ impl Syntax {
         Box::new(Expr {
             start: self.peek().start,
             end: self.peek().end,
-            type_: Type::default(),
-            target_type: Type::default(),
+            type_: Type::unknown(),
+            target_type: Type::unknown(),
             node: AstNode::None,
             err: false,
         })
@@ -646,7 +646,7 @@ impl Syntax {
     }
 
     fn parser_single_type(&mut self) -> Result<Type, SyntaxError> {
-        let mut t = Type::default();
+        let mut t = Type::unknown();
         t.status = ReductionStatus::Undo;
         t.start = self.peek().start;
 
@@ -662,7 +662,7 @@ impl Syntax {
             // 已经明确了 current 是 basic type token, 才能使用 advance
             let type_token = self.advance();
             t.kind = token_to_type_kind(&type_token.token_type);
-            t.impl_ident = Some(t.kind.to_string());
+            t._impl = (t.kind.to_string(), 0, Vec::new());
 
             if matches!(type_token.token_type, TokenType::Int | TokenType::Uint | TokenType::Float) {
                 t.origin_ident = Some(type_token.literal.clone());
@@ -938,7 +938,7 @@ impl Syntax {
             let mut alias = TypeAlias {
                 ident: ident.literal,
                 import_as: if second.is_some() { Some(first.literal.clone()) } else { None },
-                symbol_id: None,
+                symbol_id: 0,
                 args: None,
             };
             t.origin_ident = Some(alias.ident.clone());
@@ -977,7 +977,7 @@ impl Syntax {
 
         // T?, T? 后面不在允许直接携带 |
         if self.consume(TokenType::Question) {
-            let mut union_t = Type::default();
+            let mut union_t = Type::unknown();
             union_t.status = ReductionStatus::Undo;
             union_t.start = self.peek().start;
             let mut elements = Vec::new();
@@ -1137,7 +1137,7 @@ impl Syntax {
             symbol_end: alias_ident.end,
             params: alias_params,
             type_expr,
-            symbol_id: None,
+            symbol_id: 0,
         })));
         stmt.end = self.prev().unwrap().end;
 
@@ -1145,7 +1145,7 @@ impl Syntax {
     }
 
     fn expr_to_type_alias(&self, left_expr: &Expr, generics_args: Option<Vec<Type>>) -> Type {
-        let mut t = Type::default();
+        let mut t = Type::unknown();
         t.status = ReductionStatus::Undo;
         t.start = self.peek().start;
         t.end = self.peek().end;
@@ -1160,7 +1160,7 @@ impl Syntax {
                 TypeAlias {
                     ident: ident.clone(),
                     import_as: None,
-                    symbol_id: None,
+                    symbol_id: 0,
                     args: generics_args,
                 }
             }
@@ -1174,7 +1174,7 @@ impl Syntax {
                     TypeAlias {
                         ident: key.clone(),
                         import_as: Some(left_ident.clone()),
-                        symbol_id: None,
+                        symbol_id: 0,
                         args: generics_args,
                     }
                 } else {
@@ -1202,7 +1202,7 @@ impl Syntax {
             symbol_end: var_ident.end,
             be_capture: false,
             heap_ident: None,
-            symbol_id: None,
+            symbol_id: 0,
         })))
     }
 
@@ -1346,7 +1346,7 @@ impl Syntax {
         if self.is(TokenType::LeftParen) {
             // 函数调用
             let mut call = AstCall {
-                return_type: Type::default(),
+                return_type: Type::unknown(),
                 left,
                 generics_args,
                 args: Vec::new(),
@@ -1372,30 +1372,29 @@ impl Syntax {
 
         self.must(TokenType::LeftCurly)?;
 
-        if !self.consume(TokenType::RightCurly) {
-            loop {
-                let key = self.must(TokenType::Ident)?.literal.clone();
+        while !self.is(TokenType::RightCurly) {
+            let key = self.must(TokenType::Ident)?.literal.clone();
 
-                self.must(TokenType::Equal)?;
+            self.must(TokenType::Equal)?;
 
-                let value = self.parser_expr()?;
+            let value = self.parser_expr()?;
 
-                properties.push(StructNewProperty {
-                    type_: Type::default(), // 类型会在语义分析阶段填充
-                    key,
-                    start: value.start,
-                    end: value.end,
-                    value,
-                });
+            properties.push(StructNewProperty {
+                type_: Type::unknown(), // 类型会在语义分析阶段填充
+                key,
+                start: value.start,
+                end: value.end,
+                value,
+            });
 
-                if !self.consume(TokenType::Comma) {
-                    break;
-                }
+            if self.is(TokenType::RightCurly) {
+                break;
+            } else {
+                self.must(TokenType::Comma)?;
             }
-
-            self.consume(TokenType::StmtEof);
-            self.must(TokenType::RightCurly)?;
         }
+
+        self.must(TokenType::RightCurly)?;
 
         expr.node = AstNode::StructNew(String::new(), type_, properties);
         expr.end = self.prev().unwrap().end;
@@ -1458,7 +1457,7 @@ impl Syntax {
             type_: Type::default(), // 实际上就是 error type
             be_capture: false,
             heap_ident: None,
-            symbol_id: None,
+            symbol_id: 0,
         };
 
         let catch_body = self.parser_body()?;
@@ -1534,12 +1533,14 @@ impl Syntax {
         elements.push(expr);
 
         // 继续解析剩余的元素
-        loop {
+        while !self.is(TokenType::RightParen) {
             let element = self.parser_expr()?;
             elements.push(element);
 
-            if !self.consume(TokenType::Comma) {
+            if self.is(TokenType::RightParen) {
                 break;
+            } else {
+                self.must(TokenType::Comma)?;
             }
         }
 
@@ -1574,6 +1575,10 @@ impl Syntax {
 
         while t.token_type != TokenType::Eof {
             pos += 1;
+            if pos >= self.token_indexes.len() {
+                return false;
+            }
+
             let t = &self.token_db[self.token_indexes[pos]];
 
             if t.token_type == TokenType::LeftParen {
@@ -1605,7 +1610,7 @@ impl Syntax {
         let mut expr = self.expr_new();
         let ident_token = self.must(TokenType::Ident)?;
 
-        expr.node = AstNode::Ident(ident_token.literal.clone(), None);
+        expr.node = AstNode::Ident(ident_token.literal.clone(), 0);
         expr.end = self.prev().unwrap().end;
 
         Ok(expr)
@@ -1685,7 +1690,7 @@ impl Syntax {
         expr.start = left.start;
 
         let mut call = AstCall {
-            return_type: Type::default(),
+            return_type: Type::unknown(),
             left,
             args: Vec::new(),
             generics_args: Vec::new(),
@@ -1871,25 +1876,25 @@ impl Syntax {
         if self.is(TokenType::Ident) && (self.next_is(1, TokenType::Comma) || self.next_is(1, TokenType::In)) {
             let first_ident = self.must(TokenType::Ident)?;
             let first = VarDeclExpr {
-                type_: Type::default(),
+                type_: Type::unknown(),
                 ident: first_ident.literal.clone(),
                 symbol_start: first_ident.start,
                 symbol_end: first_ident.end,
                 be_capture: false,
-                symbol_id: None,
+                symbol_id: 0,
                 heap_ident: None,
             };
 
             let second = if self.consume(TokenType::Comma) {
                 let second_ident = self.must(TokenType::Ident)?;
                 Some(Arc::new(Mutex::new(VarDeclExpr {
-                    type_: Type::default(),
+                    type_: Type::unknown(),
                     ident: second_ident.literal.clone(),
                     symbol_start: second_ident.start,
                     symbol_end: second_ident.end,
                     be_capture: false,
                     heap_ident: None,
-                    symbol_id: None,
+                    symbol_id: 0,
                 })))
             } else {
                 None
@@ -2082,17 +2087,18 @@ impl Syntax {
         self.must(TokenType::LeftSquare)?;
 
         let mut elements = Vec::new();
-        if !self.consume(TokenType::RightSquare) {
-            loop {
-                let element = self.parser_expr()?;
-                elements.push(element);
 
-                if !self.consume(TokenType::Comma) {
-                    break;
-                }
+        while !self.is(TokenType::RightSquare) {
+            let element = self.parser_expr()?;
+            elements.push(element);
+
+            if self.is(TokenType::RightSquare) {
+                break;
+            } else {
+                self.must(TokenType::Comma)?;
             }
-            self.must(TokenType::RightSquare)?;
         }
+        self.must(TokenType::RightSquare)?;
 
         expr.node = AstNode::VecNew(elements, None, None);
         expr.end = self.prev().unwrap().end;
@@ -2121,11 +2127,21 @@ impl Syntax {
 
             elements.push(MapElement { key: key_expr, value });
 
-            while self.consume(TokenType::Comma) {
+            if !self.is(TokenType::RightCurly) {
+                self.must(TokenType::Comma)?;
+            }
+
+            while !self.is(TokenType::RightCurly) {
                 let key = self.parser_expr()?;
                 self.must(TokenType::Colon)?;
                 let value = self.parser_expr()?;
                 elements.push(MapElement { key, value });
+
+                if self.is(TokenType::RightCurly) {
+                    break;
+                } else {
+                    self.must(TokenType::Comma)?;
+                }
             }
 
             // skip stmt eof
@@ -2141,9 +2157,19 @@ impl Syntax {
         let mut elements = Vec::new();
         elements.push(key_expr);
 
-        while self.consume(TokenType::Comma) {
+        if !self.is(TokenType::RightCurly) {
+            self.must(TokenType::Comma)?;
+        }
+
+        while !self.is(TokenType::RightCurly) {
             let element = self.parser_expr()?;
             elements.push(element);
+
+            if self.is(TokenType::RightCurly) {
+                break;
+            } else {
+                self.must(TokenType::Comma)?;
+            }
         }
 
         self.must(TokenType::RightCurly)?;
@@ -2309,13 +2335,13 @@ impl Syntax {
                 let mut expr = self.expr_new();
 
                 expr.node = AstNode::VarDecl(Arc::new(Mutex::new(VarDeclExpr {
-                    type_: Type::default(),
+                    type_: Type::unknown(),
                     ident: ident_token.literal.clone(),
                     symbol_start: ident_token.start,
                     symbol_end: ident_token.end,
                     be_capture: false,
                     heap_ident: None,
-                    symbol_id: None,
+                    symbol_id: 0,
                 })));
                 expr.end = self.prev().unwrap().end;
                 expr
@@ -2360,7 +2386,7 @@ impl Syntax {
                 symbol_end: ident.end,
                 be_capture: false,
                 heap_ident: None,
-                symbol_id: None,
+                symbol_id: 0,
             })),
             self.parser_expr()?,
         );
@@ -2393,7 +2419,7 @@ impl Syntax {
                 symbol_end: ident.end,
                 be_capture: false,
                 heap_ident: None,
-                symbol_id: None,
+                symbol_id: 0,
             })),
             self.parser_expr()?,
         );
@@ -2548,14 +2574,14 @@ impl Syntax {
 
             // 解析实现类型
             let impl_type = if first_token.token_type == TokenType::Ident {
-                let mut t = Type::default();
-                t.kind = TypeKind::Alias(Box::new(TypeAlias {
+                let mut t = Type::undo_new(TypeKind::Alias(Box::new(TypeAlias {
                     import_as: None,
                     ident: first_token.literal.clone(),
-                    symbol_id: None,
+                    symbol_id: 0,
                     args: None,
-                }));
-                t.impl_ident = Some(self.must(TokenType::Ident)?.literal.clone());
+                })));
+                t._impl = (self.must(TokenType::Ident)?.literal.clone(), 0, Vec::new());
+
 
                 if fndef.generics_params.is_some() {
                     self.must(TokenType::LeftAngle)?;
@@ -2589,7 +2615,7 @@ impl Syntax {
                 t
             } else {
                 let mut t = self.parser_single_type()?;
-                t.impl_ident = Some(first_token.literal.clone());
+                t._impl = (first_token.literal.clone(), 0, Vec::new());
                 t
             };
 
@@ -3041,10 +3067,17 @@ impl Syntax {
 
     fn coroutine_fn_closure(&mut self, call_expr: &Box<Expr>) -> AstFnDef {
         let mut fndef = AstFnDef::default();
+
         fndef.is_async = true;
         fndef.is_errable = true;
         fndef.params = Vec::new();
         fndef.return_type = Type::new(TypeKind::Void);
+
+        let name = format!("{}{}", LOCAL_FN_NAME, self.lambda_index);
+        self.lambda_index += 1;
+
+        fndef.symbol_name = name.clone();
+        fndef.fn_name = name;
 
         let mut stmt_list = Vec::new();
 
@@ -3058,7 +3091,7 @@ impl Syntax {
                 symbol_end: 0,
                 be_capture: false,
                 heap_ident: None,
-                symbol_id: None,
+                symbol_id: 0,
             })),
             call_expr.clone(),
         );
@@ -3067,10 +3100,10 @@ impl Syntax {
         // co_return(&result)
         let mut call_stmt = self.stmt_new();
         let call = AstCall {
-            return_type: Type::default(),
-            left: Box::new(Expr::ident(fndef.start, fndef.end, "co_return".to_string(), None)),
+            return_type: Type::unknown(),
+            left: Box::new(Expr::ident(fndef.start, fndef.end, "co_return".to_string(), 0)),
             args: vec![Box::new(Expr {
-                node: AstNode::Unary(ExprOp::La, Box::new(Expr::ident(fndef.start, fndef.end, "result".to_string(), None))),
+                node: AstNode::Unary(ExprOp::La, Box::new(Expr::ident(fndef.start, fndef.end, "result".to_string(), 0))),
                 ..Default::default()
             })],
             generics_args: Vec::new(),
@@ -3092,6 +3125,11 @@ impl Syntax {
         fndef.is_errable = true;
         fndef.params = Vec::new();
         fndef.return_type = Type::new(TypeKind::Void);
+
+        let name = format!("{}{}", LOCAL_FN_NAME, self.lambda_index);
+        self.lambda_index += 1;
+        fndef.symbol_name = name.clone();
+        fndef.fn_name = name;
 
         let mut stmt_list = Vec::new();
 
@@ -3123,7 +3161,7 @@ impl Syntax {
             symbol_end: error_ident.end,
             be_capture: false,
             heap_ident: None,
-            symbol_id: None,
+            symbol_id: 0,
         }));
 
         let catch_body = self.parser_body()?;
@@ -3215,13 +3253,13 @@ impl Syntax {
             if self.is(TokenType::Ident) {
                 let ident_token = self.must(TokenType::Ident)?;
                 select_case.recv_var = Some(Arc::new(Mutex::new(VarDeclExpr {
-                    type_: Type::default(),
+                    type_: Type::unknown(),
                     ident: ident_token.literal.clone(),
                     symbol_start: ident_token.start,
                     symbol_end: ident_token.end,
                     be_capture: false,
                     heap_ident: None,
-                    symbol_id: None,
+                    symbol_id: 0,
                 })));
             }
 
@@ -3382,7 +3420,7 @@ impl Syntax {
             "reflect_hash" => self.parser_macro_reflect_hash(),
             "default" => self.parser_macro_default_expr(),
             "async" => self.parser_macro_async_expr(),
-            "ula" => self.parser_macro_ula_expr(),
+            "unsafe_load" => self.parser_macro_ula_expr(),
             _ => Err(SyntaxError(token.start, token.end, format!("macro '{}' not defined", token.literal))),
         }
     }

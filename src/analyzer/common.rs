@@ -6,7 +6,7 @@ use strum_macros::Display;
 
 use crate::utils::align_up;
 
-use super::symbol::{NodeId, SymbolTable, GLOBAL_SCOPE_ID};
+use super::symbol::{NodeId, SymbolTable};
 
 use serde::Deserialize;
 
@@ -38,6 +38,7 @@ pub struct PackageData {
     #[serde(rename = "type")]
     pub package_type: String, // 因为 type 是关键字，所以重命名
     pub links: Option<HashMap<String, LinkTargets>>,
+    #[serde(default)] 
     pub dependencies: HashMap<String, Dependency>,
 }
 
@@ -61,8 +62,7 @@ pub struct Type {
     pub origin_ident: Option<String>, // type alias 原始标识符
     pub origin_type_kind: TypeKind,
 
-    pub impl_ident: Option<String>,
-    pub impl_args: Vec<Type>,
+    pub _impl: (String, NodeId, Vec<Type>),
     pub start: usize, // 类型定义开始位置
     pub end: usize,   // 类型定义结束位置
     pub in_heap: bool,
@@ -73,11 +73,10 @@ impl Default for Type {
     fn default() -> Self {
         Self {
             kind: TypeKind::Unknown,
-            status: ReductionStatus::Undo,
+            status: ReductionStatus::Done,
             origin_ident: None,
             origin_type_kind: TypeKind::Unknown,
-            impl_ident: None,
-            impl_args: Vec::new(),
+            _impl: ("".to_string(), 0, Vec::new()),
             start: 0,
             end: 0,
             in_heap: false,
@@ -101,18 +100,41 @@ impl Display for Type {
 }
 
 impl Type {
-    pub fn new(kind: TypeKind) -> Self {
+    pub fn new(mut kind: TypeKind) -> Self {
+        kind = Type::cross_kind_trans(&kind);
         Self {
             kind: kind.clone(),
             status: ReductionStatus::Done,
             origin_ident: None,
             origin_type_kind: TypeKind::Unknown,
-            impl_ident: Some(kind.to_string()),
-            impl_args: Vec::new(),
+            _impl: (kind.to_string(), 0, Vec::new()),
             start: 0,
             end: 0,
             in_heap: Self::kind_in_heap(&kind),
             err: false,
+        }
+    }
+
+   pub fn unknown() -> Self {
+        Self {
+            kind: TypeKind::Unknown,
+            status: ReductionStatus::Undo,
+            origin_ident: None,
+            origin_type_kind: TypeKind::Unknown,
+            _impl: ("".to_string(), 0, Vec::new()),
+            start: 0,
+            end: 0,
+            in_heap: false,
+            err: false,
+        }
+    }
+
+    pub fn cross_kind_trans(kind: &TypeKind) -> TypeKind {
+        match kind {
+            TypeKind::Float => TypeKind::Float64,
+            TypeKind::Int => TypeKind::Int64,
+            TypeKind::Uint => TypeKind::Uint64,
+            _ => kind.clone(),
         }
     }
 
@@ -122,8 +144,7 @@ impl Type {
             status: ReductionStatus::Undo,
             origin_ident: None,
             origin_type_kind: TypeKind::Unknown,
-            impl_ident: Some(kind.to_string()),
-            impl_args: Vec::new(),
+            _impl: (kind.to_string(), 0, Vec::new()),
             start: 0,
             end: 0,
             in_heap: Self::kind_in_heap(&kind),
@@ -140,6 +161,9 @@ impl Type {
 
     fn _type_format(&self) -> String {
         match &self.kind {
+            TypeKind::Alias(alias) => {
+                format!("{}", alias.ident)
+            }
             TypeKind::Vec(element_type) => {
                 format!("vec<{}>", element_type)
             }
@@ -322,6 +346,8 @@ impl Type {
     }
 
     pub fn ptr_of(t: Type) -> Type {
+        assert_eq!(t.status, ReductionStatus::Done);
+
         let ptr_kind = TypeKind::Ptr(Box::new(t.clone()));
 
         let mut ptr_type = Type::new(ptr_kind);
@@ -332,6 +358,8 @@ impl Type {
     }
 
     pub fn raw_ptr_of(t: Type) -> Type {
+        assert_eq!(t.status, ReductionStatus::Done);
+
         let ptr_kind = TypeKind::RawPtr(Box::new(t.clone()));
 
         let mut ptr_type = Type::new(ptr_kind);
@@ -346,10 +374,10 @@ impl Type {
             import_as: None,
             args: None,
             ident: "error_t".to_string(),
-            symbol_id: symbol_table.find_symbol_id("error_t", GLOBAL_SCOPE_ID),
+            symbol_id: symbol_table.find_symbol_id("error_t", symbol_table.global_scope_id).unwrap(),
         }));
 
-        let mut errort = Type::new(alias.clone());
+        let mut errort = Type::undo_new(alias.clone());
         errort.origin_ident = Some("error_t".to_string());
         errort.origin_type_kind = alias.clone();
         errort.status = ReductionStatus::Undo;
@@ -478,7 +506,7 @@ pub struct TypeFn {
 pub struct TypeAlias {
     pub import_as: Option<String>,
     pub ident: String,
-    pub symbol_id: Option<NodeId>,
+    pub symbol_id: NodeId,
     pub args: Option<Vec<Type>>,
 }
 
@@ -487,7 +515,7 @@ impl TypeAlias {
         Self {
             import_as: None,
             ident: String::new(),
-            symbol_id: None,
+            symbol_id: 0,
             args: None,
         }
     }
@@ -718,6 +746,10 @@ impl ExprOp {
         )
     }
 
+    pub fn is_bool(&self) -> bool {
+        return matches!(self, ExprOp::AndAnd | ExprOp::OrOr);
+    }
+
     pub fn is_logic(&self) -> bool {
         matches!(
             self,
@@ -728,17 +760,7 @@ impl ExprOp {
     pub fn is_arithmetic(&self) -> bool {
         matches!(
             self,
-            ExprOp::Add
-                | ExprOp::Sub
-                | ExprOp::Mul
-                | ExprOp::Div
-                | ExprOp::Rem
-                | ExprOp::Lshift
-                | ExprOp::Rshift
-                | ExprOp::And
-                | ExprOp::Or
-                | ExprOp::Xor
-                | ExprOp::Bnot
+            ExprOp::Add | ExprOp::Sub | ExprOp::Mul | ExprOp::Div | ExprOp::Rem | ExprOp::Lshift | ExprOp::Rshift | ExprOp::And | ExprOp::Or | ExprOp::Xor
         )
     }
 }
@@ -749,7 +771,7 @@ pub enum AstNode {
     Literal(TypeKind, String),            // (kind, value)
     Binary(ExprOp, Box<Expr>, Box<Expr>), // (op, left, right)
     Unary(ExprOp, Box<Expr>),             // (op, operand)
-    Ident(String, Option<NodeId>),        // (ident, symbol_id)
+    Ident(String, NodeId),                // (ident, symbol_id)
     As(Type, Box<Expr>),                  // (target_type, src)
     Is(Type, Box<Expr>),                  // (target_type, src)
     MatchIs(Type),                        // (target_type)
@@ -770,7 +792,7 @@ pub enum AstNode {
     ArrayAccess(Type, Box<Expr>, Box<Expr>),             // (element_type, left, index)
     TupleAccess(Type, Box<Expr>, u64),                   // (element_type, left, index)
     StructSelect(Box<Expr>, String, TypeStructProperty), // (instance, key, property)
-    EnvAccess(u8, String, Option<NodeId>),               // (index, unique_ident)
+    EnvAccess(u8, String, NodeId),                       // (index, unique_ident)
 
     VecNew(Vec<Box<Expr>>, Option<Box<Expr>>, Option<Box<Expr>>), // (elements, len, cap)
     ArrayNew(Vec<Box<Expr>>),                                     // elements
@@ -798,7 +820,7 @@ pub enum AstNode {
     If(Box<Expr>, Vec<Box<Stmt>>, Vec<Box<Stmt>>), // (condition, consequent, alternate)
     Throw(Box<Expr>),
     TryCatch(Vec<Box<Stmt>>, Arc<Mutex<VarDeclExpr>>, Vec<Box<Stmt>>), // (try_body, catch_err, catch_body)
-    Let(Box<Expr>),                                               // (expr)
+    Let(Box<Expr>),                                                    // (expr)
     ForIterator(Box<Expr>, Arc<Mutex<VarDeclExpr>>, Option<Arc<Mutex<VarDeclExpr>>>, Vec<Box<Stmt>>), // (iterate, first, second, body)
 
     ForCond(Box<Expr>, Vec<Box<Stmt>>),                            // (condition, body)
@@ -863,13 +885,13 @@ impl Default for Expr {
 }
 
 impl Expr {
-    pub fn ident(start: usize, end: usize, literal: String, symbol_id_option: Option<NodeId>) -> Self {
+    pub fn ident(start: usize, end: usize, literal: String, symbol_id: NodeId) -> Self {
         Self {
             start,
             end,
             type_: Type::default(),
             target_type: Type::default(),
-            node: AstNode::Ident(literal, symbol_id_option),
+            node: AstNode::Ident(literal, symbol_id),
             err: false,
         }
     }
@@ -878,9 +900,9 @@ impl Expr {
 #[derive(Debug, Clone)]
 pub struct VarDeclExpr {
     pub ident: String,
-    pub symbol_id: Option<NodeId>, // unique symbol table id
-    pub symbol_start: usize,       // 符号定义位置
-    pub symbol_end: usize,         // 符号定义位置
+    pub symbol_id: NodeId,   // unique symbol table id
+    pub symbol_start: usize, // 符号定义位置
+    pub symbol_end: usize,   // 符号定义位置
     pub type_: Type,
     pub be_capture: bool,
     pub heap_ident: Option<String>,
@@ -987,7 +1009,7 @@ pub struct TypeAliasStmt {
     pub type_expr: Type,
     pub symbol_start: usize,
     pub symbol_end: usize,
-    pub symbol_id: Option<NodeId>,
+    pub symbol_id: NodeId,
 }
 
 #[derive(Debug, Clone)]
@@ -1013,12 +1035,13 @@ pub struct SelectCase {
 #[derive(Debug, Clone)]
 pub struct AstFnDef {
     pub symbol_name: String,
-    pub symbol_id: Option<NodeId>,
+    pub symbol_id: NodeId,
     pub return_type: Type,
     pub params: Vec<Arc<Mutex<VarDeclExpr>>>,
     pub rest_param: bool,
     pub body: Vec<Box<Stmt>>,
     pub closure: Option<isize>,
+    pub generics_special_done: bool,
     pub generics_hash_table: Option<HashMap<u64, Arc<Mutex<AstFnDef>>>>,
     pub generics_args_table: Option<HashMap<String, Type>>,
     pub generics_args_hash: Option<u64>,
@@ -1057,12 +1080,13 @@ impl Default for AstFnDef {
     fn default() -> Self {
         Self {
             symbol_name: "".to_string(),
-            symbol_id: None,
+            symbol_id: 0,
             return_type: Type::new(TypeKind::Void),
             params: Vec::new(),
             rest_param: false,
             body: Vec::new(),
             closure: None,
+            generics_special_done: false,
             generics_hash_table: None,
             generics_args_table: None,
             generics_args_hash: None,

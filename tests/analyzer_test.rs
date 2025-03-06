@@ -24,4 +24,8 @@ async fn test_project() {
 
     let module_index = project.build(&file_path, &module_ident).await;
     dbg!(module_index);
+
+    let mut module_db = project.module_db.lock().unwrap();
+    let m = &mut module_db[module_index];
+    dbg!(&m.analyzer_errors);
 }

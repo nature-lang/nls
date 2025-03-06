@@ -471,8 +471,40 @@ impl LanguageServer for Backend {
     }
 
     async fn did_change_watched_files(&self, params: DidChangeWatchedFilesParams) {
-        dbg!(params);
-        debug!("watched files have changed!");
+        debug!("package.toml files have changed!");
+
+        for param in params.changes {
+            let file_path = param.uri.path();
+            let Some(mut project) = self.get_file_project(&file_path) else {
+                unreachable!()
+            };
+
+            if !file_path.ends_with("package.toml") {
+                panic!("unexpected package file '{}'", file_path);
+            }
+
+            match parse_package(&file_path) {
+                Ok(package_conf) => {
+                    let mut package_option = project.package_config.lock().unwrap();
+                    *package_option = Some(package_conf);
+                }
+                Err(e) => {
+                    // read file content
+                    if let Ok(content) = std::fs::read_to_string(&file_path) {
+                        // 创建 rope 用于将偏移量转换为位置
+                        let rope = ropey::Rope::from_str(&content);
+                        let start_position = offset_to_position(e.start, &rope).unwrap_or(Position::new(0, 0));
+
+                        let end_position = offset_to_position(e.end, &rope).unwrap_or(Position::new(0, 0));
+
+                        let diagnostic = Diagnostic::new_simple(Range::new(start_position, end_position), format!("parser package.toml failed: {}", e.message));
+                        self.client.publish_diagnostics(param.uri.clone(), vec![diagnostic], None).await;
+                    }
+                }
+            }
+        }
+
+        debug!("package.toml updated");
     }
 
     async fn execute_command(&self, _: ExecuteCommandParams) -> Result<Option<Value>> {
@@ -534,22 +566,7 @@ impl Backend {
 
         // package.toml specail handle
         if file_path.ends_with("package.toml") {
-            match parse_package(&file_path) {
-                Ok(package_conf) => {
-                    project.package_config = Some(Arc::new(Mutex::new(package_conf)));
-                }
-                Err(e) => {
-                    // 创建 rope 用于将偏移量转换为位置
-                    let rope = ropey::Rope::from_str(params.text);
-                    let start_position = offset_to_position(e.start, &rope).unwrap_or(Position::new(0, 0));
-
-                    let end_position = offset_to_position(e.end, &rope).unwrap_or(Position::new(0, 0));
-
-                    let diagnostic = Diagnostic::new_simple(Range::new(start_position, end_position), format!("parser package.toml failed: {}", e.message));
-                    self.client.publish_diagnostics(params.uri.clone(), vec![diagnostic], params.version).await;
-                }
-            }
-            return;
+            panic!("unexpected package file '{}'", file_path);
         }
 
         let module_ident = module_unique_ident(&project.root, &file_path);

@@ -1,7 +1,7 @@
 use crate::analyzer::common::{AnalyzerError, AstFnDef, AstNode, ImportStmt, PackageConfig, Stmt};
 use crate::analyzer::lexer::{Lexer, Token};
 use crate::analyzer::semantic::Semantic;
-use crate::analyzer::symbol::SymbolTable;
+use crate::analyzer::symbol::{NodeId, SymbolTable};
 use crate::analyzer::syntax::Syntax;
 use crate::analyzer::typesys::Typesys;
 use crate::analyzer::{analyze_imports, register_global_symbol};
@@ -10,6 +10,7 @@ use ropey::Rope;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
+use log::debug;
 
 pub const DEFAULT_NATURE_ROOT: &str = "/usr/local/nature";
 // pub const DEFAULT_NATURE_ROOT: &str = "/Users/weiwenhao/Code/nature";
@@ -32,18 +33,21 @@ pub struct Module {
     pub all_fndefs: Vec<Arc<Mutex<AstFnDef>>>, // 包含 global 和 local fn def
     pub analyzer_errors: Vec<AnalyzerError>,
 
+    pub scope_id: NodeId, // 当前 module 对应的 scope
+
     pub references: Vec<usize>,        // 哪些模块依赖于当前模块
     pub dependencies: Vec<ImportStmt>, // 当前模块依赖 哪些模块
 }
 
 impl Module {
-    pub fn new(ident: String, source: String, path: String, index: usize) -> Self {
+    pub fn new(ident: String, source: String, path: String, index: usize, scope_id: NodeId) -> Self {
         // 计算 module ident, 和 analyze_import 中的 import.module_ident 需要采取相同的策略
 
         let dir = Path::new(&path).parent().and_then(|p| p.to_str()).unwrap_or("").to_string();
 
         let rope = ropey::Rope::from_str(&source);
 
+        // create module scope
         Self {
             index,
             ident,
@@ -51,6 +55,7 @@ impl Module {
             path,
             dir,
             rope,
+            scope_id,
             token_db: Vec::new(),
             token_indexes: Vec::new(),
             sem_token_db: Vec::new(),
@@ -77,6 +82,7 @@ impl Module {
 impl Default for Module {
     fn default() -> Self {
         Self {
+            scope_id: 0,
             index: 0,
             ident: "".to_string(),
             source: "".to_string(),
@@ -112,7 +118,7 @@ pub struct Project {
     pub module_handled: Arc<Mutex<HashMap<String, usize>>>, // key = path, 记录所有已经编译的 module, usize 指向 module db
     // queue 中的每一个 module 都可以视为 main.n 来编译，主要是由于用户打开文件 A import B or C 产生的 B 和 C 注册到 queue 中进行处理
     pub queue: Arc<Mutex<Vec<QueueItem>>>,
-    pub package_config: Option<Arc<Mutex<PackageConfig>>>, // 当前 project 如果包含 package.toml, 则可以解析出 package_config 等信息，import 需要借助该信息进行解析
+    pub package_config: Arc<Mutex<Option<PackageConfig>>>, // 当前 project 如果包含 package.toml, 则可以解析出 package_config 等信息，import 需要借助该信息进行解析
     pub symbol_table: Arc<Mutex<SymbolTable>>,
 }
 
@@ -149,10 +155,10 @@ impl Project {
         let package_path = Path::new(&project_root).join("package.toml").to_str().unwrap().to_string();
         let package_config = match parse_package(&package_path) {
             Ok(package_config) => {
-                Some(Arc::new(Mutex::new(package_config)))
+                Arc::new(Mutex::new(Some(package_config)))
             }
             Err(_e) => {
-                None
+                Arc::new(Mutex::new(None))
             }
         };
 
@@ -293,7 +299,10 @@ impl Project {
                 let mut module_db = self.module_db.lock().unwrap();
                 let index = module_db.len();
 
-                let temp = Module::new(import_stmt.module_ident, content, import_stmt.full_path.to_string(), index);
+                // create module scope
+                let scope_id = self.symbol_table.lock().unwrap().create_module_scope(import_stmt.module_ident.clone());
+
+                let temp = Module::new(import_stmt.module_ident, content, import_stmt.full_path.to_string(), index, scope_id);
                 module_db.push(temp);
 
                 // set module_handled
@@ -305,6 +314,12 @@ impl Project {
 
             let mut module_db = self.module_db.lock().unwrap();
             let m = &mut module_db[index];
+
+
+            debug!("build, module_dir {}, project root {}", m.dir, self.root);
+
+            // clean module symbol table
+            self.symbol_table.lock().unwrap().clean_module_scope(m.ident.clone());
 
             // - lexer
             let (token_db, token_indexes, lexer_errors) = Lexer::new(m.source.clone()).scan();
@@ -326,8 +341,9 @@ impl Project {
             register_global_symbol(&m, &mut symbol_table, &stmts);
             drop(symbol_table);
 
+            dbg!(&self.package_config);
             // analyzer imports to worklist
-            let imports = analyze_imports(&self.package_config, m, &mut stmts);
+            let imports = analyze_imports(self.root.clone(), &self.package_config, m, &mut stmts);
             m.stmts = stmts;
 
             let mut filter_imports: Vec<ImportStmt> = Vec::new();

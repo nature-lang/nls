@@ -1,39 +1,46 @@
+use log::debug;
+
+use crate::utils::format_global_ident;
+
 use super::common::{AstFnDef, TypeAliasStmt, VarDeclExpr};
 use std::collections::HashMap;
-use std::num::NonZeroU32;
 use std::sync::{Arc, Mutex};
 
 // 定义索引类型
-#[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]
-pub struct NodeId(NonZeroU32);
-
-// 全局 scope id
-pub const GLOBAL_SCOPE_ID: NodeId = unsafe { NodeId(NonZeroU32::new_unchecked(1)) };
+pub type NodeId = usize;
 
 // Arena 分配器
 #[derive(Debug, Clone)]
 pub struct Arena<T> {
-    items: Vec<T>,
+    items: HashMap<NodeId, T>,
+    next_id: NodeId,
 }
 
 impl<T> Arena<T> {
     fn new() -> Self {
-        Arena { items: Vec::new() }
+        Arena { 
+            items: HashMap::new(),
+            next_id: 1,
+        }
     }
 
     fn alloc(&mut self, value: T) -> NodeId {
-        let id = self.items.len();
-        self.items.push(value);
-        // 确保 id + 1 不为 0
-        NodeId(NonZeroU32::new(id as u32 + 1).unwrap())
+        let id = self.next_id;
+        self.items.insert(id, value);
+        self.next_id += 1;
+        id
     }
 
     fn get(&self, id: NodeId) -> Option<&T> {
-        self.items.get(id.0.get() as usize - 1)
+        self.items.get(&id)
     }
 
     fn get_mut(&mut self, id: NodeId) -> Option<&mut T> {
-        self.items.get_mut(id.0.get() as usize - 1)
+        self.items.get_mut(&id)
+    }
+
+    fn remove(&mut self, id: NodeId) {
+        self.items.remove(&id);
     }
 }
 
@@ -52,6 +59,7 @@ pub struct Symbol {
     pub ident: String,
     pub kind: SymbolKind,
     pub defined_in: NodeId, // defined in scope
+    pub is_local: bool, // 是否是 module 级别的 global symbol
     pub pos: usize,         // 符号定义的其实位置
 
     // local symbol 需要一些额外信息
@@ -72,7 +80,10 @@ pub struct FreeIdent {
 
 #[derive(Debug, Clone)]
 pub enum ScopeKind {
+    // 全局作用域，每个 module scope 中的符号会进行改名并注册到全局作用域中，module 清理时需要清理对应的 global scope
+    // buitin 直接注册到全局作用域中
     Global,
+    Module(String),  // 创建 module 产生的 scope, 当前 scope 中存储了当前 module 的所有符号
     GlobalFn(Arc<Mutex<AstFnDef>>),
     LocalFn(Arc<Mutex<AstFnDef>>),
     Local,
@@ -80,8 +91,9 @@ pub enum ScopeKind {
 
 #[derive(Debug, Clone)]
 pub struct Scope {
-    pub parent: Option<NodeId>,              // 除了全局作用域外，每个作用域都有一个父作用域
+    pub parent: NodeId,              // 除了全局作用域外，每个作用域都有一个父作用域
     pub symbols: Vec<NodeId>,                // 当前作用域中定义的符号列表
+
     pub children: Vec<NodeId>,               // 子作用域列表
     pub symbol_map: HashMap<String, NodeId>, // 符号名到符号ID的映射
 
@@ -95,48 +107,35 @@ pub struct Scope {
 
 #[derive(Debug, Clone)]
 pub struct SymbolTable {
-    pub scopes: Arena<Scope>,     // 作用域列表, 根据 NodeId 索引
-    pub symbols: Arena<Symbol>,   // 符号列表, 根据 NodeId 索引
-    pub current_scope_id: NodeId, // ast 解析时记录当前作用域 id
+    pub scopes: Arena<Scope>,     // 所有的作用域列表, 根据 NodeId 索引
+    pub symbols: Arena<Symbol>,   // 所有的符号列表, 根据 NodeId 索引
+    pub module_scopes: HashMap<String, NodeId>, // 不再创建 global scope, symbol_table 就是 global scope
+    pub global_scope_id: NodeId,
 }
 
 impl SymbolTable {
     pub fn new() -> Self {
-        let mut scopes = Arena::new();
-
-        // 创建全局作用域
-        let global_scope = Scope {
-            parent: None,
-            symbols: Vec::new(),
-            children: Vec::new(),
-            symbol_map: HashMap::new(),
-            range: (0, 0),
-            kind: ScopeKind::Global,
-            frees: HashMap::new(),
+        // 创建 global scope
+        let mut result = Self{
+            scopes: Arena::new(),
+            symbols: Arena::new(),
+            module_scopes: HashMap::new(),
+            global_scope_id: 0,
         };
 
-        let global_scope_id = scopes.alloc(global_scope);
-        assert_eq!(global_scope_id, GLOBAL_SCOPE_ID);
+        result.global_scope_id = result.create_scope(ScopeKind::Global, 0);
 
-        SymbolTable {
-            scopes,
-            symbols: Arena::new(),
-            current_scope_id: global_scope_id,
-        }
+        result
     }
 
-    pub fn get_scope(&self) -> &Scope {
-        self.scopes.get(self.current_scope_id).unwrap()
-    }
-
-    pub fn find_scope(&self, scope_id: NodeId) -> Option<&Scope> {
-        self.scopes.get(scope_id)
+    pub fn find_scope(&self, scope_id: NodeId) -> &Scope {
+        self.scopes.get(scope_id).unwrap()
     }
 
     // 创建新的作用域
-    fn create_scope(&mut self, kind: ScopeKind) -> NodeId {
+    pub fn create_scope(&mut self, kind: ScopeKind, parent_id: NodeId) -> NodeId {
         let new_scope = Scope {
-            parent: Some(self.current_scope_id),
+            parent: parent_id,
             symbols: Vec::new(),
             children: Vec::new(),
             symbol_map: HashMap::new(),
@@ -148,83 +147,194 @@ impl SymbolTable {
         let new_scope_id = self.scopes.alloc(new_scope);
 
         // 将新作用域添加到父作用域的children中, current cope 作为 parent
-        if let Some(current_scope) = self.scopes.get_mut(self.current_scope_id) {
-            current_scope.children.push(new_scope_id);
+        if  parent_id > 0 {
+            if let Some(parent_scope) = self.scopes.get_mut(parent_id) {
+                parent_scope.children.push(new_scope_id);
+            }
         }
 
         new_scope_id
     }
 
-    pub fn enter_scope(&mut self, scope_id: NodeId) {
-        self.current_scope_id = scope_id;
+    /**
+     * 返回 current scope 的 parent scope id
+     */
+    pub fn exit_scope(&mut self, scope_id: NodeId) -> NodeId {
+        if let Some(scope) = self.scopes.get_mut(scope_id) {
+            assert!(scope.parent > 0, "module scope cannot exit");
+
+            return scope.parent;
+        }
+
+        panic!("scope not found");
     }
 
-    pub fn enter_create_scope(&mut self, kind: ScopeKind) -> NodeId {
-        let scope_id = self.create_scope(kind);
-        self.current_scope_id = scope_id;
+    /**
+     * 如果 module_ident == "", 直接使用 global scope 即可
+     */
+    pub fn create_module_scope(&mut self, moudel_ident: String) -> NodeId {
+        if moudel_ident == "" {
+            return self.global_scope_id;
+        }
+
+
+        if let Some(_scope_id) = self.module_scopes.get(&moudel_ident) {
+            panic!("module scope already exists");
+            // return *scope_id;
+        }
+
+        let scope_id = self.create_scope(ScopeKind::Module(moudel_ident.clone()), self.global_scope_id);
+        self.module_scopes.insert(moudel_ident, scope_id);
         scope_id
     }
 
-    // 退出当前作用域
-    pub fn exit_scope(&mut self) {
-        if let Some(scope) = self.scopes.get(self.current_scope_id) {
-            if let Some(parent_id) = scope.parent {
-                self.current_scope_id = parent_id;
+    pub fn clean_module_scope(&mut self, module_ident: String) {
+        if module_ident == "" {
+            return;
+        }
+
+        let module_scope_id = self.module_scopes.get(&module_ident).unwrap();
+        let module_scope = self.scopes.get_mut(*module_scope_id).unwrap();
+        let module_symbol_map = module_scope.symbol_map.clone();
+
+        // 基于 worklist 的方式，从 arena 中清理所有的 symbol 和 children scope?
+        let mut worklist = Vec::new();
+        worklist.extend(module_scope.children.clone());
+
+        // module scope 本身不进行清理, 所以需要手动清空其中的字段
+        module_scope.symbols = Vec::new();
+        module_scope.children = Vec::new();
+        module_scope.symbol_map = HashMap::new();
+
+        // module scope 中的 global symbol 冗余注册到了 global scope 中，需要进行删除清理
+        let global_scope = self.scopes.get_mut(self.global_scope_id).unwrap();
+
+        // module_scope 中的 symbol 都是 global symbol, 需要从 global scope 中清理
+        for (ident, module_symbol_id) in module_symbol_map.iter() {
+
+            let symbol_id_option = global_scope.symbol_map.get(ident);
+            if let Some(global_symbol_id) = symbol_id_option {
+                assert!(global_symbol_id != module_symbol_id);
+
+                self.symbols.remove(*global_symbol_id);
+                global_scope.symbol_map.remove(ident);
+            } 
+
+
+            self.symbols.remove(*module_symbol_id);
+        }
+
+        // 处理 worklist
+        while let Some(scope_id) = worklist.pop() {
+            if let Some(scope) = self.scopes.get(scope_id) {
+                // 将当前作用域的子作用域添加到工作列表
+                worklist.extend(scope.children.clone());
+
+                // 将当前作用域中的所有符号从 local scope 中清理
+                for symbol_id in &scope.symbols {
+                    self.symbols.remove(*symbol_id);
+                }
             }
+
+            self.scopes.remove(scope_id);
         }
     }
 
-    pub fn define_symbol_in_scope(&mut self, ident: String, kind: SymbolKind, pos: usize, scope_id: NodeId) -> Result<NodeId, String> {
+    pub fn define_global_symbol(&mut self, global_ident: String, kind: SymbolKind, pos: usize, defined_in: NodeId) -> Result<NodeId, String> {
+        assert!(global_ident != "");
+
+        // 注册到 global scope
+        let global_scope = self.scopes.get_mut(self.global_scope_id).unwrap();
+
+        if let Some(&_) = global_scope.symbol_map.get(&global_ident) {
+            // 获取已存在的符号
+            return Err(format!("redeclare global ident '{}'", global_ident));
+        } 
+
+        let symbol = Symbol {
+            ident: global_ident.clone(),
+            kind,
+            defined_in: defined_in, // global ident 的 defined_in 指向 module scope id
+            is_local: false,
+            pos,
+            is_capture: false,
+            generics_id_map: HashMap::new(),
+        };
+
+        let global_symbol_id = self.symbols.alloc(symbol);
+
+        // 将符号添加到当前作用域
+        // scope.symbols.push(symbol_id); // 为了方便清理, 不添加到 symbols  中
+        global_scope.symbol_map.insert(global_ident.clone(), global_symbol_id);
+
+        debug!("define global symbol {}, global symbol_id: {}, defined_in_scope_id: {}", &global_ident, global_symbol_id, defined_in);
+
+        Ok(global_symbol_id)
+    }
+
+    pub fn cover_symbol_in_scope(&mut self, ident: String, kind: SymbolKind, pos: usize, scope_id: NodeId) -> NodeId {
         // 检查当前作用域是否已存在同名符号
-        if let Some(scope) = self.scopes.get(scope_id) {
-            if let Some(&existing_symbol_id) = scope.symbol_map.get(&ident) {
-                // 获取已存在的符号
-                if let Some(existing_symbol) = self.symbols.get_mut(existing_symbol_id) {
-                    // 如果位置相同，则更新 kind
-                    if existing_symbol.pos == pos {
-                        existing_symbol.kind = kind;
-                        return Ok(existing_symbol_id);
-                    } else {
-                        // 位置不同，则是真正的重复定义
-                        return Err(format!("redeclare ident '{}'", ident));
-                    }
-                }
-            }
+        let scope = self.scopes.get_mut(scope_id).unwrap();
+
+        if let Some(&symbol_id) = scope.symbol_map.get(&ident) {
+            // 获取已存在的符号, 则读取符号内容进行修改
+            let symbol =  self.get_symbol(symbol_id).unwrap();
+            symbol.kind = kind;
+            symbol.pos = pos;
+            symbol.generics_id_map = HashMap::new();
+            return symbol_id;
+        }
+
+        // 符号不存在，直接调用 define_symbol_in_scope 创建
+        return self.define_symbol_in_scope(ident, kind, pos, scope_id).unwrap();
+    }
+
+    pub fn define_symbol_in_scope(&mut self, ident: String, kind: SymbolKind, pos: usize, scope_id: NodeId) -> Result<NodeId, String> {
+        assert!(ident != "");
+
+        // 检查当前作用域是否已存在同名符号
+        let scope = self.scopes.get_mut(scope_id).unwrap();
+
+        let is_local = !matches!(scope.kind, ScopeKind::Module(..)|ScopeKind::Global);
+
+        if let Some(&_) = scope.symbol_map.get(&ident) {
+            // 获取已存在的符号
+            return Err(format!("redeclare ident '{}'", ident));
         }
 
         let symbol = Symbol {
             ident: ident.clone(),
             kind,
-            defined_in: self.current_scope_id,
+            defined_in: scope_id,
+            is_local,
             pos,
             is_capture: false,
             generics_id_map: HashMap::new(),
         };
+
+        if let SymbolKind::Fn(fn_mutex) = &symbol.kind {
+            debug!("define fn symbol {}, fn_mutex_ptr: {:?}",  &ident, Arc::as_ptr(fn_mutex));
+        }
 
         let symbol_id = self.symbols.alloc(symbol);
 
         // 将符号添加到当前作用域
         if let Some(scope) = self.scopes.get_mut(scope_id) {
             scope.symbols.push(symbol_id);
-            scope.symbol_map.insert(ident, symbol_id);
+            scope.symbol_map.insert(ident.clone(), symbol_id);
         }
+
+        debug!("define symbol {}, module symbol_id: {}, defined_in_scope_id: {}",  &ident, symbol_id, scope_id);
 
         Ok(symbol_id)
     }
 
-    /**
-     * 存在 rebuild 机制，所以同一个符号会被重复定义, 但是定义的位置相同。
-     */
-    pub fn define_symbol(&mut self, ident: String, kind: SymbolKind, pos: usize) -> Result<NodeId, String> {
-        return self.define_symbol_in_scope(ident, kind, pos, self.current_scope_id);
-    }
+    // 查找符号 from current scope（包括父作用域）
+    pub fn lookup_symbol(&self, ident: &str, current_scope_id: NodeId) -> Option<NodeId> {
+        let mut current = current_scope_id;
 
-    // 查找符号（包括父作用域）
-    pub fn lookup_symbol(&self, ident: &str) -> Option<NodeId> {
-        let mut current = Some(self.current_scope_id);
-
-        while let Some(scope_id) = current {
-            if let Some(scope) = self.scopes.get(scope_id) {
+        while current > 0 {
+            if let Some(scope) = self.scopes.get(current) {
                 // 在当前作用域中查找
                 if let Some(&symbol_id) = scope.symbol_map.get(ident) {
                     return Some(symbol_id);
@@ -238,11 +348,14 @@ impl SymbolTable {
         None
     }
 
-    pub fn find_global_fn(&self) -> Option<Arc<Mutex<AstFnDef>>> {
-        let mut current = Some(self.current_scope_id);
+    /**
+     * 从当前 scope 向上查找，直到找到一个 global fn 类型的 scope, 从而构建 global fn 和 local fn 的关系
+     */
+    pub fn find_global_fn(&self, current_scope_id: NodeId) -> Option<Arc<Mutex<AstFnDef>>> {
+        let mut current = current_scope_id;
 
-        while let Some(scope_id) = current {
-            if let Some(scope) = self.scopes.get(scope_id) {
+        while current > 0 {
+            if let Some(scope) = self.scopes.get(current) {
                 match &scope.kind {
                     ScopeKind::GlobalFn(fn_def) => return Some(fn_def.clone()),
                     _ => current = scope.parent,
@@ -262,8 +375,34 @@ impl SymbolTable {
         }
     }
 
-    pub fn find_global_symbol(&self, ident: &str) -> Option<&Symbol> {
-        if let Some(symbol_id) = self.find_symbol_id(ident, GLOBAL_SCOPE_ID) {
+    pub fn find_scope_id(&self, symbol_id: NodeId) -> NodeId {
+        if let Some(symbol) = self.symbols.get(symbol_id) {
+            return symbol.defined_in;
+        }
+
+        panic!("symbol not found")
+    }
+
+    pub fn find_module_symbol_id(&self, module_ident: &str, ident: &str) -> Option<NodeId> {
+        if let Some(scope_id) = self.module_scopes.get(module_ident) {
+            let global_ident = format_global_ident(module_ident.to_string(), ident.to_string());
+            return self.find_symbol_id(&global_ident, *scope_id);
+        } else {
+            return None;
+        }
+    }
+
+    pub fn find_global_symbol(&self, global_ident: &str) -> Option<&Symbol> {
+        let global_scope = self.scopes.get(self.global_scope_id).unwrap();
+        if let Some(&symbol_id) = global_scope.symbol_map.get(global_ident) {
+            return Some(self.symbols.get(symbol_id).unwrap());
+        } else {
+            return None;
+        }
+    }
+
+    pub fn find_symbol(&self, ident: &str, scope_id: NodeId) -> Option<&Symbol> {
+        if let Some(symbol_id) = self.find_symbol_id(ident, scope_id) {
             return Some(self.symbols.get(symbol_id).unwrap());
         } else {
             return None;
@@ -272,14 +411,6 @@ impl SymbolTable {
 
     pub fn symbol_exists_in_scope(&self, ident: &str, scope_id: NodeId) -> bool {
         if let Some(scope) = self.scopes.get(scope_id) {
-            return scope.symbol_map.contains_key(ident);
-        } else {
-            return false;
-        }
-    }
-
-    pub fn symbol_exists_in_current(&self, ident: &str) -> bool {
-        if let Some(scope) = self.scopes.get(self.current_scope_id) {
             return scope.symbol_map.contains_key(ident);
         } else {
             return false;

@@ -306,6 +306,10 @@ impl Token {
             length += 2;
         }
 
+        if token_type == TokenType::MacroIdent {
+            length += 1;
+        }
+
         let semantic_token_type = Self::get_semantic_token_type(&token_type);
         let semantic_token_type = semantic_token_type_index(semantic_token_type);
 

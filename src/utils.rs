@@ -25,6 +25,10 @@ pub fn format_global_ident(prefix: String, ident: String)->String {
     format!("{prefix}.{ident}")
 }
 
+pub fn format_impl_ident(impl_ident: String, key: String) -> String {
+    format!("{impl_ident}_{key}")
+}
+
 pub fn format_generics_ident(ident: String, hash: u64) -> String {
     assert!(hash != 0, "hash must not be 0");
 
