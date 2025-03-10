@@ -1050,6 +1050,7 @@ impl Lexer {
                 | TokenType::U64
                 | TokenType::String
                 | TokenType::Null
+                | TokenType::Void
                 | TokenType::Not
         )
     }

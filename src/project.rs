@@ -316,7 +316,7 @@ impl Project {
             let m = &mut module_db[index];
 
 
-            debug!("build, module_dir {}, project root {}", m.dir, self.root);
+            debug!("build, m.path {}, module_dir {}, project root {}", m.path, m.dir, self.root);
 
             // clean module symbol table
             self.symbol_table.lock().unwrap().clean_module_scope(m.ident.clone());

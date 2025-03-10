@@ -28,9 +28,15 @@ impl LanguageServer for Backend {
         if let Some(workspace_folders) = params.workspace_folders {
             for folder in workspace_folders {
                 // folder.uri 是工作区根目录的 URI
-                let project_root = folder.uri.to_file_path().expect("Failed to convert URI to file path").to_string_lossy().to_string();
+                let project_root = folder
+                    .uri
+                    .to_file_path()
+                    .expect("Failed to convert URI to file path")
+                    .to_string_lossy()
+                    .to_string();
                 let project = Project::new(project_root.clone()).await;
                 project.backend_handle_queue();
+                debug!("project new success root: {}", project_root);
 
                 // 多工作区处理
                 self.projects.insert(project_root, project);
@@ -113,7 +119,28 @@ impl LanguageServer for Backend {
     }
 
     async fn did_open(&self, params: DidOpenTextDocumentParams) {
-        debug!("file opened");
+        debug!("file opened {}", params.text_document.uri);
+
+        // 从 uri 所在目录开始逐层向上读取，判断是否存在 package.toml, 如果存在 package.toml, 那 package.toml 所在目录就是一个新的 project
+        let file_path = params.text_document.uri.path();
+        let file_dir = std::path::Path::new(file_path).parent();
+
+        if let Some(dir) = file_dir {
+            // 检查是否需要创建新的项目
+            if let Some(package_dir) = self.find_package_dir(dir) {
+                let project_root = package_dir.to_string_lossy().to_string();
+
+                // 检查这个项目是否已经存在
+                if !self.projects.contains_key(&project_root) {
+                    debug!("Found new project at {}", project_root);
+                    let project = Project::new(project_root.clone()).await;
+                    project.backend_handle_queue();
+                    debug!("project new success root: {}", project_root);
+                    self.projects.insert(project_root, project);
+                }
+            }
+        }
+
         self.on_change(TextDocumentItem {
             uri: params.text_document.uri,
             text: &params.text_document.text,
@@ -285,9 +312,7 @@ impl LanguageServer for Backend {
     async fn semantic_tokens_range(&self, params: SemanticTokensRangeParams) -> Result<Option<SemanticTokensRangeResult>> {
         let file_path = params.text_document.uri.path();
         let semantic_tokens = || -> Option<Vec<SemanticToken>> {
-            let Some(project) = self.get_file_project(&file_path) else {
-                unreachable!()
-            };
+            let Some(project) = self.get_file_project(&file_path) else { unreachable!() };
 
             // 直接从 module_handled 中获取
             let module_index = {
@@ -539,14 +564,44 @@ struct TextDocumentItem<'a> {
 impl Backend {
     // 添加一个辅助方法来根据文件 URI 找到对应的项目
     fn get_file_project(&self, file_path: &str) -> Option<Project> {
-        // 遍历所有项目，找到包含该文件的项目
+        // 遍历所有项目，找到最匹配（路径最长）的项目
+        let mut best_match: Option<(usize, Project)> = None;
+        
         for entry in self.projects.iter() {
             let workspace_uri = entry.key();
-            dbg!(&file_path, &workspace_uri, file_path.starts_with(workspace_uri));
+            
+            // 检查文件是否属于这个项目
             if file_path.starts_with(workspace_uri) {
-                return Some(entry.value().clone()); // project 中的数据都通过 arc 共享，可以随便 clone
+                // 如果文件属于这个项目，检查这是否是最佳匹配（路径最长）
+                let uri_len = workspace_uri.len();
+                
+                if let Some((best_len, _)) = &best_match {
+                    if uri_len > *best_len {
+                        // 找到更长的匹配，更新最佳匹配
+                        best_match = Some((uri_len, entry.value().clone()));
+                    }
+                } else {
+                    // 第一个匹配
+                    best_match = Some((uri_len, entry.value().clone()));
+                }
             }
         }
+        
+        // 返回最佳匹配的项目
+        best_match.map(|(_, project)| project)
+    }
+
+    fn find_package_dir(&self, start_dir: &std::path::Path) -> Option<std::path::PathBuf> {
+        let mut current_dir = Some(start_dir.to_path_buf());
+
+        while let Some(dir) = current_dir {
+            let package_path = dir.join("package.toml");
+            if package_path.exists() {
+                return Some(dir);
+            }
+            current_dir = dir.parent().map(|p| p.to_path_buf());
+        }
+
         None
     }
 
@@ -563,6 +618,7 @@ impl Backend {
         let Some(mut project) = self.get_file_project(&file_path) else {
             unreachable!()
         };
+        debug!("file {} change in project {:?}", file_path, project.root);
 
         // package.toml specail handle
         if file_path.ends_with("package.toml") {
@@ -571,6 +627,7 @@ impl Backend {
 
         let module_ident = module_unique_ident(&project.root, &file_path);
         debug!("will build, module ident: {}", module_ident);
+
         //  基于 project path 计算 moudle ident
         let module_index = project.build(&file_path, &module_ident).await;
         debug!("build success");
@@ -584,7 +641,7 @@ impl Backend {
             m.analyzer_errors
                 .clone()
                 .into_iter()
-                .filter(|error|  error.end > 0)  // 过滤掉 start = end = 0 的错误
+                .filter(|error| error.end > 0) // 过滤掉 start = end = 0 的错误
                 .filter_map(|error| {
                     let start_position = offset_to_position(error.start, &m.rope)?;
                     let end_position = offset_to_position(error.end, &m.rope)?;

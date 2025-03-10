@@ -578,7 +578,7 @@ impl<'a> Semantic<'a> {
                     self.errors.push(AnalyzerError {
                         start: expr.start,
                         end: expr.end,
-                        message: format!("identifier '{}' undeclared in {} module", key, left_ident),
+                        message: format!("identifier '{}' undeclared in '{}' module", key, left_ident),
                     });
                     expr.err = true;
                     return;
