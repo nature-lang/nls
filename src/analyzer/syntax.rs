@@ -2,6 +2,8 @@ use super::common::*;
 use super::lexer::semantic_token_type_index;
 use super::lexer::Token;
 use super::lexer::TokenType;
+use crate::project::Module;
+use crate::utils::errors_push;
 use std::collections::HashMap;
 use std::error::Error;
 use std::fmt;
@@ -142,7 +144,6 @@ pub struct Syntax {
     current: usize, // token index
 
     lambda_index: usize, // default 0
-    errors: Vec<AnalyzerError>,
 
     // parser 阶段辅助记录当前的 type_param, 当进入到 fn body 或者 struct def 时可以准确识别当前是 type param 还是 alias, 仅仅使用到 key
     // 默认是一个空 hashmap
@@ -153,11 +154,13 @@ pub struct Syntax {
 
     // match 表达式中 subject 的解析
     match_subject: bool,
+
+    module: Module,
 }
 
-impl Syntax {
+impl<'a> Syntax {
     // static method new, Syntax::new(tokens)
-    pub fn new(token_db: Vec<Token>, token_indexes: Vec<usize>) -> Self {
+    pub fn new(m: Module, token_db: Vec<Token>, token_indexes: Vec<usize>) -> Self {
         Self {
             token_db: token_db,
             token_indexes: token_indexes,
@@ -165,8 +168,8 @@ impl Syntax {
             type_params_table: HashMap::new(),
             match_cond: false,
             match_subject: false,
-            errors: Vec::new(),
             lambda_index: 0,
+            module: m,
         }
     }
 
@@ -306,7 +309,7 @@ impl Syntax {
                 infix_precedence: SyntaxPrecedence::Call,
             },
             LeftSquare => ParserRule {
-                prefix: Some(Self::parser_vec_new),
+                prefix: Some(Self::parser_left_square_expr),
                 infix: Some(Self::parser_access),
                 infix_precedence: SyntaxPrecedence::Call,
             },
@@ -527,11 +530,14 @@ impl Syntax {
             match self.parser_global_stmt() {
                 Ok(stmt) => stmt_list.push(stmt),
                 Err(e) => {
-                    self.errors.push(AnalyzerError {
-                        start: e.0,
-                        end: e.1,
-                        message: e.2,
-                    });
+                    errors_push(
+                        &mut self.module,
+                        AnalyzerError {
+                            start: e.0,
+                            end: e.1,
+                            message: e.2,
+                        },
+                    );
 
                     // 查找到下一个同步点
                     let found = self.synchronize(0);
@@ -543,7 +549,7 @@ impl Syntax {
             }
         }
 
-        return (stmt_list, self.token_db.clone(), self.errors.clone());
+        return (stmt_list, self.token_db.clone(), self.module.analyzer_errors.clone());
     }
 
     fn parser_body(&mut self) -> Result<Vec<Box<Stmt>>, SyntaxError> {
@@ -562,11 +568,14 @@ impl Syntax {
             match self.parser_stmt() {
                 Ok(stmt) => stmt_list.push(stmt),
                 Err(e) => {
-                    self.errors.push(AnalyzerError {
-                        start: e.0,
-                        end: e.1,
-                        message: e.2,
-                    });
+                    errors_push(
+                        &mut self.module,
+                        AnalyzerError {
+                            start: e.0,
+                            end: e.1,
+                            message: e.2,
+                        },
+                    );
 
                     let found = self.synchronize(1);
                     if !found && !self.is(TokenType::Eof) {
@@ -645,6 +654,49 @@ impl Syntax {
         }
     }
 
+    fn parser_type_fn(&mut self) -> Result<TypeKind, SyntaxError> {
+        let mut param_types = Vec::new();
+
+        self.must(TokenType::LeftParen)?;
+
+        if !self.consume(TokenType::RightParen) {
+            // 解析参数类型列表
+            loop {
+                let param_type = self.parser_type()?;
+                param_types.push(param_type);
+
+                // 可选的参数名称（忽略）
+                self.consume(TokenType::Ident);
+
+                if !self.consume(TokenType::Comma) {
+                    break;
+                }
+            }
+
+            self.must(TokenType::RightParen)?;
+        }
+
+        // 解析返回类型
+        let return_type = if self.consume(TokenType::Colon) {
+            self.parser_type()?
+        } else {
+            Type::new(TypeKind::Void)
+        };
+
+        // 检查是否可能抛出错误
+        let is_errable = self.consume(TokenType::Not);
+
+        // 创建并返回函数类型
+        Ok(TypeKind::Fn(Box::new(TypeFn {
+            name: "".to_string(),
+            param_types,
+            return_type,
+            rest: false,
+            tpl: false,
+            errable: is_errable,
+        })))
+    }
+
     fn parser_single_type(&mut self) -> Result<Type, SyntaxError> {
         let mut t = Type::unknown();
         t.status = ReductionStatus::Undo;
@@ -652,7 +704,7 @@ impl Syntax {
 
         // any union type
         if self.consume(TokenType::Any) {
-            t.kind = TypeKind::Union(true, Vec::new());
+            t.kind = TypeKind::Union(true, false, Vec::new());
             t.end = self.prev().unwrap().end;
             return Ok(t);
         }
@@ -661,14 +713,16 @@ impl Syntax {
         if self.is_basic_type() {
             // 已经明确了 current 是 basic type token, 才能使用 advance
             let type_token = self.advance();
-            t.kind = token_to_type_kind(&type_token.token_type);
-            t._impl = (t.kind.to_string(), 0, Vec::new());
+            t.kind = Type::cross_kind_trans(&token_to_type_kind(&type_token.token_type));
 
-            if matches!(type_token.token_type, TokenType::Int | TokenType::Uint | TokenType::Float) {
-                t.origin_ident = Some(type_token.literal.clone());
-                t.origin_type_kind = t.kind.clone();
+            if Type::is_impl_builtin_type(&t.kind) {
+                t.ident = t.kind.to_string();
+                t.ident_kind = TypeIdentKind::Builtin;
+                t.args = Vec::new();
             }
 
+            // 基础类型直接设置为解析完成
+            t.status = ReductionStatus::Done;
             t.end = self.prev().unwrap().end;
             return Ok(t);
         }
@@ -685,10 +739,32 @@ impl Syntax {
         }
 
         // [type]
+        // [type;size]
         if self.consume(TokenType::LeftSquare) {
             let element_type = self.parser_type()?;
-            self.must(TokenType::RightSquare)?;
+            if self.consume(TokenType::StmtEof) {
+                let length_token = self.must(TokenType::IntLiteral)?.clone();
+                self.must(TokenType::RightSquare)?;
 
+                let length = length_token
+                    .literal
+                    .parse::<u64>()
+                    .map_err(|_| SyntaxError(length_token.start, length_token.end, "array length must be a valid integer".to_string()))?;
+
+                if length == 0 {
+                    return Err(SyntaxError(
+                        length_token.start,
+                        length_token.end,
+                        "array length must be greater than 0".to_string(),
+                    ));
+                }
+
+                t.kind = TypeKind::Arr(length, Box::new(element_type));
+                t.end = self.prev().unwrap().end;
+                return Ok(t);
+            }
+
+            self.must(TokenType::RightSquare)?;
             t.kind = TypeKind::Vec(Box::new(element_type));
             t.end = self.prev().unwrap().end;
             return Ok(t);
@@ -756,32 +832,6 @@ impl Syntax {
             self.must(TokenType::RightAngle)?;
 
             t.kind = TypeKind::Chan(Box::new(element_type));
-            t.end = self.prev().unwrap().end;
-            return Ok(t);
-        }
-
-        // arr<type,length>
-        if self.consume(TokenType::Arr) {
-            self.must(TokenType::LeftAngle)?;
-            let element_type = self.parser_type()?;
-            self.must(TokenType::Comma)?;
-            let length_token = self.must(TokenType::IntLiteral)?;
-
-            let length = length_token
-                .literal
-                .parse::<u64>()
-                .map_err(|_| SyntaxError(length_token.start, length_token.end, "array length must be a valid integer".to_string()))?;
-
-            if length == 0 {
-                return Err(SyntaxError(
-                    length_token.start,
-                    length_token.end,
-                    "array length must be greater than 0".to_string(),
-                ));
-            }
-            self.must(TokenType::RightAngle)?;
-
-            t.kind = TypeKind::Arr(length, Box::new(element_type));
             t.end = self.prev().unwrap().end;
             return Ok(t);
         }
@@ -875,37 +925,8 @@ impl Syntax {
 
         // fn(Type, Type, ...):T!
         if self.consume(TokenType::Fn) {
-            self.must(TokenType::LeftParen)?;
-            let mut param_types = Vec::new();
-
-            if !self.consume(TokenType::RightParen) {
-                loop {
-                    let param_type = self.parser_type()?;
-                    param_types.push(param_type);
-
-                    if !self.consume(TokenType::Comma) {
-                        break;
-                    }
-                }
-                self.must(TokenType::RightParen)?;
-            }
-
-            let return_type = if self.consume(TokenType::Colon) {
-                self.parser_type()?
-            } else {
-                Type::new(TypeKind::Void)
-            };
-
-            let errable = if self.consume(TokenType::Not) { true } else { false };
-
-            t.kind = TypeKind::Fn(Box::new(TypeFn {
-                name: "".to_string(),
-                param_types,
-                return_type,
-                rest: false,
-                tpl: false,
-                errable,
-            }));
+            let type_fn_kind = self.parser_type_fn()?;
+            t.kind = type_fn_kind;
             t.end = self.prev().unwrap().end;
             return Ok(t);
         }
@@ -915,51 +936,41 @@ impl Syntax {
             self.set_current_token_type(SemanticTokenType::TYPE);
             let first = self.must(TokenType::Ident)?.clone();
 
-            // handle param
+            // ------------- handle param
             if !self.type_params_table.is_empty() && self.type_params_table.contains_key(&first.literal) {
-                t.kind = TypeKind::Param(first.literal.clone());
-                t.origin_ident = Some(first.literal.clone());
-                t.origin_type_kind = t.kind.clone();
+                t.kind = TypeKind::Ident;
+                t.ident = first.literal.clone();
+                t.ident_kind = TypeIdentKind::Param;
                 return Ok(t);
             }
 
-            // handle alias (package.ident)
+            // handle def or alias (package.ident)
             let mut second = None;
             if self.consume(TokenType::Dot) {
-                self.set_current_token_type(SemanticTokenType::TYPE);
+                self.set_current_token_type(SemanticTokenType::TYPE); // 重置语义类型
                 second = Some(self.must(TokenType::Ident)?);
             }
+            t.kind = TypeKind::Ident;
+            t.ident_kind = TypeIdentKind::Unknown;
 
-            let ident = if let Some(second_token) = second {
-                second_token.clone()
+            (t.import_as, t.ident) = if let Some(second_token) = second {
+                t.import_as = first.literal.clone();
+                (first.literal.clone(), second_token.literal.clone())
             } else {
-                first.clone()
+                ("".to_string(), first.literal.clone())
             };
-            let mut alias = TypeAlias {
-                ident: ident.literal,
-                import_as: if second.is_some() { Some(first.literal.clone()) } else { None },
-                symbol_id: 0,
-                args: None,
-            };
-            t.origin_ident = Some(alias.ident.clone());
-            if let Some(import_as) = &alias.import_as {
-                t.origin_ident = Some(format!("{}.{}", import_as, alias.ident.clone()));
-            }
 
-            // alias<arg1, arg2, ...>
+            // ident<arg1, arg2, ...>
             if self.consume(TokenType::LeftAngle) {
-                let mut args = Vec::new();
                 loop {
-                    args.push(self.parser_single_type()?);
+                    t.args.push(self.parser_single_type()?);
                     if !self.consume(TokenType::Comma) {
                         break;
                     }
                 }
                 self.must(TokenType::RightAngle)?;
-                alias.args = Some(args);
             }
 
-            t.kind = TypeKind::Alias(Box::new(alias));
             t.end = self.prev().unwrap().end;
             return Ok(t);
         }
@@ -980,13 +991,14 @@ impl Syntax {
             let mut union_t = Type::unknown();
             union_t.status = ReductionStatus::Undo;
             union_t.start = self.peek().start;
+
             let mut elements = Vec::new();
             elements.push(t);
 
             let null_type = Type::new(TypeKind::Null);
             elements.push(null_type);
 
-            union_t.kind = TypeKind::Union(false, elements);
+            union_t.kind = TypeKind::Union(false, true, elements);
             union_t.end = self.prev().unwrap().end;
             return Ok(union_t);
         }
@@ -1002,42 +1014,52 @@ impl Syntax {
         return Ok(t);
     }
 
-    fn parser_type_alias_stmt(&mut self) -> Result<Box<Stmt>, SyntaxError> {
+    fn parser_typedef_stmt(&mut self) -> Result<Box<Stmt>, SyntaxError> {
         let mut stmt = self.stmt_new();
 
         self.must(TokenType::Type)?;
+
         self.set_current_token_type(SemanticTokenType::TYPE);
         let ident_token = self.must(TokenType::Ident)?;
-        let alias_ident = ident_token.clone();
+        let typedef_ident = ident_token.clone();
 
         // T<arg1, arg2>
-        let mut alias_params = Vec::new();
+        let mut typedef_params = Vec::new();
         if self.consume(TokenType::LeftAngle) {
             if self.is(TokenType::RightAngle) {
                 return Err(SyntaxError(self.peek().start, self.peek().end, "type alias params cannot be empty".to_string()));
             }
 
-            // 临时保存当前的 type_params_table
+            // 临时保存当前的 type_params_table, 协助 parser 解析
             self.type_params_table = HashMap::new();
 
             loop {
                 let ident = self.must(TokenType::Ident)?.literal.clone();
-                let mut param = GenericsParam::new(ident.clone());
+                let mut param: GenericsParam = GenericsParam::new(ident.clone());
 
-                // 可选的泛型类型约束 <T:t1|t2, U:t1|t2>
+                // 可选的泛型类型约束 <T:t1|t2, U:t1&t2>
                 if self.consume(TokenType::Colon) {
-                    param.constraints.0 = false;
-                    loop {
-                        let t = self.parser_single_type()?;
+                    let mut t = self.parser_single_type()?;
+                    param.constraints.0.push(t);
 
-                        param.constraints.1.push(t);
-                        if !self.consume(TokenType::Or) {
-                            break;
+                    if self.is(TokenType::Or) {
+                        param.constraints.3 = true;
+                        while self.consume(TokenType::Or) {
+                            t = self.parser_single_type()?;
+                            param.constraints.0.push(t);
+                        }
+                    } else if self.is(TokenType::And) {
+                        param.constraints.2 = true;
+                        while self.consume(TokenType::And) {
+                            t = self.parser_single_type()?;
+                            param.constraints.0.push(t);
                         }
                     }
+
+                    param.constraints.1 = false;
                 }
 
-                alias_params.push(param);
+                typedef_params.push(param);
 
                 self.type_params_table.insert(ident.clone(), ident.clone());
 
@@ -1049,8 +1071,30 @@ impl Syntax {
             self.must(TokenType::RightAngle)?;
         }
 
+        // impl interface
+        // type data_t: container<T> {
+        // type data_t: container<int> {
+        let impl_interfaces = if self.consume(TokenType::Colon) {
+            let mut impl_interfaces = Vec::new();
+            loop {
+                let mut interface_type = self.parser_type()?;
+                interface_type.ident_kind = TypeIdentKind::Interface;
+                impl_interfaces.push(interface_type);
+
+                if !self.consume(TokenType::Comma) {
+                    break;
+                }
+            }
+
+            impl_interfaces
+        } else {
+            Vec::new()
+        };
+
         self.must(TokenType::Equal)?;
 
+        let mut is_interface = false;
+        let mut exists = HashMap::new();
         let type_expr = if self.consume(TokenType::Struct) {
             self.must(TokenType::LeftCurly)?;
 
@@ -1058,6 +1102,18 @@ impl Syntax {
             while !self.is(TokenType::RightCurly) {
                 let field_type = self.parser_type()?;
                 let field_name = self.must(TokenType::Ident)?.literal.clone();
+
+                if exists.contains_key(&field_name) {
+                    errors_push(
+                        &mut self.module,
+                        AnalyzerError {
+                            start: field_type.start,
+                            end: field_type.end,
+                            message: format!("struct field '{}' already exists", field_name),
+                        },
+                    );
+                }
+                exists.insert(field_name.clone(), 1);
 
                 let mut default_value = None;
 
@@ -1091,6 +1147,41 @@ impl Syntax {
             self.must(TokenType::RightCurly)?;
 
             Type::undo_new(TypeKind::Struct("".to_string(), 0, properties))
+        } else if self.consume(TokenType::Interface) {
+            let mut elements: Vec<Type> = Vec::new();
+            self.must(TokenType::LeftCurly)?;
+
+            while !self.consume(TokenType::RightCurly) {
+                let fn_start = self.must(TokenType::Fn)?.clone();
+                let fn_name_token = self.must(TokenType::Ident)?.clone();
+                let fn_name = fn_name_token.literal.clone();
+                let mut type_fn_kind = self.parser_type_fn()?;
+                if let TypeKind::Fn(fn_kind) = &mut type_fn_kind {
+                    fn_kind.name = fn_name.clone();
+                }
+
+                if exists.contains_key(&fn_name) {
+                    errors_push(
+                        &mut self.module,
+                        AnalyzerError {
+                            start: fn_name_token.start,
+                            end: fn_name_token.end,
+                            message: format!("interface method '{}' already exists", fn_name),
+                        },
+                    );
+                }
+                exists.insert(fn_name.clone(), 1);
+
+                let mut interface_item = Type::undo_new(type_fn_kind);
+                interface_item.start = fn_start.start;
+                interface_item.end = self.prev().unwrap().end;
+
+                elements.push(interface_item);
+                self.must_stmt_end()?;
+            }
+
+            is_interface = true;
+            Type::undo_new(TypeKind::Interface(elements))
         } else {
             let mut alias_type = self.parser_single_type()?;
 
@@ -1108,7 +1199,7 @@ impl Syntax {
                     ));
                 }
 
-                alias_type = Type::undo_new(TypeKind::Union(false, elements));
+                alias_type = Type::undo_new(TypeKind::Union(false, true, elements));
             } else if self.consume(TokenType::Or) {
                 let mut elements = Vec::new();
                 elements.push(alias_type);
@@ -1122,7 +1213,7 @@ impl Syntax {
                     }
                 }
 
-                alias_type = Type::undo_new(TypeKind::Union(false, elements));
+                alias_type = Type::undo_new(TypeKind::Union(false, false, elements));
             }
 
             alias_type
@@ -1131,12 +1222,16 @@ impl Syntax {
         // 恢复之前的 type_params_table
         self.type_params_table = HashMap::new();
 
-        stmt.node = AstNode::TypeAlias(Arc::new(Mutex::new(TypeAliasStmt {
-            ident: alias_ident.literal,
-            symbol_start: alias_ident.start,
-            symbol_end: alias_ident.end,
-            params: alias_params,
+        stmt.node = AstNode::Typedef(Arc::new(Mutex::new(TypedefStmt {
+            ident: typedef_ident.literal,
+            symbol_start: typedef_ident.start,
+            symbol_end: typedef_ident.end,
+            params: typedef_params,
             type_expr,
+            is_alias: false,
+            is_interface,
+            impl_interfaces,
+            method_table: HashMap::new(),
             symbol_id: 0,
         })));
         stmt.end = self.prev().unwrap().end;
@@ -1144,39 +1239,25 @@ impl Syntax {
         Ok(stmt)
     }
 
-    fn expr_to_type_alias(&self, left_expr: &Expr, generics_args: Option<Vec<Type>>) -> Type {
+    fn expr_to_typedef(&self, left_expr: &Expr, generics_args: Option<Vec<Type>>) -> Type {
         let mut t = Type::unknown();
         t.status = ReductionStatus::Undo;
         t.start = self.peek().start;
         t.end = self.peek().end;
+        t.kind = TypeKind::Ident;
+        t.ident_kind = TypeIdentKind::Def;
 
         // 根据左值表达式类型构造 TypeAlias
-        let alias = match &left_expr.node {
+        match &left_expr.node {
             // 简单标识符: foo
             AstNode::Ident(ident, _) => {
-                t.origin_ident = Some(ident.clone());
-                t.origin_type_kind = TypeKind::Alias(Box::new(TypeAlias::default()));
-
-                TypeAlias {
-                    ident: ident.clone(),
-                    import_as: None,
-                    symbol_id: 0,
-                    args: generics_args,
-                }
+                t.ident = ident.clone();
             }
-
             // 包选择器: pkg.foo
             AstNode::SelectExpr(left, key) => {
                 if let AstNode::Ident(left_ident, _) = &left.node {
-                    t.origin_ident = Some(key.clone());
-                    t.origin_type_kind = TypeKind::Alias(Box::new(TypeAlias::default()));
-
-                    TypeAlias {
-                        ident: key.clone(),
-                        import_as: Some(left_ident.clone()),
-                        symbol_id: 0,
-                        args: generics_args,
-                    }
+                    t.import_as = left_ident.clone();
+                    t.ident = key.clone();
                 } else {
                     panic!("struct new left type exception");
                 }
@@ -1184,7 +1265,7 @@ impl Syntax {
             _ => panic!("struct new left type exception"),
         };
 
-        t.kind = TypeKind::Alias(Box::new(alias));
+        t.args = generics_args.unwrap_or(Vec::new());
         t
     }
 
@@ -1207,7 +1288,7 @@ impl Syntax {
     }
 
     // 解析函数参数
-    fn parser_params(&mut self, fn_decl: &mut AstFnDef) -> Result<(), SyntaxError> {
+    fn parser_fn_params(&mut self, fn_decl: &mut AstFnDef) -> Result<(), SyntaxError> {
         self.must(TokenType::LeftParen)?;
 
         if self.consume(TokenType::RightParen) {
@@ -1353,7 +1434,7 @@ impl Syntax {
                 spread: false,
             };
 
-            call.args = self.parser_args(&mut call)?;
+            call.args = self.parser_call_args(&mut call)?;
 
             expr.node = AstNode::Call(call);
             return Ok(expr);
@@ -1361,7 +1442,7 @@ impl Syntax {
 
         // 结构体初始化
         assert!(self.is(TokenType::LeftCurly));
-        let t = self.expr_to_type_alias(&left, Some(generics_args));
+        let t = self.expr_to_typedef(&left, Some(generics_args));
 
         self.parser_struct_new(t)
     }
@@ -1643,7 +1724,7 @@ impl Syntax {
         Ok(expr)
     }
 
-    fn parser_args(&mut self, call: &mut AstCall) -> Result<Vec<Box<Expr>>, SyntaxError> {
+    fn parser_call_args(&mut self, call: &mut AstCall) -> Result<Vec<Box<Expr>>, SyntaxError> {
         self.must(TokenType::LeftParen)?;
         let mut args = Vec::new();
 
@@ -1697,7 +1778,7 @@ impl Syntax {
             spread: false,
         };
 
-        call.args = self.parser_args(&mut call)?;
+        call.args = self.parser_call_args(&mut call)?;
 
         expr.node = AstNode::Call(call);
         expr.end = self.prev().unwrap().end;
@@ -1777,6 +1858,33 @@ impl Syntax {
         Ok(semicolon_count == 2)
     }
 
+    fn is_call_generics(&mut self) -> bool {
+        // 保存当前解析位置
+        let current_pos = self.current;
+
+        // 屏蔽错误
+        let mut result = false;
+
+        // 尝试解析类型
+        match self.parser_type() {
+            Err(_) => {
+                // 无法判定为类型，直接返回 true
+                result = true;
+            }
+            Ok(_) => {
+                // 判断下一个符号是否为左括号
+                if self.is(TokenType::LeftParen) {
+                    result = true;
+                }
+            }
+        }
+
+        // 恢复解析位置
+        self.current = current_pos;
+
+        result
+    }
+
     fn is_type_begin_stmt(&mut self) -> bool {
         // var/any/int/float/bool/string
         if self.is_basic_type() {
@@ -1831,12 +1939,12 @@ impl Syntax {
 
         // person<[i8]> foo
         if self.is(TokenType::Ident) && self.next_is(1, TokenType::LeftAngle) {
-            return true;
+            return !self.is_call_generics();
         }
 
         // person.foo<[i8]>
         if self.is(TokenType::Ident) && self.next_is(1, TokenType::Dot) && self.next_is(2, TokenType::Ident) && self.next_is(3, TokenType::LeftAngle) {
-            return true;
+            return !self.is_call_generics();
         }
 
         // (var_a, var_b) = (1, 2)
@@ -2082,11 +2190,36 @@ impl Syntax {
         Ok(stmt)
     }
 
-    fn parser_vec_new(&mut self) -> Result<Box<Expr>, SyntaxError> {
+    fn parser_left_square_expr(&mut self) -> Result<Box<Expr>, SyntaxError> {
         let mut expr = self.expr_new();
         self.must(TokenType::LeftSquare)?;
 
+        // 处理空数组 []
+        if self.consume(TokenType::RightSquare) {
+            expr.node = AstNode::VecNew(Vec::new(), None, None);
+            expr.end = self.prev().unwrap().end;
+            return Ok(expr);
+        }
+
+        // 解析第一个元素
+        let first_element = self.parser_expr()?;
+
+        // 处理重复数组 [expr; length]
+        if self.consume(TokenType::StmtEof) {
+            let length_expr = self.parser_expr()?;
+            self.must(TokenType::RightSquare)?;
+
+            expr.node = AstNode::VecRepeatNew(first_element, length_expr);
+            expr.end = self.prev().unwrap().end;
+            return Ok(expr);
+        }
+
         let mut elements = Vec::new();
+        elements.push(first_element);
+
+        if !self.is(TokenType::RightSquare) {
+            self.must(TokenType::Comma)?;
+        }
 
         while !self.is(TokenType::RightSquare) {
             let element = self.parser_expr()?;
@@ -2122,6 +2255,7 @@ impl Syntax {
 
         // if colon, parse map
         if self.consume(TokenType::Colon) {
+            // k:v
             let mut elements = Vec::new();
             let value = self.parser_expr()?;
 
@@ -2187,8 +2321,8 @@ impl Syntax {
         self.must(TokenType::Fn)?;
 
         let mut fndef = AstFnDef::default();
-        fndef.start = start;
-        fndef.end = end;
+        fndef.symbol_start = start;
+        fndef.symbol_end = end;
 
         if self.is(TokenType::Ident) {
             // fn expr 不能包含名称
@@ -2202,7 +2336,7 @@ impl Syntax {
             fndef.fn_name = name;
         }
 
-        self.parser_params(&mut fndef)?;
+        self.parser_fn_params(&mut fndef)?;
 
         // parse return type
         if self.consume(TokenType::Colon) {
@@ -2227,7 +2361,7 @@ impl Syntax {
                 generics_args: Vec::new(),
                 spread: false,
             };
-            call.args = self.parser_args(&mut call)?;
+            call.args = self.parser_call_args(&mut call)?;
 
             let mut call_expr = self.expr_new();
             call_expr.node = AstNode::Call(call);
@@ -2242,42 +2376,61 @@ impl Syntax {
 
     fn parser_new_expr(&mut self) -> Result<Box<Expr>, SyntaxError> {
         let mut expr = self.expr_new();
-        self.must(TokenType::New)?;
+        self.must(TokenType::Ident)?; // ident = new
 
         let t = self.parser_type()?;
         self.must(TokenType::LeftParen)?;
         let mut properties: Vec<StructNewProperty> = Vec::new();
+        let mut default_expr_option = None;
 
         if !self.consume(TokenType::RightParen) {
-            loop {
-                if self.is(TokenType::RightParen) {
-                    break;
+            if self.is(TokenType::Ident) && (self.next_is(1, TokenType::Equal) || self.next_is(1, TokenType::Comma)) {
+                while !self.is(TokenType::RightParen) {
+                    let start = self.peek().start;
+                    let key = self.must(TokenType::Ident)?.clone();
+                    let value = if self.consume(TokenType::Equal) {
+                        self.parser_expr()?
+                    } else {
+                        Box::new(Expr::ident(start, self.peek().end, key.literal.clone(), 0))
+                    };
+
+                    let end = value.end;
+
+                    properties.push(StructNewProperty {
+                        type_: Type::default(),
+                        key: key.literal,
+                        value,
+                        start,
+                        end,
+                    });
+
+                    if self.is(TokenType::RightParen) {
+                        break;
+                    } else {
+                        self.must(TokenType::Comma)?;
+                    }
+                }
+            } else {
+                let default_expr = self.parser_expr()?;
+
+                // copy to properties
+                if let AstNode::Ident(ident, symbol_id) = &default_expr.node {
+                    properties.push(StructNewProperty {
+                        type_: Type::default(),
+                        key: ident.clone(),
+                        value: Box::new(Expr::ident(default_expr.start, default_expr.end, ident.clone(), *symbol_id)),
+                        start: default_expr.start,
+                        end: default_expr.end,
+                    });
                 }
 
-                let start = self.peek().start;
-                let key = self.must(TokenType::Ident)?.clone();
-                self.must(TokenType::Equal)?;
-                let value = self.parser_expr()?;
-                let end = value.end;
-
-                properties.push(StructNewProperty {
-                    type_: Type::default(),
-                    key: key.literal,
-                    value,
-                    start,
-                    end,
-                });
-
-                if self.is(TokenType::RightParen) {
-                    break;
-                } else {
-                    self.must(TokenType::Comma)?;
-                }
+                default_expr_option = Some(default_expr);
             }
+
             self.must(TokenType::RightParen)?;
         }
 
-        expr.node = AstNode::New(t, properties);
+        expr.node = AstNode::New(t, properties, default_expr_option);
         expr.end = self.prev().unwrap().end;
 
         Ok(expr)
@@ -2496,36 +2649,9 @@ impl Syntax {
         false
     }
 
-    fn is_impl_type(&mut self, kind: &TypeKind) -> bool {
-        matches!(
-            kind,
-            TypeKind::String
-                | TypeKind::Bool
-                | TypeKind::Int
-                | TypeKind::Uint
-                | TypeKind::Int8
-                | TypeKind::Int16
-                | TypeKind::Int32
-                | TypeKind::Int64
-                | TypeKind::Uint8
-                | TypeKind::Uint16
-                | TypeKind::Uint32
-                | TypeKind::Uint64
-                | TypeKind::Float
-                | TypeKind::Float32
-                | TypeKind::Float64
-                | TypeKind::Chan(..)
-                | TypeKind::Vec(..)
-                | TypeKind::Map(..)
-                | TypeKind::Set(..)
-                | TypeKind::Tuple(..)
-                | TypeKind::Alias(..)
-        )
-    }
-
     fn parser_fndef_stmt(&mut self, mut fndef: AstFnDef) -> Result<Box<Stmt>, SyntaxError> {
         let mut stmt = self.stmt_new();
-        fndef.start = self.peek().start;
+        fndef.symbol_start = self.peek().start;
         self.must(TokenType::Fn)?;
 
         // 检查是否是类型实现函数
@@ -2546,14 +2672,24 @@ impl Syntax {
 
                     // 处理泛型约束 <T:t1|t2, U:t1|t2>
                     if self.consume(TokenType::Colon) {
-                        param.constraints.0 = false;
-                        loop {
-                            let t = self.parser_single_type()?;
-                            param.constraints.1.push(t);
-                            if !self.consume(TokenType::Or) {
-                                break;
+                        let mut t = self.parser_single_type()?;
+                        param.constraints.0.push(t);
+
+                        if self.is(TokenType::Or) {
+                            param.constraints.3 = true;
+                            while self.consume(TokenType::Or) {
+                                t = self.parser_single_type()?;
+                                param.constraints.0.push(t);
+                            }
+                        } else if self.is(TokenType::And) {
+                            param.constraints.2 = true;
+                            while self.consume(TokenType::And) {
+                                t = self.parser_single_type()?;
+                                param.constraints.0.push(t);
                             }
                         }
+
+                        param.constraints.1 = false;
                     }
 
                     if let Some(params) = &mut fndef.generics_params {
@@ -2574,14 +2710,10 @@ impl Syntax {
 
             // 解析实现类型
             let impl_type = if first_token.token_type == TokenType::Ident {
-                let mut t = Type::undo_new(TypeKind::Alias(Box::new(TypeAlias {
-                    import_as: None,
-                    ident: first_token.literal.clone(),
-                    symbol_id: 0,
-                    args: None,
-                })));
-                t._impl = (self.must(TokenType::Ident)?.literal.clone(), 0, Vec::new());
-
+                let mut t = Type::undo_new(TypeKind::Ident);
+                t.ident = self.must(TokenType::Ident)?.clone().literal;
+                t.ident_kind = TypeIdentKind::Def;
+                t.start = first_token.start;
 
                 if fndef.generics_params.is_some() {
                     self.must(TokenType::LeftAngle)?;
@@ -2589,38 +2721,40 @@ impl Syntax {
 
                     loop {
                         let param_type = self.parser_single_type()?;
-                        assert!(matches!(param_type.kind, TypeKind::Param(_)));
+                        assert!(param_type.ident_kind == TypeIdentKind::Param);
 
                         if self.consume(TokenType::Colon) {
                             loop {
                                 self.parser_single_type()?;
+
                                 if !self.consume(TokenType::Or) {
                                     break;
                                 }
                             }
                         }
-                        args.push(param_type);
 
+                        args.push(param_type);
                         if !self.consume(TokenType::Comma) {
                             break;
                         }
                     }
 
                     self.must(TokenType::RightAngle)?;
-
-                    if let TypeKind::Alias(alias) = &mut t.kind {
-                        alias.args = Some(args);
-                    }
+                    t.args = args;
                 }
+
+                t.end = self.prev().unwrap().end;
                 t
             } else {
                 let mut t = self.parser_single_type()?;
-                t._impl = (first_token.literal.clone(), 0, Vec::new());
+                t.ident = first_token.literal.clone();
+                t.ident_kind = TypeIdentKind::Builtin;
+                t.args = Vec::new();
                 t
             };
 
             // 类型检查
-            if !self.is_impl_type(&impl_type.kind) {
+            if !Type::is_impl_builtin_type(&impl_type.kind) && impl_type.kind != TypeKind::Ident {
                 return Err(SyntaxError(
                     self.peek().start,
                     self.peek().end,
@@ -2643,7 +2777,7 @@ impl Syntax {
         fndef.symbol_name = ident.literal.clone();
         fndef.fn_name = ident.literal.clone();
 
-        // 处理非实现类型的泛型参数
+        // 处理非类型参数的泛型参数
         if !is_impl_type && self.consume(TokenType::LeftAngle) {
             self.type_params_table = HashMap::new();
             fndef.generics_params = Some(Vec::new());
@@ -2652,15 +2786,26 @@ impl Syntax {
                 let ident = self.must(TokenType::Ident)?.literal.clone();
                 let mut param = GenericsParam::new(ident.clone());
 
+                // 处理泛型约束 <T:t1|t2, U:t1|t2>
                 if self.consume(TokenType::Colon) {
-                    param.constraints.0 = false;
-                    loop {
-                        let t = self.parser_single_type()?;
-                        param.constraints.1.push(t);
-                        if !self.consume(TokenType::Or) {
-                            break;
+                    let mut t = self.parser_single_type()?;
+                    param.constraints.0.push(t);
+
+                    if self.is(TokenType::Or) {
+                        param.constraints.3 = true;
+                        while self.consume(TokenType::Or) {
+                            t = self.parser_single_type()?;
+                            param.constraints.0.push(t);
+                        }
+                    } else if self.is(TokenType::And) {
+                        param.constraints.2 = true;
+                        while self.consume(TokenType::And) {
+                            t = self.parser_single_type()?;
+                            param.constraints.0.push(t);
                         }
                     }
+
+                    param.constraints.1 = false;
                 }
 
                 if let Some(params) = &mut fndef.generics_params {
@@ -2677,7 +2822,7 @@ impl Syntax {
             self.must(TokenType::RightAngle)?;
         }
 
-        self.parser_params(&mut fndef)?;
+        self.parser_fn_params(&mut fndef)?;
 
         // 处理返回类型
         if self.consume(TokenType::Colon) {
@@ -2701,7 +2846,7 @@ impl Syntax {
 
         fndef.body = self.parser_body()?;
 
-        fndef.end = if let Some(prev) = self.prev() { prev.end } else { self.peek().end };
+        fndef.symbol_end = if let Some(prev) = self.prev() { prev.end } else { self.peek().end };
 
         self.type_params_table = HashMap::new();
 
@@ -2737,7 +2882,7 @@ impl Syntax {
         self.must(TokenType::StmtEof)?;
 
         if self.is(TokenType::Type) {
-            self.parser_type_alias_stmt()
+            self.parser_typedef_stmt()
         } else if self.is(TokenType::Fn) {
             self.parser_fndef_stmt(fndef)
         } else {
@@ -2817,7 +2962,7 @@ impl Syntax {
         } else if self.is(TokenType::Import) {
             self.parser_import_stmt()?
         } else if self.is(TokenType::Type) {
-            self.parser_type_alias_stmt()?
+            self.parser_typedef_stmt()?
         } else {
             return Err(SyntaxError(
                 self.peek().start,
@@ -2870,7 +3015,7 @@ impl Syntax {
             self.parser_throw_stmt()?
         } else if self.is(TokenType::Let) {
             self.parser_let_stmt()?
-        } else if self.is(TokenType::Ident) {
+        } else if self.is(TokenType::Ident) || self.is(TokenType::Star) {
             self.parser_expr_begin_stmt()?
         } else if self.is(TokenType::Label) {
             self.parser_label()?
@@ -2883,7 +3028,7 @@ impl Syntax {
         } else if self.is(TokenType::Import) {
             self.parser_import_stmt()?
         } else if self.is(TokenType::Type) {
-            self.parser_type_alias_stmt()?
+            self.parser_typedef_stmt()?
         } else if self.is(TokenType::Continue) {
             self.parser_continue_stmt()?
         } else if self.is(TokenType::Break) {
@@ -3101,9 +3246,9 @@ impl Syntax {
         let mut call_stmt = self.stmt_new();
         let call = AstCall {
             return_type: Type::unknown(),
-            left: Box::new(Expr::ident(fndef.start, fndef.end, "co_return".to_string(), 0)),
+            left: Box::new(Expr::ident(fndef.symbol_start, fndef.symbol_end, "co_return".to_string(), 0)),
             args: vec![Box::new(Expr {
-                node: AstNode::Unary(ExprOp::La, Box::new(Expr::ident(fndef.start, fndef.end, "result".to_string(), 0))),
+                node: AstNode::Unary(ExprOp::La, Box::new(Expr::ident(fndef.symbol_start, fndef.symbol_end, "result".to_string(), 0))),
                 ..Default::default()
             })],
             generics_args: Vec::new(),
@@ -3425,6 +3570,38 @@ impl Syntax {
         }
     }
 
+    fn parser_ident_is(&mut self, expect: String) -> bool {
+        let t = self.peek();
+        if t.token_type != TokenType::Ident {
+            return false;
+        }
+
+        return t.literal == expect;
+    }
+
+    fn parser_is_new(&mut self) -> bool {
+        if !self.parser_ident_is("new".to_string()) {
+            return false;
+        }
+
+        self.next_is(1, TokenType::Ident) ||
+            self.next_is(1, TokenType::Int) ||
+            self.next_is(1, TokenType::I8) ||
+            self.next_is(1, TokenType::I16) ||
+            self.next_is(1, TokenType::I32) ||
+            self.next_is(1, TokenType::I64) ||
+            self.next_is(1, TokenType::Uint) ||
+            self.next_is(1, TokenType::U8) ||
+            self.next_is(1, TokenType::U16) ||
+            self.next_is(1, TokenType::U32) ||
+            self.next_is(1, TokenType::U64) ||
+            self.next_is(1, TokenType::Float) ||
+            self.next_is(1, TokenType::F32) ||
+            self.next_is(1, TokenType::F64) ||
+            self.next_is(1, TokenType::LeftSquare) || // array new
+            self.next_is(1, TokenType::Bool)
+    }
+
     fn parser_expr(&mut self) -> Result<Box<Expr>, SyntaxError> {
         // 根据当前 token 类型选择对应的解析器
         if self.parser_is_struct_new_expr() {
@@ -3435,7 +3612,7 @@ impl Syntax {
             self.parser_match_expr()
         } else if self.is(TokenType::Fn) {
             self.parser_fndef_expr()
-        } else if self.is(TokenType::New) {
+        } else if self.parser_is_new() {
             self.parser_new_expr()
         } else {
             self.parser_expr_with_precedence()

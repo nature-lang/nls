@@ -8,15 +8,14 @@ use std::hash::{Hash, Hasher};
 
 use log::debug;
 
+use super::{
+    common::{AnalyzerError, AstCall, AstNode, Expr, Stmt, Type, TypeFn, TypedefStmt, VarDeclExpr},
+    symbol::{NodeId, SymbolTable},
+};
 use crate::{
     analyzer::{common::*, symbol::SymbolKind},
     project::Module,
-    utils::{format_generics_ident, format_impl_ident},
-};
-
-use super::{
-    common::{AnalyzerError, AstCall, AstNode, Expr, Stmt, Type, TypeAliasStmt, TypeFn, VarDeclExpr},
-    symbol::{NodeId, SymbolTable},
+    utils::{errors_push, format_generics_ident, format_impl_ident},
 };
 
 #[derive(Debug, Clone)]
@@ -87,6 +86,12 @@ impl GenericSpecialFnClone {
                 cap.as_ref().map(|e| Box::new(self.clone_expr(e))),
             ),
             AstNode::ArrayNew(elements) => AstNode::ArrayNew(elements.iter().map(|e| Box::new(self.clone_expr(e))).collect()),
+            AstNode::VecRepeatNew(default_element, len_element) => {
+                AstNode::VecRepeatNew(Box::new(self.clone_expr(default_element)), Box::new(self.clone_expr(len_element)))
+            }
+            AstNode::ArrRepeatNew(default_element, len_element) => {
+                AstNode::ArrRepeatNew(Box::new(self.clone_expr(default_element)), Box::new(self.clone_expr(len_element)))
+            }
             AstNode::VecAccess(type_, left, index) => AstNode::VecAccess(type_.clone(), Box::new(self.clone_expr(left)), Box::new(self.clone_expr(index))),
             AstNode::EmptyCurlyNew => AstNode::EmptyCurlyNew,
 
@@ -145,7 +150,7 @@ impl GenericSpecialFnClone {
             }),
 
             AstNode::FnDef(fn_def_mutex) => AstNode::FnDef(self.deep_clone(fn_def_mutex)),
-            AstNode::New(type_, props) => AstNode::New(
+            AstNode::New(type_, props, scalar_expr) => AstNode::New(
                 type_.clone(),
                 props
                     .iter()
@@ -157,6 +162,11 @@ impl GenericSpecialFnClone {
                         end: p.end,
                     })
                     .collect(),
+                if let Some(expr) = scalar_expr {
+                    Some(Box::new(self.clone_expr(expr)))
+                } else {
+                    None
+                },
             ),
             AstNode::As(type_, src) => AstNode::As(type_.clone(), Box::new(self.clone_expr(src))),
             AstNode::Is(type_, src) => AstNode::Is(type_.clone(), Box::new(self.clone_expr(src))),
@@ -238,7 +248,7 @@ impl GenericSpecialFnClone {
                 self.clone_body(catch_body),
             ),
 
-            AstNode::TypeAlias(alias) => AstNode::TypeAlias(Arc::new(Mutex::new(alias.lock().unwrap().clone()))),
+            AstNode::Typedef(alias) => AstNode::Typedef(Arc::new(Mutex::new(alias.lock().unwrap().clone()))),
             _ => stmt.node.clone(),
         };
 
@@ -314,140 +324,259 @@ impl<'a> Typesys<'a> {
         }
     }
 
-    fn finalize_type(&mut self, t: Type, origin_ident: Option<String>, origin_type_kind: TypeKind) -> Type {
+    fn finalize_type(&mut self, t: Type, ident: String, ident_kind: TypeIdentKind, args: Vec<Type>) -> Type {
         let mut result = t.clone();
-        result.origin_ident = origin_ident;
-        result.origin_type_kind = origin_type_kind;
+        if ident_kind != TypeIdentKind::Unknown {
+            result.ident_kind = ident_kind;
+            result.ident = ident;
+        }
+
+        if args.len() > 0 {
+            result.args = args;
+        }
+
         result.status = ReductionStatus::Done;
         result.kind = Type::cross_kind_trans(&result.kind);
 
         return result;
     }
 
-    fn reduction_type_alias(&mut self, t: Type) -> Result<Type, AnalyzerError> {
-        let TypeKind::Alias(alias) = &t.kind else { unreachable!() };
-        let start = t.start;
-        let end = t.end;
+    fn combination_interface(&mut self, typedef_stmt: &mut TypedefStmt) -> Result<(), AnalyzerError> {
+        // 确保类型表达式已完成归约且是接口类型
+        assert!(typedef_stmt.type_expr.status == ReductionStatus::Done);
+
+        // 获取原始接口中的方法列表
+        let TypeKind::Interface(origin_elements) = &mut typedef_stmt.type_expr.kind else {
+            return Err(AnalyzerError {
+                start: typedef_stmt.symbol_start,
+                end: typedef_stmt.symbol_end,
+                message: "typedef type is not interface".to_string(),
+            });
+        };
+
+        // 创建一个 HashMap 用于跟踪已存在的方法
+        let mut exists = HashMap::new();
+
+        // 将原始接口中的方法添加到 exists 中
+        for element in origin_elements.clone() {
+            if let TypeKind::Fn(type_fn) = &element.kind {
+                exists.insert(type_fn.name.clone(), element.clone());
+            }
+        }
+
+        // 合并实现的接口
+        for impl_interface in &mut typedef_stmt.impl_interfaces {
+            // 归约接口类型
+            *impl_interface = self.reduction_type(impl_interface.clone()).unwrap();
+
+            if let TypeKind::Interface(elements) = &impl_interface.kind {
+                for element in elements {
+                    if let TypeKind::Fn(type_fn) = &element.kind {
+                        // 检查方法是否已存在
+                        if let Some(exist_type) = exists.get(&type_fn.name) {
+                            // 比较方法签名是否一致
+                            if !self.type_compare(&element, exist_type) {
+                                return Err(AnalyzerError {
+                                    start: element.start,
+                                    end: element.end,
+                                    message: format!("duplicate method '{}'", type_fn.name),
+                                });
+                            }
+                            continue;
+                        }
+
+                        // 添加新方法
+                        exists.insert(type_fn.name.clone(), element.clone());
+                        origin_elements.push(element.clone());
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    fn reduction_typedef_or_alias(&mut self, mut t: Type) -> Result<Type, AnalyzerError> {
+        let mut start = t.start;
+        let mut end = t.end;
 
         // semantic 阶段已经找到了 alias 定义点的 symbol_Id
-        if alias.symbol_id == 0 {
+        if t.symbol_id == 0 {
             return Err(AnalyzerError {
                 start: 0,
                 end: 0,
-                message: format!("type alias '{}' symbol_id not found", alias.ident),
+                message: format!("typedef '{}' symbol_id not found", t.ident),
             });
         }
 
-        // 获取类型别名的标识符和参数
-        let impl_ident = alias.ident.clone();
-        let impl_symbol_id = alias.symbol_id;
+        // 获取符号定义
+        let symbol = self.symbol_table.get_symbol(t.symbol_id).ok_or_else(|| AnalyzerError {
+            start,
+            end,
+            message: format!("typedef '{}' not found", t.ident),
+        })?;
 
-        let symbol = self.symbol_table.get_symbol(alias.symbol_id).unwrap(); // 确保找到的符号是类型别名
-
-        let type_alias_stmt_mutex = match symbol.kind.clone() {
-            SymbolKind::TypeAlias(stmt) => stmt,
-            _ => {
-                return Err(AnalyzerError {
-                    start,
-                    end,
-                    message: format!("'{}' is not a type", symbol.ident),
-                });
-            }
+        // 检查符号类型
+        let SymbolKind::Type(typedef_mutex) = symbol.kind.clone() else {
+            return Err(AnalyzerError {
+                start,
+                end,
+                message: format!("'{}' is not a type", symbol.ident),
+            });
         };
 
-        let mut type_alias = match type_alias_stmt_mutex.try_lock() {
-            Ok(guard) => guard,
-            Err(_) => return Ok(t), // 无法获取锁,说明存在递归调用,返回原始类型
-        };
+        let mut typedef = typedef_mutex.lock().unwrap();
+        start = typedef.symbol_start;
+        end = typedef.symbol_end;
 
-        let mut impl_args = Vec::new();
-
-        // 处理带参数的类型别名
-        if type_alias.params.len() > 0 {
-            if alias.args.is_none() {
+        // 处理泛型参数
+        if typedef.params.len() > 0 {
+            // 检查是否提供了泛型参数
+            if t.args.is_empty() {
                 return Err(AnalyzerError {
                     start,
                     end,
-                    message: format!("type alias '{}' need param", alias.ident),
+                    message: format!("typedef '{}' need params", t.ident),
                 });
             }
-
-            let args = alias.args.as_ref().unwrap();
-
-            if args.len() != type_alias.params.len() {
+            // 检查参数数量是否匹配
+            if t.args.len() != typedef.params.len() {
                 return Err(AnalyzerError {
                     start,
                     end,
-                    message: format!("type alias '{}' param not match", alias.ident),
+                    message: format!("typedef '{}' params mismatch", t.ident),
                 });
             }
 
-            // 对每个参数进行类型归约和约束检查
-            for (i, undo_arg_type) in args.iter().enumerate() {
-                let arg_type = self.reduction_type(undo_arg_type.clone())?;
-                // assert!(!matches!(arg_type.kind, TypeKind::Param(..))); 泛型函数的泛型类型自动推导时 reduction_type 可以接受 param
+            // 创建参数表并压入栈
+            let mut args_table = HashMap::new();
+            let mut impl_args = Vec::new();
+            for (i, undo_arg) in t.args.iter_mut().enumerate() {
+                // 先进行类型归约
+                let arg = self.reduction_type(undo_arg.clone())?;
 
-                impl_args.push(arg_type.clone());
+                let param = &mut typedef.params[i];
 
-                let param = &mut type_alias.params[i];
-
-                // 处理约束条件
-                if !param.constraints.0 {
-                    for constraint in param.constraints.1.iter_mut() {
-                        *constraint = self.reduction_type(constraint.clone())?;
-                    }
-                }
-
-                if !self.union_type_contains(&param.constraints, &arg_type) {
+                // 检查泛型约束
+                if let Err(e) = self.generics_constrains_check(param, &arg) {
                     return Err(AnalyzerError {
                         start,
                         end,
-                        message: format!("type alias '{}' param constraint not match", alias.ident),
+                        message: format!("generics constraint check failed: {}", e),
                     });
+                }
+
+                impl_args.push(arg.clone());
+                args_table.insert(param.ident.clone(), arg.clone());
+            }
+
+            // 压入参数表用于后续处理
+            self.generics_args_stack.push(args_table);
+
+            // 处理接口实现
+            if typedef.impl_interfaces.len() > 0 {
+                if typedef.is_interface {
+                    assert!(typedef.type_expr.status == ReductionStatus::Done);
+                    assert!(matches!(typedef.type_expr.kind, TypeKind::Interface(..)));
+                    self.combination_interface(&mut typedef)?
+                } else {
+                    for impl_interface in &mut typedef.impl_interfaces {
+                        *impl_interface = self.reduction_type(impl_interface.clone())?;
+                    }
+
+                    for impl_interface in &typedef.impl_interfaces {
+                        self.check_typedef_impl(impl_interface, t.ident.clone(), &typedef)
+                            .map_err(|e| AnalyzerError { start, end, message: e })?;
+                    }
                 }
             }
 
-            // 处理类型参数栈
-            let mut args_table: HashMap<String, Type> = HashMap::new();
-            for (i, undo_arg_type) in args.iter().enumerate() {
-                let arg_type = self.reduction_type(undo_arg_type.clone())?;
-                let param = &type_alias.params[i];
+            // 处理右值表达式
+            let mut right_type = typedef.type_expr.clone();
 
-                args_table.insert(param.ident.clone(), arg_type.clone());
+            right_type = self.reduction_type(right_type)?;
+
+            // 弹出参数表
+            self.generics_args_stack.pop();
+
+            t.args = impl_args;
+            t.kind = right_type.kind;
+            t.status = right_type.status;
+            return Ok(t);
+        } else {
+            // params == 0
+            if !t.args.is_empty() {
+                return Err(AnalyzerError {
+                    start,
+                    end,
+                    message: format!("typedef '{}' args mismatch", t.ident),
+                });
             }
-
-            self.generics_args_stack.push(args_table);
-
-            // 对右值类型进行归约
-            let mut alias_value_type = type_alias.type_expr.clone();
-            alias_value_type = self.reduction_type(alias_value_type)?;
-
-            if self.generics_args_stack.len() > 0 {
-                self.generics_args_stack.pop();
-            }
-
-            alias_value_type._impl = (impl_ident, impl_symbol_id, impl_args);
-
-            return Ok(alias_value_type);
         }
 
-        // 检查是否已完成归约
-        if type_alias.type_expr.status == ReductionStatus::Done {
-            type_alias.type_expr._impl = (impl_ident, impl_symbol_id, impl_args);
-            return Ok(type_alias.type_expr.clone());
-        }
-
-        // 处理正在进行归约的情况(避免循环依赖)
-        if type_alias.type_expr.status == ReductionStatus::Doing {
+        // 检查右值是否已完成归约
+        if typedef.type_expr.status == ReductionStatus::Done {
+            t.kind = typedef.type_expr.kind.clone();
+            t.status = typedef.type_expr.status;
             return Ok(t);
         }
 
-        // 进行类型归约
-        type_alias.type_expr.status = ReductionStatus::Doing;
-        type_alias.type_expr = self.reduction_type(type_alias.type_expr.clone())?;
-        type_alias.type_expr._impl = (impl_ident, impl_symbol_id, impl_args);
+        // 处理循环引用
+        if typedef.type_expr.status == ReductionStatus::Doing {
+            return Ok(t);
+        }
 
-        return Ok(type_alias.type_expr.clone());
+        // 标记正在处理,避免循环引用
+        typedef.type_expr.status = ReductionStatus::Doing;
+
+        // 处理接口
+        if typedef.is_interface {
+            typedef.type_expr.ident_kind = TypeIdentKind::Interface;
+            typedef.type_expr.ident = t.ident.clone();
+        }
+        let type_expr = typedef.type_expr.clone();
+
+        // 在递归调用前释放锁，避免死锁
+        drop(typedef);
+
+        // 归约类型表达式递归处理, 避免 typedef_mutex 锁定
+        let type_expr = match self.reduction_type(type_expr) {
+            Ok(type_expr) => type_expr,
+            Err(e) => {
+                // change typedef status to undo
+                let mut typedef = typedef_mutex.lock().unwrap();
+                if typedef.type_expr.status == ReductionStatus::Doing {
+                    typedef.type_expr.status = ReductionStatus::Undo;
+                }
+
+                return Err(e);
+            }
+        };
+
+        let mut typedef = typedef_mutex.lock().unwrap();
+        typedef.type_expr = type_expr;
+
+        // 处理接口实现
+        if typedef.impl_interfaces.len() > 0 {
+            if typedef.is_interface {
+                assert!(typedef.type_expr.status == ReductionStatus::Done);
+                assert!(matches!(typedef.type_expr.kind, TypeKind::Interface(..)));
+                self.combination_interface(&mut typedef)?
+            } else {
+                for impl_interface in &mut typedef.impl_interfaces {
+                    *impl_interface = self.reduction_type(impl_interface.clone())?;
+                }
+
+                for impl_interface in &typedef.impl_interfaces {
+                    self.check_typedef_impl(impl_interface, t.ident.clone(), &typedef)
+                        .map_err(|e| AnalyzerError { start, end, message: e })?;
+                }
+            }
+        }
+
+        t.kind = typedef.type_expr.kind.clone();
+        t.status = typedef.type_expr.status;
+        Ok(t)
     }
 
     fn reduction_complex_type(&mut self, t: Type) -> Result<Type, AnalyzerError> {
@@ -457,10 +586,8 @@ impl<'a> Typesys<'a> {
 
         match &mut result.kind {
             // 处理指针类型
-            TypeKind::Ptr(value_type) | TypeKind::RawPtr(value_type) => {
+            TypeKind::Ptr(value_type) | TypeKind::Rawptr(value_type) => {
                 *value_type = Box::new(self.reduction_type(*value_type.clone())?);
-
-                result._impl = value_type._impl.clone();
             }
 
             // 处理数组类型
@@ -471,13 +598,19 @@ impl<'a> Typesys<'a> {
             // 处理通道类型
             TypeKind::Chan(element_type) => {
                 *element_type = Box::new(self.reduction_type(*element_type.clone())?);
-                result._impl = (kind_str, 0, vec![*element_type.clone()]);
+
+                result.ident_kind = TypeIdentKind::Builtin;
+                result.ident = kind_str;
+                result.args.push(*element_type.clone());
             }
 
             // 处理向量类型
             TypeKind::Vec(element_type) => {
                 *element_type = Box::new(self.reduction_type(*element_type.clone())?);
-                result._impl = (kind_str, 0, vec![*element_type.clone()]);
+
+                result.ident_kind = TypeIdentKind::Builtin;
+                result.ident = kind_str;
+                result.args = vec![*element_type.clone()];
             }
 
             // 处理映射类型
@@ -494,7 +627,9 @@ impl<'a> Typesys<'a> {
                     });
                 }
 
-                result._impl = (kind_str, 0, vec![*key_type.clone(), *value_type.clone()]);
+                result.ident_kind = TypeIdentKind::Builtin;
+                result.ident = kind_str;
+                result.args = vec![*key_type.clone(), *value_type.clone()];
             }
 
             // 处理集合类型
@@ -510,12 +645,20 @@ impl<'a> Typesys<'a> {
                     });
                 }
 
-                result._impl = (kind_str, 0, vec![*element_type.clone()]);
+                result.ident_kind = TypeIdentKind::Builtin;
+                result.ident = kind_str;
+                result.args = vec![*element_type.clone()];
             }
 
             // 处理元组类型
             TypeKind::Tuple(elements, align) => {
-                assert!(!elements.is_empty(), "tuple element empty");
+                if elements.is_empty() {
+                    return Err(AnalyzerError {
+                        start: t.start,
+                        end: t.end,
+                        message: "tuple element empty".to_string(),
+                    });
+                }
 
                 let mut max_align = 0;
                 for element_type in elements.iter_mut() {
@@ -525,14 +668,12 @@ impl<'a> Typesys<'a> {
                 }
 
                 *align = max_align;
-
-                // tuple 未实现 impl
             }
             TypeKind::Fn(type_fn) => {
                 type_fn.return_type = self.reduction_type(type_fn.return_type.clone())?;
 
-                for param_type in type_fn.param_types.iter_mut() {
-                    *param_type = self.reduction_type(param_type.clone())?;
+                for formal_type in type_fn.param_types.iter_mut() {
+                    *formal_type = self.reduction_type(formal_type.clone())?;
                 }
             }
 
@@ -588,9 +729,18 @@ impl<'a> Typesys<'a> {
         Ok(result)
     }
 
+    pub fn type_param_special(&mut self, t: Type, arg_table: HashMap<String, Type>) -> Type {
+        assert!(t.kind == TypeKind::Ident);
+        assert!(t.ident_kind == TypeIdentKind::Param);
+
+        let arg_type = arg_table.get(&t.ident).unwrap();
+        return self.reduction_type(arg_type.clone()).unwrap();
+    }
+
     pub fn reduction_type(&mut self, mut t: Type) -> Result<Type, AnalyzerError> {
-        let origin_ident = t.origin_ident.clone();
-        let origin_type_kind = t.origin_type_kind.clone();
+        let ident = t.ident.clone();
+        let ident_kind = t.ident_kind.clone();
+        let args = t.args.clone();
 
         if t.err {
             return Err(AnalyzerError {
@@ -605,44 +755,65 @@ impl<'a> Typesys<'a> {
         }
 
         if t.status == ReductionStatus::Done {
-            return Ok(self.finalize_type(t, origin_ident, origin_type_kind));
+            return Ok(self.finalize_type(t, ident, ident_kind, args));
+        }
+
+        if Type::ident_is_def_or_alias(&t) {
+            t = self.reduction_typedef_or_alias(t)?;
+            // 如果原来存在 t.args 则其经过了 reduction
+            return Ok(self.finalize_type(t.clone(), ident, ident_kind, t.args));
+        }
+
+        if t.kind == TypeKind::Ident && t.ident_kind == TypeIdentKind::Interface {
+            t = self.reduction_typedef_or_alias(t)?;
+            return Ok(self.finalize_type(t, ident, ident_kind, args));
+        }
+
+        if t.kind == TypeKind::Ident && t.ident_kind == TypeIdentKind::Param {
+            if self.generics_args_stack.is_empty() {
+                return Ok(self.finalize_type(t, ident, ident_kind, args));
+            }
+
+            let arg_table = self.generics_args_stack.last().unwrap();
+            let result = self.type_param_special(t, arg_table.clone());
+
+            return Ok(self.finalize_type(result.clone(), result.ident.clone(), result.ident_kind, result.args));
         }
 
         match &mut t.kind {
-            TypeKind::Alias(_) => {
-                let result = self.reduction_type_alias(t)?;
-                return Ok(self.finalize_type(result, origin_ident, origin_type_kind));
-            }
-            TypeKind::Param(ident) => {
-                if self.generics_args_stack.is_empty() {
-                    return Ok(self.finalize_type(t, origin_ident, origin_type_kind));
-                }
-
-                let args_table = self.generics_args_stack.last().unwrap();
-                let result = self.reduction_type(args_table.get(ident).unwrap().clone())?;
-                return Ok(self.finalize_type(result, origin_ident, origin_type_kind));
-            }
-            TypeKind::Union(any, elements) => {
+            TypeKind::Union(any, _, elements) => {
                 if *any {
-                    return Ok(self.finalize_type(t, origin_ident, origin_type_kind));
+                    return Ok(self.finalize_type(t, ident, ident_kind, args));
                 }
 
                 for element in elements {
                     *element = self.reduction_type(element.clone())?;
                 }
 
-                return Ok(self.finalize_type(t, origin_ident, origin_type_kind));
+                return Ok(self.finalize_type(t, ident, ident_kind, args));
+            }
+            TypeKind::Interface(elements) => {
+                for element in elements {
+                    *element = self.reduction_type(element.clone())?;
+                }
+
+                return Ok(self.finalize_type(t, ident, ident_kind, args));
             }
             _ => {
                 if Type::is_origin_type(&t.kind) {
                     let mut result = t.clone();
-                    result._impl = (t.kind.to_string(), 0, vec![]);
-                    return Ok(self.finalize_type(result, origin_ident, origin_type_kind));
+
+                    result.status = ReductionStatus::Done;
+                    result.ident = t.kind.to_string(); // 如果 origin ident 存在，则会被覆盖
+                    result.ident_kind = TypeIdentKind::Builtin; // 如果 origin ident_kind 存在，则会被覆盖
+                    result.args = vec![];
+
+                    return Ok(self.finalize_type(result, ident, ident_kind, args));
                 }
 
-                if Type::is_reduction_type(&t.kind) {
+                if Type::is_complex_type(&t.kind) {
                     let result = self.reduction_complex_type(t)?;
-                    return Ok(self.finalize_type(result, origin_ident, origin_type_kind));
+                    return Ok(self.finalize_type(result, ident, ident_kind, args));
                 }
 
                 panic!("cannot parser type: {}", t);
@@ -657,32 +828,40 @@ impl<'a> Typesys<'a> {
      *
      * integer literal 之间的转换需要进行 fit 检查
      */
-    fn literal_as_check(&mut self, literal_kind: &mut TypeKind, literal_value: &mut String, target_kind: TypeKind) -> bool {
+    fn literal_as_check(&mut self, literal_kind: &mut TypeKind, literal_value: &mut String, target_kind: TypeKind) -> Result<(), String> {
         let literal_kind = Type::cross_kind_trans(literal_kind);
         let target_kind = Type::cross_kind_trans(&target_kind);
 
-        if Type::is_integer(&literal_kind) && Type::is_integer(&target_kind) {
-            let i = if literal_value.starts_with("0x") {
-                i64::from_str_radix(&literal_value[2..], 16)
-            } else if literal_value.starts_with("0b") {
-                i64::from_str_radix(&literal_value[2..], 2)
-            } else if literal_value.starts_with("0o") {
-                i64::from_str_radix(&literal_value[2..], 8)
-            } else {
-                literal_value.parse::<i64>()
-            };
-
-            match i {
-                Ok(i) => {
-                    return self.integer_range_check(&target_kind, i);
-                }
-                Err(_) => {
-                    return false;
-                }
-            }
+        // 如果不是整数类型之间的转换，直接返回 true
+        if !Type::is_integer(&literal_kind) || !Type::is_integer(&target_kind) {
+            return Ok(());
         }
 
-        return true;
+        let (literal_value, is_negative) = if literal_value.starts_with('-') {
+            (literal_value[1..].to_string(), true)
+        } else {
+            (literal_value.clone(), false)
+        };
+
+        // 统一处理数字转换
+        let i = if literal_value.starts_with("0x") {
+            i64::from_str_radix(&literal_value[2..], 16)
+        } else if literal_value.starts_with("0b") {
+            i64::from_str_radix(&literal_value[2..], 2)
+        } else if literal_value.starts_with("0o") {
+            i64::from_str_radix(&literal_value[2..], 8)
+        } else {
+            literal_value.parse::<i64>()
+        }
+        .map_err(|e| e.to_string())?;
+
+        let i = if is_negative { -i } else { i };
+
+        if self.integer_range_check(&target_kind, i) {
+            return Ok(());
+        }
+
+        return Err(format!("literal {} out of type '{}' range", literal_value, literal_kind.to_string()));
     }
 
     pub fn infer_as_expr(&mut self, expr: &mut Box<Expr>) -> Result<Type, AnalyzerError> {
@@ -693,28 +872,28 @@ impl<'a> Typesys<'a> {
         // 推导源表达式类型, 如果存在错误则停止后续比较, 直接返回错误
         let src_type = self.infer_expr(src, Type::default())?;
         if src_type.kind.is_unknown() {
-            return Err(AnalyzerError{
+            return Err(AnalyzerError {
                 start: expr.start,
                 end: expr.end,
                 message: "unknown as source type".to_string(),
-            })
+            });
         }
 
         src.type_ = src_type.clone();
 
-        // void_ptr 可以 as 为任意类型
-        if matches!(src.type_.kind, TypeKind::VoidPtr) && !Type::is_float(&target_type.kind) {
+        // anyptr 可以 as 为任意类型
+        if matches!(src.type_.kind, TypeKind::Anyptr) && !Type::is_float(&target_type.kind) {
             return Ok(target_type.clone());
         }
 
-        // 除了 float 任意类型都可以 as void_ptr
-        if !Type::is_float(&src.type_.kind) && matches!(target_type.kind, TypeKind::VoidPtr) {
+        // 除了 float 任意类型都可以 as anyptr
+        if !Type::is_float(&src.type_.kind) && matches!(target_type.kind, TypeKind::Anyptr) {
             return Ok(target_type.clone());
         }
 
         // union/nay 可以 as 为任意类型
         // 处理联合类型转换
-        if let TypeKind::Union(any, elements) = &src_type.kind {
+        if let TypeKind::Union(any, _, elements) = &src_type.kind {
             if matches!(target_type.kind, TypeKind::Union(..)) {
                 return Err(AnalyzerError {
                     start: expr.start,
@@ -723,13 +902,75 @@ impl<'a> Typesys<'a> {
                 });
             }
 
-            // 检查目标类型是否包含在联合类型中
             if !self.union_type_contains(&(*any, elements.clone()), &target_type) {
                 return Err(AnalyzerError {
                     start: expr.start,
                     end: expr.end,
                     message: format!("type = {} not contains in union type", target_type),
                 });
+            }
+
+            return Ok(target_type.clone());
+        }
+
+        // 处理接口类型转换
+        if let TypeKind::Interface(_) = &src_type.kind {
+            // interface_type = src_type
+            let temp_target_type = match &target_type.kind {
+                TypeKind::Ptr(value_type) | TypeKind::Rawptr(value_type) => *value_type.clone(),
+                _ => target_type.clone(),
+            };
+
+            if temp_target_type.ident.is_empty() || temp_target_type.ident_kind != TypeIdentKind::Def {
+                return Err(AnalyzerError {
+                    start: expr.start,
+                    end: expr.end,
+                    message: format!("type = {} not impl interface", src_type),
+                });
+            }
+
+            // get symbol from symbol table
+            let symbol = match self.symbol_table.find_global_symbol(&temp_target_type.ident) {
+                Some(s) => s,
+                None => {
+                    return Err(AnalyzerError {
+                        start: expr.start,
+                        end: expr.end,
+                        message: format!("type '{}' not found", temp_target_type.ident),
+                    });
+                }
+            };
+
+            if let SymbolKind::Type(typedef_mutex) = symbol.kind.clone() {
+                let typedef = typedef_mutex.lock().unwrap();
+                let mut found = false;
+                for interface in &typedef.impl_interfaces {
+                    assert!(interface.ident_kind == TypeIdentKind::Interface);
+
+                    // str check
+                    if interface.ident == src_type.ident {
+                        found = true;
+                        break;
+                    }
+                }
+
+                // 禁止制鸭子类型
+                if !found {
+                    return Err(AnalyzerError {
+                        start: expr.start,
+                        end: expr.end,
+                        message: format!("type '{}' not impl '{}' interface", temp_target_type.ident, src_type),
+                    });
+                }
+
+                self.check_typedef_impl(&src_type, temp_target_type.ident.clone(), &typedef)
+                    .map_err(|e| AnalyzerError {
+                        start: expr.start,
+                        end: expr.end,
+                        message: e,
+                    })?;
+            } else {
+                unreachable!();
             }
 
             return Ok(target_type.clone());
@@ -748,16 +989,51 @@ impl<'a> Typesys<'a> {
         // number 之间可以相互进行类型转换, 但是需要进行 literal check
         if Type::is_number(&src_type.kind) && Type::is_number(&target_type.kind) {
             if let AstNode::Literal(literal_kind, literal_value) = &mut src.node {
-                if !self.literal_as_check(literal_kind, literal_value, target_type.kind.clone()) {
-                    return Err(AnalyzerError {
+                self.literal_as_check(literal_kind, literal_value, target_type.kind.clone())
+                    .map_err(|e| AnalyzerError {
                         start: expr.start,
                         end: expr.end,
-                        message: format!("literal {} out of type '{}' range", literal_value, target_type),
-                    });
-                }
+                        message: e,
+                    })?;
             }
 
             return Ok(target_type.clone());
+        }
+
+        // 处理 typedef ident 类型转换
+        if target_type.ident_kind == TypeIdentKind::Def {
+            let ident = target_type.ident.clone();
+            let ident_kind = target_type.ident_kind.clone();
+            let args = target_type.args.clone();
+
+            src.type_.ident = target_type.ident.clone();
+            src.type_.ident_kind = target_type.ident_kind.clone();
+            src.type_.args = target_type.args.clone();
+
+            // compare check
+            if self.type_compare(&src.type_, target_type) {
+                src.type_.ident = ident;
+                src.type_.ident_kind = ident_kind;
+                src.type_.args = args;
+                return Ok(target_type.clone());
+            }
+
+            return Err(AnalyzerError {
+                start: expr.start,
+                end: expr.end,
+                message: format!("cannot casting to '{}'", target_type),
+            });
+        }
+
+        if src.type_.ident_kind == TypeIdentKind::Def && target_type.ident_kind == TypeIdentKind::Builtin {
+            let mut src_temp_type = src.type_.clone();
+            src_temp_type.ident = target_type.ident.clone();
+            src_temp_type.ident_kind = target_type.ident_kind.clone();
+
+            if self.type_compare(&target_type, &src_temp_type) {
+                src.type_ = src_temp_type.clone();
+                return Ok(target_type.clone());
+            }
         }
 
         // 检查目标类型是否可以进行类型转换
@@ -820,11 +1096,11 @@ impl<'a> Typesys<'a> {
 
                     // 处理 is 类型匹配
                     if let AstNode::MatchIs(_target_type) = cond_expr.node.clone() {
-                        if !matches!(subject_type.kind, TypeKind::Union(..)) {
+                        if !matches!(subject_type.kind, TypeKind::Union(..) | TypeKind::Interface(..)) {
                             return Err(AnalyzerError {
                                 start: cond_expr.start,
                                 end: cond_expr.end,
-                                message: "only union type can use is assert".to_string(),
+                                message: format!("{} cannot use 'is' operator", subject_type),
                             });
                         }
 
@@ -849,7 +1125,7 @@ impl<'a> Typesys<'a> {
         // 检查 default case
         if !has_default {
             // 对于非 any 的联合类型,检查是否所有可能的类型都已匹配
-            if let TypeKind::Union(any, elements) = &subject_type.kind {
+            if let TypeKind::Union(any, _, elements) = &subject_type.kind {
                 if !any {
                     for element_type in elements {
                         if !union_types.contains_key(&element_type.hash()) {
@@ -944,7 +1220,7 @@ impl<'a> Typesys<'a> {
                 return Err(AnalyzerError {
                     start: type_prop.start,
                     end: type_prop.end,
-                    message: format!("property '{}' type '{}' must assign value", type_prop.key, type_prop.type_),
+                    message: format!("struct filed '{}' must be assigned default value", type_prop.key),
                 });
             }
         }
@@ -963,6 +1239,13 @@ impl<'a> Typesys<'a> {
 
         // 先推导左操作数的类型
         let left_type = self.infer_right_expr(left, left_target_type)?;
+        if left_type.kind.is_unknown() {
+            return Err(AnalyzerError {
+                start: left.start,
+                end: left.end,
+                message: "unknown binary expr left type".to_string(),
+            });
+        }
 
         let right_target_type = if let TypeKind::Union(..) = left_type.kind.clone() {
             Type::new(TypeKind::Unknown)
@@ -1095,7 +1378,7 @@ impl<'a> Typesys<'a> {
                 });
             }
 
-            return Ok(Type::raw_ptr_of(operand_type));
+            return Ok(Type::rawptr_of(operand_type));
         }
 
         // 处理不安全取地址运算符 @unsafe_la
@@ -1125,7 +1408,7 @@ impl<'a> Typesys<'a> {
         if op == ExprOp::Ia {
             // 检查是否是指针类型
             match operand_type.kind {
-                TypeKind::Ptr(value_type) | TypeKind::RawPtr(value_type) => {
+                TypeKind::Ptr(value_type) | TypeKind::Rawptr(value_type) => {
                     return Ok(*value_type);
                 }
                 _ => {
@@ -1152,10 +1435,10 @@ impl<'a> Typesys<'a> {
         };
 
         let symbol = self.symbol_table.get_symbol(*symbol_id).unwrap();
-        debug!(
-            "infer_ident {} symbol_ident: {} {} {} {}",
-            ident, &symbol.ident, &symbol.is_local, &symbol.defined_in, *symbol_id
-        );
+        // debug!(
+        //     "infer_ident {} symbol_ident: {} {} {} {}",
+        //     ident, &symbol.ident, &symbol.is_local, &symbol.defined_in, *symbol_id
+        // );
 
         let mut symbol_kind = symbol.kind.clone();
 
@@ -1192,7 +1475,7 @@ impl<'a> Typesys<'a> {
                 return Ok(var_decl.type_.clone());
             }
             SymbolKind::Fn(fndef) => {
-                return self.infer_fn_decl(fndef.clone());
+                return self.infer_fn_decl(fndef.clone(), Type::default());
             }
             _ => {
                 panic!("unknown symbol kind");
@@ -1202,7 +1485,6 @@ impl<'a> Typesys<'a> {
 
     pub fn infer_vec_new(&mut self, expr: &mut Box<Expr>, infer_target_type: Type) -> Result<Type, AnalyzerError> {
         let AstNode::VecNew(elements, _, _) = &mut expr.node else { unreachable!() };
-        dbg!(&elements);
 
         // 如果目标类型是数组，则将 VecNew 重写为 ArrayNew
         if let TypeKind::Arr(length, element_type) = &infer_target_type.kind {
@@ -1210,7 +1492,10 @@ impl<'a> Typesys<'a> {
             expr.node = AstNode::ArrayNew(elements.clone());
             let AstNode::ArrayNew(elements) = &mut expr.node else { unreachable!() };
 
-            let result = Type::undo_new(TypeKind::Arr(length.clone(), element_type.clone()));
+            let mut result = Type::undo_new(TypeKind::Arr(length.clone(), element_type.clone()));
+            result.ident = infer_target_type.ident.clone();
+            result.ident_kind = infer_target_type.ident_kind.clone();
+            result.args = infer_target_type.args.clone();
 
             // 如果数组为空，直接返回目标类型
             if elements.is_empty() {
@@ -1224,7 +1509,7 @@ impl<'a> Typesys<'a> {
                 }
             }
 
-            return self.reduction_type(infer_target_type);
+            return self.reduction_type(result);
         }
 
         // 处理向量类型
@@ -1244,7 +1529,13 @@ impl<'a> Typesys<'a> {
                     message: "vec element type not confirm".to_string(),
                 });
             }
-            return self.reduction_type(Type::undo_new(TypeKind::Vec(Box::new(element_type))));
+            let mut result = Type::undo_new(TypeKind::Vec(Box::new(element_type)));
+            if infer_target_type.kind.is_exist() {
+                result.ident = infer_target_type.ident.clone();
+                result.ident_kind = infer_target_type.ident_kind.clone();
+                result.args = infer_target_type.args.clone();
+            }
+            return self.reduction_type(result);
         }
 
         // 如果元素类型未知，使用第一个元素的类型进行推导
@@ -1258,9 +1549,16 @@ impl<'a> Typesys<'a> {
                 self.errors_push(e.start, e.end, e.message);
             }
         }
+        let mut result = Type::undo_new(TypeKind::Vec(Box::new(element_type)));
+        if infer_target_type.kind.is_exist() {
+            result.ident = infer_target_type.ident.clone();
+            result.ident_kind = infer_target_type.ident_kind.clone();
+            result.args = infer_target_type.args.clone();
+        }
 
         // 返回最终的向量类型
-        self.reduction_type(Type::undo_new(TypeKind::Vec(Box::new(element_type))))
+        let result = self.reduction_type(result);
+        return result;
     }
 
     pub fn infer_map_new(&mut self, elements: &mut Vec<MapElement>, infer_target_type: Type, start: usize, end: usize) -> Result<Type, AnalyzerError> {
@@ -1309,9 +1607,16 @@ impl<'a> Typesys<'a> {
                 self.errors_push(e.start, e.end, e.message);
             }
         }
+        let mut result = Type::undo_new(TypeKind::Map(Box::new(key_type), Box::new(value_type)));
+
+        if infer_target_type.kind.is_exist() {
+            result.ident = infer_target_type.ident.clone();
+            result.ident_kind = infer_target_type.ident_kind.clone();
+            result.args = infer_target_type.args.clone();
+        }
 
         // 返回最终的Map类型
-        self.reduction_type(Type::undo_new(TypeKind::Map(Box::new(key_type), Box::new(value_type))))
+        self.reduction_type(result)
     }
 
     pub fn infer_set_new(&mut self, elements: &mut Vec<Box<Expr>>, infer_target_type: Type, start: usize, end: usize) -> Result<Type, AnalyzerError> {
@@ -1347,8 +1652,15 @@ impl<'a> Typesys<'a> {
             }
         }
 
-        // 返回最终的Set类型
-        self.reduction_type(Type::undo_new(TypeKind::Set(Box::new(element_type))))
+        // 返回最终的 set 类型
+        let mut result = Type::undo_new(TypeKind::Set(Box::new(element_type)));
+        if infer_target_type.kind.is_exist() {
+            result.ident = infer_target_type.ident.clone();
+            result.ident_kind = infer_target_type.ident_kind.clone();
+            result.args = infer_target_type.args.clone();
+        }
+
+        self.reduction_type(result)
     }
 
     pub fn infer_tuple_new(&mut self, elements: &mut Vec<Box<Expr>>, infer_target_type: Type, start: usize, end: usize) -> Result<Type, AnalyzerError> {
@@ -1386,14 +1698,96 @@ impl<'a> Typesys<'a> {
         }
 
         // 创建并返回元组类型
-        self.reduction_type(Type::undo_new(TypeKind::Tuple(element_types, 0))) // 0 是对齐字节数，这里暂时使用0
+        let mut result = Type::undo_new(TypeKind::Tuple(element_types, 0));
+        if infer_target_type.kind.is_exist() {
+            result.ident = infer_target_type.ident.clone();
+            result.ident_kind = infer_target_type.ident_kind.clone();
+            result.args = infer_target_type.args.clone();
+        }
+
+        self.reduction_type(result) // 0 是对齐字节数，这里暂时使用0
+    }
+
+    pub fn infer_vec_repeat_new(&mut self, expr: &mut Box<Expr>, infer_target_type: Type) -> Result<Type, AnalyzerError> {
+        let AstNode::VecRepeatNew(default_element, length_expr) = &mut expr.node.clone() else {
+            unreachable!()
+        };
+
+        // 如果目标类型是数组，将表达式重写为数组重复初始化
+        if let TypeKind::Arr(_, element_type) = &infer_target_type.kind {
+            // 重写为数组重复初始化节点
+            expr.node = AstNode::ArrRepeatNew(default_element.clone(), length_expr.clone());
+
+            // 检查默认值类型
+            self.infer_right_expr(default_element, *element_type.clone())?;
+
+            // 检查长度表达式
+            self.infer_right_expr(length_expr, Type::new(TypeKind::Int))?;
+
+            // 长度必须是整数字面量
+            let length = if let AstNode::Literal(kind, value) = &length_expr.node {
+                if !Type::is_integer(kind) {
+                    return Err(AnalyzerError {
+                        start: length_expr.start,
+                        end: length_expr.end,
+                        message: "array length must be integer literal".to_string(),
+                    });
+                }
+                value.parse::<i64>().map_err(|_| AnalyzerError {
+                    start: length_expr.start,
+                    end: length_expr.end,
+                    message: "invalid array length".to_string(),
+                })?
+            } else {
+                return Err(AnalyzerError {
+                    start: length_expr.start,
+                    end: length_expr.end,
+                    message: "array length must be constant".to_string(),
+                });
+            };
+
+            // 检查长度是否大于0
+            if length <= 0 {
+                return Err(AnalyzerError {
+                    start: length_expr.start,
+                    end: length_expr.end,
+                    message: "array length must be greater than 0".to_string(),
+                });
+            }
+
+            let result = Type::undo_new(TypeKind::Arr(length as u64, element_type.clone()));
+
+            return self.reduction_type(result);
+        }
+
+        // 处理向量类型
+        let mut element_type = Type::unknown();
+        if let TypeKind::Vec(target_element_type) = &infer_target_type.kind {
+            element_type = *target_element_type.clone();
+        }
+
+        // 推导默认值类型
+        element_type = self.infer_right_expr(default_element, element_type)?;
+        let result = Type::undo_new(TypeKind::Vec(Box::new(element_type)));
+
+        return self.reduction_type(result);
     }
 
     pub fn infer_access_expr(&mut self, expr: &mut Box<Expr>) -> Result<Type, AnalyzerError> {
         let AstNode::AccessExpr(left, key) = &mut expr.node else { unreachable!() };
 
         // 推导左侧表达式的类型
-        let left_type = self.infer_right_expr(left, Type::default())?;
+        let mut left_type = self.infer_right_expr(left, Type::default())?;
+        left_type = match &left_type.kind {
+            TypeKind::Ptr(value_type) | TypeKind::Rawptr(value_type) => {
+                if matches!(value_type.kind, TypeKind::Arr(..)) {
+                    *value_type.clone()
+                } else {
+                    left_type.clone()
+                }
+            }
+            _ => left_type.clone(),
+        };
 
         // 处理 Map 类型访问
         if let TypeKind::Map(key_type, value_type) = &left_type.kind {
@@ -1409,7 +1803,7 @@ impl<'a> Typesys<'a> {
         // 处理 Vec 和 String 类型访问
         if matches!(left_type.kind, TypeKind::Vec(_) | TypeKind::String) {
             // key 必须是整数类型
-            self.infer_right_expr(key, Type::new(TypeKind::Int))?;
+            self.infer_right_expr(key, Type::integer_t_new())?;
 
             let element_type = if let TypeKind::Vec(element_type) = &left_type.kind {
                 *element_type.clone()
@@ -1426,7 +1820,7 @@ impl<'a> Typesys<'a> {
         // 处理 Array 类型访问
         if let TypeKind::Arr(_, element_type) = &left_type.kind {
             // key 必须是整数类型
-            self.infer_right_expr(key, Type::new(TypeKind::Int))?;
+            self.infer_right_expr(key, Type::integer_t_new())?;
 
             // 重写为 ArrayAccess 节点
             expr.node = AstNode::ArrayAccess(*element_type.clone(), left.clone(), key.clone());
@@ -1490,7 +1884,7 @@ impl<'a> Typesys<'a> {
 
         // 处理自动解引用 - 如果是指针类型且指向结构体，则获取结构体类型
         let mut deref_type = match &left_type.kind {
-            TypeKind::Ptr(value_type) | TypeKind::RawPtr(value_type) => {
+            TypeKind::Ptr(value_type) | TypeKind::Rawptr(value_type) => {
                 if matches!(value_type.kind, TypeKind::Struct(..)) {
                     *value_type.clone()
                 } else {
@@ -1527,7 +1921,7 @@ impl<'a> Typesys<'a> {
                 return Err(AnalyzerError {
                     start: expr.start,
                     end: expr.end,
-                    message: format!("type struct '{}' no property '{}'", deref_type.origin_ident.unwrap_or("_".to_string()), key),
+                    message: format!("type struct '{}' no field '{}'", deref_type.ident, key),
                 });
             }
         }
@@ -1536,7 +1930,7 @@ impl<'a> Typesys<'a> {
         Err(AnalyzerError {
             start: expr.start,
             end: expr.end,
-            message: format!("type '{}' no property {}", left_type, key),
+            message: format!("no field named '{}' found in type '{}'", key, left_type),
         })
     }
 
@@ -1565,12 +1959,12 @@ impl<'a> Typesys<'a> {
         }
 
         // 检查原始调用
-        let fn_type = self.infer_right_expr(&mut async_expr.origin_call.left, Type::default())?;
+        self.infer_call(&mut async_expr.origin_call, Type::default(), start, end, false)?;
+
+        let fn_type = async_expr.origin_call.left.type_.clone();
 
         if let TypeKind::Fn(type_fn) = fn_type.kind {
             async_expr.return_type = type_fn.return_type.clone();
-
-            self.infer_call_args(&mut async_expr.origin_call, *type_fn);
         } else {
             return Err(AnalyzerError {
                 start: expr.start,
@@ -1597,8 +1991,8 @@ impl<'a> Typesys<'a> {
             left
         } else {
             // 需要使用闭包包装
-            let _ = self.infer_fn_decl(async_expr.closure_fn.clone());
-            let _ = self.infer_fn_decl(async_expr.closure_fn_void.clone());
+            let _ = self.infer_fn_decl(async_expr.closure_fn.clone(), Type::default());
+            let _ = self.infer_fn_decl(async_expr.closure_fn_void.clone(), Type::default());
 
             let closure_fn = if async_expr.return_type.kind == TypeKind::Void {
                 // 使用 void 版本的闭包
@@ -1636,8 +2030,8 @@ impl<'a> Typesys<'a> {
         };
 
         expr.node = AstNode::Call(call);
-
-        return Ok(self.infer_right_expr(expr, Type::default())?);
+        let result = self.infer_right_expr(expr, Type::default())?;
+        return Ok(result);
     }
 
     pub fn infer_expr(&mut self, expr: &mut Box<Expr>, infer_target_type: Type) -> Result<Type, AnalyzerError> {
@@ -1657,7 +2051,7 @@ impl<'a> Typesys<'a> {
                 let src_type = self.infer_right_expr(src, Type::default())?;
 
                 *target_type = self.reduction_type(target_type.clone())?;
-                if !matches!(src_type.kind, TypeKind::Union(..)) {
+                if !matches!(src_type.kind, TypeKind::Union(..) | TypeKind::Interface(..)) {
                     return Err(AnalyzerError {
                         start: expr.start,
                         end: expr.end,
@@ -1669,6 +2063,12 @@ impl<'a> Typesys<'a> {
             }
             AstNode::MacroSizeof(target_type) => {
                 *target_type = self.reduction_type(target_type.clone())?;
+
+                // literal 自动转换
+                if Type::is_integer(&infer_target_type.kind) || infer_target_type.kind == TypeKind::Anyptr {
+                    return Ok(infer_target_type.clone());
+                }
+
                 return Ok(Type::new(TypeKind::Int));
             }
             AstNode::MacroReflectHash(target_type) => {
@@ -1682,16 +2082,24 @@ impl<'a> Typesys<'a> {
             AstNode::MacroDefault => {
                 return Ok(infer_target_type);
             }
-            AstNode::New(type_, properties) => {
+            AstNode::New(type_, properties, expr_option) => {
                 *type_ = self.reduction_type(type_.clone())?;
+
                 if let TypeKind::Struct(_, _, type_properties) = &mut type_.kind {
                     *properties = self.infer_struct_properties(type_properties, properties)?;
                 } else {
-                    return Err(AnalyzerError {
-                        start: expr.start,
-                        end: expr.end,
-                        message: "cannot use 'new' operator on non-struct type".to_string(),
-                    });
+                    // check scala type or arr
+                    if !Type::is_scala_type(&type_.kind) && !matches!(type_.kind, TypeKind::Arr(..)) {
+                        return Err(AnalyzerError {
+                            start: expr.start,
+                            end: expr.end,
+                            message: "'new' operator can only be used with scalar types (number/boolean/struct/array)".to_string(),
+                        });
+                    }
+
+                    if let Some(expr) = expr_option {
+                        self.infer_right_expr(expr, type_.clone())?;
+                    }
                 }
 
                 return self.reduction_type(Type::ptr_of(type_.clone()));
@@ -1700,6 +2108,7 @@ impl<'a> Typesys<'a> {
             AstNode::Unary(op, operand) => self.infer_unary(op.clone(), operand, infer_target_type),
             AstNode::Ident(ident, symbol_id) => self.infer_ident(ident, symbol_id, expr.start, expr.end),
             AstNode::VecNew(..) => self.infer_vec_new(expr, infer_target_type),
+            AstNode::VecRepeatNew(..) | AstNode::ArrRepeatNew(..) => self.infer_vec_repeat_new(expr, infer_target_type),
             AstNode::EmptyCurlyNew => {
                 if infer_target_type.kind.is_unknown() {
                     return Ok(infer_target_type);
@@ -1745,15 +2154,102 @@ impl<'a> Typesys<'a> {
             }
             AstNode::AccessExpr(..) => self.infer_access_expr(expr),
             AstNode::SelectExpr(..) => self.infer_select_expr(expr),
-            AstNode::Call(call) => self.infer_call(call, infer_target_type, expr.start, expr.end),
+            AstNode::Call(call) => self.infer_call(call, infer_target_type, expr.start, expr.end, true),
             AstNode::MacroAsync(_) => self.infer_async(expr),
-            AstNode::FnDef(fndef) => self.infer_fn_decl(fndef.clone()),
+            AstNode::FnDef(fndef) => self.infer_fn_decl(fndef.clone(), infer_target_type),
             AstNode::Literal(..) => self.infer_literal(expr, infer_target_type),
             AstNode::EnvAccess(_, unique_ident, symbol_id_option) => {
                 return self.infer_ident(unique_ident, symbol_id_option, expr.start, expr.end);
             }
             _ => panic!("unknown operand {:?}", expr.node),
         };
+    }
+
+    fn is_nullable_interface(&mut self, target_type: &Type) -> bool {
+        if let TypeKind::Union(_, nullable, elements) = &target_type.kind {
+            if !nullable {
+                return false;
+            }
+
+            assert!(elements.len() == 2);
+            let first_element = &elements[0];
+            return matches!(first_element.kind, TypeKind::Interface(..));
+        } else {
+            return false;
+        }
+    }
+
+    fn as_to_interface(&mut self, expr: &mut Box<Expr>, interface_type: Type) -> Result<Box<Expr>, AnalyzerError> {
+        assert!(matches!(interface_type.ident_kind, TypeIdentKind::Interface));
+        assert!(expr.type_.status == ReductionStatus::Done);
+        assert!(interface_type.status == ReductionStatus::Done);
+
+        // 自动解引用指针类型
+        let src_type = match &expr.type_.kind {
+            TypeKind::Ptr(value_type) | TypeKind::Rawptr(value_type) => *value_type.clone(),
+            _ => expr.type_.clone(),
+        };
+
+        // 检查源类型必须是已定义类型
+        if !matches!(src_type.ident_kind, TypeIdentKind::Def) {
+            return Err(AnalyzerError {
+                start: expr.start,
+                end: expr.end,
+                message: format!("type '{}' cannot casting to interface '{}'", src_type, interface_type.ident),
+            });
+        }
+
+        if src_type.symbol_id == 0 {
+            return Err(AnalyzerError {
+                start: expr.start,
+                end: expr.end,
+                message: format!("src type symbol id is zero"),
+            });
+        }
+
+        // 获取类型定义
+        let symbol = self.symbol_table.get_symbol(src_type.symbol_id).unwrap();
+        let SymbolKind::Type(typedef_stmt_mutex) = symbol.kind.clone() else {
+            unreachable!()
+        };
+        let typedef_stmt = typedef_stmt_mutex.lock().unwrap();
+
+        // 检查类型是否实现了目标接口
+        let mut found = false;
+        for impl_interface in &typedef_stmt.impl_interfaces {
+            assert!(matches!(impl_interface.ident_kind, TypeIdentKind::Interface));
+            if impl_interface.ident == interface_type.ident {
+                found = true;
+                break;
+            }
+        }
+
+        // 禁止鸭子类型
+        if !found {
+            return Err(AnalyzerError {
+                start: expr.start,
+                end: expr.end,
+                message: format!("type '{}' not impl '{}' interface", src_type.ident, interface_type.ident),
+            });
+        }
+
+        // 检查接口实现的完整性
+        self.check_typedef_impl(&interface_type, src_type.ident.clone(), &typedef_stmt)
+            .map_err(|e| AnalyzerError {
+                start: expr.start,
+                end: expr.end,
+                message: e,
+            })?;
+
+        // 创建类型转换表达式
+        Ok(Box::new(Expr {
+            start: expr.start,
+            end: expr.end,
+            type_: interface_type.clone(),
+            target_type: interface_type.clone(),
+            node: AstNode::As(interface_type.clone(), expr.clone()),
+            err: false,
+        }))
     }
 
     fn infer_literal(&mut self, expr: &mut Box<Expr>, infer_target_type: Type) -> Result<Type, AnalyzerError> {
@@ -1765,7 +2261,7 @@ impl<'a> Typesys<'a> {
         *kind = literal_type.kind.clone();
 
         let mut target_kind = infer_target_type.kind.clone();
-        if matches!(target_kind, TypeKind::VoidPtr) {
+        if matches!(target_kind, TypeKind::Anyptr) {
             target_kind = TypeKind::Uint;
         }
         target_kind = Type::cross_kind_trans(&target_kind);
@@ -1783,7 +2279,13 @@ impl<'a> Typesys<'a> {
         }
 
         if Type::is_integer(&literal_type.kind) && Type::is_integer(&target_kind) {
-            let i = if literal_value.starts_with("0x") {
+            let (literal_value, is_negative) = if literal_value.starts_with('-') {
+                (literal_value[1..].to_string(), true)
+            } else {
+                (literal_value.clone(), false)
+            };
+
+            let mut i = if literal_value.starts_with("0x") {
                 i64::from_str_radix(&literal_value[2..], 16)
             } else if literal_value.starts_with("0b") {
                 i64::from_str_radix(&literal_value[2..], 2)
@@ -1797,6 +2299,10 @@ impl<'a> Typesys<'a> {
                 end: expr.end,
                 message: e.to_string(),
             })?;
+
+            if is_negative {
+                i = -i;
+            }
 
             if self.integer_range_check(&target_kind, i) {
                 *kind = target_kind;
@@ -1824,6 +2330,15 @@ impl<'a> Typesys<'a> {
             TypeKind::Uint32 => value >= 0 && value <= u32::MAX as i64,
             TypeKind::Uint64 => value >= 0,
             _ => false,
+        }
+    }
+
+    fn can_assign_to_interface(&self, type_: &Type) -> bool {
+        match &type_.kind {
+            TypeKind::Interface(..) => false,
+            TypeKind::Void => false,
+            TypeKind::Null => false,
+            _ => true,
         }
     }
 
@@ -1863,9 +2378,29 @@ impl<'a> Typesys<'a> {
             return Ok(expr.type_.clone());
         }
 
+        // handle interface
+        if matches!(target_type.kind, TypeKind::Interface(..)) && self.can_assign_to_interface(&expr.type_) {
+            *expr = self.as_to_interface(expr, target_type.clone())?;
+        }
+
+        // if self.null
+        if self.is_nullable_interface(&target_type) && self.can_assign_to_interface(&expr.type_) {
+            let TypeKind::Union(_, nullable, elements) = target_type.kind.clone() else {
+                unreachable!()
+            };
+
+            assert!(nullable);
+            assert!(elements.len() == 2);
+            let interface_type = elements[0].clone();
+
+            *expr = self.as_to_interface(expr, interface_type)?;
+        }
+
         // auto as，为了后续的 linear, 需要将 signal type 转换为 union type
         if matches!(target_type.kind, TypeKind::Union(..)) && self.can_assign_to_union(&expr.type_) {
-            let TypeKind::Union(any, elements) = &target_type.kind else { unreachable!() };
+            let TypeKind::Union(any, _, elements) = &target_type.kind else {
+                unreachable!()
+            };
             if !self.union_type_contains(&(*any, elements.clone()), &expr.type_) {
                 return Err(AnalyzerError {
                     start: expr.start,
@@ -1919,7 +2454,20 @@ impl<'a> Typesys<'a> {
             AstNode::EnvAccess(_, ident, symbol_id_option) => self.infer_ident(ident, symbol_id_option, expr.start, expr.end),
 
             // 函数调用
-            AstNode::Call(call) => self.infer_call(call, Type::default(), expr.start, expr.end),
+            AstNode::Call(call) => self.infer_call(call, Type::default(), expr.start, expr.end, true),
+
+            // *a
+            AstNode::Unary(op, operand) => {
+                if *op == ExprOp::Ia {
+                    return self.infer_unary(op.clone(), operand, Type::default());
+                } else {
+                    return Err(AnalyzerError {
+                        start: expr.start,
+                        end: expr.end,
+                        message: "unary operand cannot used in left".to_string(),
+                    });
+                }
+            }
 
             _ => {
                 // 对于不能作为左值的表达式，添加错误
@@ -1957,7 +2505,7 @@ impl<'a> Typesys<'a> {
         // 检查变量类型是否为void(非参数类型的情况下)
         {
             let var_decl = var_decl_mutex.lock().unwrap();
-            if !matches!(var_decl.type_.origin_type_kind, TypeKind::Param(..)) && matches!(var_decl.type_.kind, TypeKind::Void) {
+            if var_decl.type_.ident_kind != TypeIdentKind::Param && matches!(var_decl.type_.kind, TypeKind::Void) {
                 return Err(AnalyzerError {
                     start: var_decl.symbol_start,
                     end: var_decl.symbol_end,
@@ -2059,11 +2607,9 @@ impl<'a> Typesys<'a> {
 
         self.be_caught -= 1;
 
-        let mut errort = Type::errort(self.symbol_table);
-
         {
-            errort = self.reduction_type(errort)?;
             let mut catch_err = catch_err_mutex.lock().unwrap();
+            let errort = self.interface_throwable();
             catch_err.type_ = errort;
         }
 
@@ -2089,12 +2635,10 @@ impl<'a> Typesys<'a> {
 
         self.be_caught -= 1;
 
-        let mut errort = Type::errort(self.symbol_table);
-
         // reduction errort
         {
-            errort = self.reduction_type(errort)?;
             let mut catch_err = catch_err_mutex.lock().unwrap();
+            let errort = self.interface_throwable();
             catch_err.type_ = errort;
         }
 
@@ -2123,6 +2667,37 @@ impl<'a> Typesys<'a> {
         Ok(hasher.finish())
     }
 
+    fn find_impl_call_ident(&mut self, impl_symbol_name: String, impl_args: Vec<Type>, select_left_type: &Type) -> Result<(String, NodeId), String> {
+        // 定位 scope_id
+        let global_symbol_option = self.symbol_table.find_global_symbol(&impl_symbol_name);
+        let module_scope_id = if let Some(global_symbol) = global_symbol_option {
+            global_symbol.defined_in
+        } else {
+            // 直接使用 global scope id 进行测试？应该问题不大, 后面还会报错
+            self.symbol_table.global_scope_id
+        };
+
+        // 如果有泛型参数,需要处理hash
+        if impl_args.len() > 0 {
+            // 基于 arg 计算 unique hash
+            let arg_hash = self.generics_impl_args_hash(&impl_args).map_err(|e| e.message)?;
+
+            let impl_symbol_name_with_hash = format_generics_ident(impl_symbol_name.clone(), arg_hash);
+
+            // find by hash
+            if let Some(symbol_id) = self.symbol_table.find_symbol_id(&impl_symbol_name_with_hash, module_scope_id) {
+                return Ok((impl_symbol_name_with_hash, symbol_id));
+            }
+        }
+
+        // 直接通过 impl_symbol_name 不携带 hash
+        if let Some(symbol_id) = self.symbol_table.find_symbol_id(&impl_symbol_name, module_scope_id) {
+            return Ok((impl_symbol_name, symbol_id));
+        }
+
+        return Err(format!("type '{}' not impl fn'{}'", select_left_type, impl_symbol_name));
+    }
+
     fn impl_call_rewrite(&mut self, call: &mut AstCall, start: usize, end: usize) -> Result<bool, AnalyzerError> {
         // 获取select表达式
         let AstNode::SelectExpr(select_left, key) = &mut call.left.node.clone() else {
@@ -2133,9 +2708,9 @@ impl<'a> Typesys<'a> {
         let select_left_type = self.infer_right_expr(select_left, Type::default())?;
 
         // 解构类型判断
-        let select_left_type = if matches!(select_left_type.kind, TypeKind::Ptr(_) | TypeKind::RawPtr(_)) {
+        let select_left_type = if matches!(select_left_type.kind, TypeKind::Ptr(_) | TypeKind::Rawptr(_)) {
             match &select_left_type.kind {
-                TypeKind::Ptr(value_type) | TypeKind::RawPtr(value_type) => *value_type.clone(),
+                TypeKind::Ptr(value_type) | TypeKind::Rawptr(value_type) => *value_type.clone(),
                 _ => unreachable!(),
             }
         } else {
@@ -2149,57 +2724,66 @@ impl<'a> Typesys<'a> {
             }
         }
 
-        // 获取impl标识符和参数, 如果 impl_ident 是 string/int 这样的内置类型，其实没有注册到符号表的
-        // 所以 impl_symbol_id 也是 0, 原则上也用不到这个 impl_symbol_id, 直接在 global scope 中查找即可
-        let (impl_ident, _, impl_args) = select_left_type._impl.clone();
+        // 比如 int? 转换为 union 时就不存在 ident
+        if select_left_type.ident.is_empty() {
+            return Ok(false);
+        }
+
+        let mut impl_ident = select_left_type.ident.clone();
+        let mut impl_args = select_left_type.args.clone();
 
         // string.len() -> string_len
         // person_t.set_age() -> person_t_set_age()
         // register_global_symbol 中进行类 impl_foramt
-        let impl_symbol_name = format_impl_ident(impl_ident.clone(), key.clone());
-        let global_symbol_option = self.symbol_table.find_global_symbol(&impl_symbol_name);
-        let module_scope_id = if let Some(global_symbol) = global_symbol_option {
-            global_symbol.defined_in
-        } else {
-            return Err(AnalyzerError {
-                start,
-                end,
-                message: format!("impl '{}' not found", impl_symbol_name),
-            });
-        };
+        let mut impl_symbol_name = format_impl_ident(impl_ident.clone(), key.clone());
 
-        // 如果有泛型参数,需要处理hash
-        let (final_symbol_name, symbol_id) = if !impl_args.is_empty() {
-            // 基于 arg 计算 unique hash
-            let arg_hash = self.generics_impl_args_hash(&impl_args)?;
+        let (final_symbol_name, symbol_id) = match self.find_impl_call_ident(impl_symbol_name.clone(), impl_args.clone(), &select_left_type) {
+            Ok(r) => r,
+            Err(_e) => {
+                // idetn to default kind(need args)
+                let mut builtin_type = select_left_type.clone();
+                builtin_type.ident = "".to_string();
+                builtin_type.ident_kind = TypeIdentKind::Unknown;
+                builtin_type.args = Vec::new();
+                builtin_type.status = ReductionStatus::Undo;
+                builtin_type = self.reduction_type(builtin_type)?;
 
-            let impl_symbol_name_with_hash = format_generics_ident(impl_symbol_name.clone(), arg_hash);
+                // builtin 测试
+                if builtin_type.ident.len() > 0 && builtin_type.ident_kind == TypeIdentKind::Builtin {
+                    impl_ident = builtin_type.ident.clone();
+                    impl_args = builtin_type.args.clone();
+                    impl_symbol_name = format_impl_ident(impl_ident.clone(), key.clone());
 
-            // find by hash
-            if let Some(symbol_id) = self.symbol_table.find_symbol_id(&impl_symbol_name_with_hash, module_scope_id) {
-                (impl_symbol_name_with_hash, symbol_id)
-            } else {
-                // 直接通过 impl_symbol_name 不携带 hash
-                if let Some(symbol_id) = self.symbol_table.find_symbol_id(&impl_symbol_name, module_scope_id) {
-                    (impl_symbol_name, symbol_id)
+                    // 直接返回第二次查找的结果，成功时返回结果，失败时返回错误
+                    match self.find_impl_call_ident(impl_symbol_name.clone(), impl_args.clone(), &select_left_type) {
+                        Ok(result) => {
+                            // change self arg 类型
+                            match &mut select_left.type_.kind {
+                                TypeKind::Ptr(value_type) | TypeKind::Rawptr(value_type) => {
+                                    *value_type = Box::new(builtin_type);
+                                }
+                                _ => {
+                                    select_left.type_ = builtin_type;
+                                }
+                            }
+
+                            result
+                        }
+                        Err(_) => {
+                            return Err(AnalyzerError {
+                                start,
+                                end,
+                                message: format!("type '{}' no impl fn '{}'", select_left_type, key),
+                            });
+                        }
+                    }
                 } else {
                     return Err(AnalyzerError {
-                        start: call.left.start,
-                        end: call.left.end,
-                        message: format!("type '{}' no impl fn '{}({})':", select_left_type, key, impl_symbol_name),
+                        start,
+                        end,
+                        message: format!("type '{}' no impl fn '{}'", select_left_type, key),
                     });
                 }
-            }
-        } else {
-            // find global scope symbol
-            if let Some(symbol_id) = self.symbol_table.find_symbol_id(&impl_symbol_name, module_scope_id) {
-                (impl_symbol_name, symbol_id)
-            } else {
-                return Err(AnalyzerError {
-                    start: call.left.start,
-                    end: call.left.end,
-                    message: format!("type '{}' no impl fn '{}'", select_left_type, key),
-                });
             }
         };
 
@@ -2237,7 +2821,7 @@ impl<'a> Typesys<'a> {
         let (mut args, generics_args, spread) = call_data;
         let mut table = HashMap::new();
 
-        let temp_fndef = temp_fndef_mutex.lock().unwrap();
+        let mut temp_fndef = temp_fndef_mutex.lock().unwrap();
 
         assert!(temp_fndef.is_generics);
 
@@ -2246,6 +2830,7 @@ impl<'a> Typesys<'a> {
             assert!(!generics_args.is_empty());
         }
 
+        // call generics args 为 null 说明 caller 没有传递泛型 args, 此时需要根据参数进行泛型推导
         if generics_args.is_empty() {
             // 保存当前的类型参数栈
             let stash_stack = self.generics_args_stack.clone();
@@ -2286,11 +2871,14 @@ impl<'a> Typesys<'a> {
             }
 
             // 检查所有泛型参数是否都已推导
-            if let Some(generics_params) = &temp_fndef.generics_params {
+            if let Some(generics_params) = &mut temp_fndef.generics_params {
                 for param in generics_params {
-                    if !table.contains_key(&param.ident) {
-                        return Err(format!("generics param {} infer failed", param.ident));
-                    }
+                    let arg_type = match table.get(&param.ident) {
+                        Some(arg_type) => arg_type,
+                        None => return Err(format!("cannot infer generics param '{}'", param.ident)),
+                    };
+
+                    self.generics_constrains_check(param, arg_type)?
                 }
             }
 
@@ -2422,19 +3010,19 @@ impl<'a> Typesys<'a> {
             self.generics_args_stack.push(special_fn.generics_args_table.clone().unwrap());
         }
 
-        self.infer_fn_decl(special_fn_mutex.clone()).map_err(|e| e.message)?;
+        self.infer_fn_decl(special_fn_mutex.clone(), Type::default()).map_err(|e| e.message)?;
 
         self.worklist.push(special_fn_mutex.clone());
 
         // handle child
         {
             let special_fn = special_fn_mutex.lock().unwrap();
-            dbg!("special fn to work list, will infer body", &special_fn.symbol_name, &special_fn.type_);
+            // dbg!("special fn to work list, will infer body", &special_fn.symbol_name, &special_fn.type_);
 
             for child in special_fn.local_children.iter() {
                 // local fn 定义在 global fn 中，所以其 define_in != global_fn 的 scope_id
                 self.rewrite_local_fndef(child.clone());
-                self.infer_fn_decl(child.clone()).map_err(|e| e.message)?;
+                self.infer_fn_decl(child.clone(), Type::default()).map_err(|e| e.message)?;
             }
         }
 
@@ -2574,6 +3162,14 @@ impl<'a> Typesys<'a> {
             self.errors_push(call.left.start, call.left.end, format!("not enough args"));
         }
 
+        if call.spread && target_type_fn.rest && call.args.len() != target_type_fn.param_types.len() {
+            self.errors_push(
+                call.left.start,
+                call.left.end,
+                format!("spread operator '...' requires a function with rest parameters"),
+            );
+        }
+
         let call_args_len = call.args.len();
         for (i, arg) in call.args.iter_mut().enumerate() {
             let is_spread = call.spread && (i == call_args_len - 1);
@@ -2586,21 +3182,41 @@ impl<'a> Typesys<'a> {
         }
     }
 
-    pub fn infer_call(&mut self, call: &mut AstCall, target_type: Type, start: usize, end: usize) -> Result<Type, AnalyzerError> {
-        if call.left.err {
-            return Ok(Type::error());
+    pub fn infer_call_left(&mut self, call: &mut AstCall, target_type: Type, start: usize, end: usize) -> Result<TypeKind, AnalyzerError> {
+        // --------------------------------------------interface call handle----------------------------------------------------------
+        if let AstNode::SelectExpr(select_left, key) = &mut call.left.node {
+            let select_left_type = self.infer_right_expr(select_left, Type::default())?;
+
+            if let TypeKind::Interface(elements) = &select_left_type.kind {
+                // 在接口中查找对应的方法
+                for element in elements {
+                    if let TypeKind::Fn(fn_type) = &element.kind {
+                        if fn_type.name == *key {
+                            return Ok(element.kind.clone());
+                        }
+                    }
+                }
+
+                return Err(AnalyzerError {
+                    start,
+                    end,
+                    message: format!("interface '{}' not declare '{}' fn", select_left_type.ident, key),
+                });
+            }
         }
 
-        if matches!(call.left.node, AstNode::SelectExpr(_, _)) {
+        // --------------------------------------------impl type handle----------------------------------------------------------
+        if let AstNode::SelectExpr(_, _) = &mut call.left.node {
             let _is_rewrite = self.impl_call_rewrite(call, start, end)?;
         }
 
+        // --------------------------------------------generics handle----------------------------------------------------------
         if let AstNode::Ident(ident, symbol_id) = &mut call.left.node {
             if *symbol_id == 0 {
                 return Err(AnalyzerError {
-                    start: call.left.start,
-                    end: call.left.end,
-                    message: format!("call left ident '{}' symbol_id is none", ident),
+                    start,
+                    end,
+                    message: format!("symbol '{}' not found", ident),
                 });
             }
 
@@ -2613,10 +3229,12 @@ impl<'a> Typesys<'a> {
                     match result {
                         Some(special_fn) => {
                             let special_fn = special_fn.lock().unwrap();
+
+                            // ident 重写
                             *ident = special_fn.symbol_name.clone();
                             *symbol_id = special_fn.symbol_id; // change call ident actual symbol_id
                         }
-                        None => {} // local fn 或者 no generics param 都不是 generics fn
+                        None => {} // local fn 或者 no generics param 都不是 generics fn, 此时什么都不做
                     }
                 }
                 Err(e) => {
@@ -2625,8 +3243,10 @@ impl<'a> Typesys<'a> {
             };
         }
 
+        // 推导左侧表达式类型
         let left_type = self.infer_right_expr(&mut call.left, Type::default())?;
 
+        // 确保是函数类型
         if !matches!(left_type.kind, TypeKind::Fn(..)) {
             return Err(AnalyzerError {
                 start,
@@ -2635,11 +3255,21 @@ impl<'a> Typesys<'a> {
             });
         }
 
-        let TypeKind::Fn(type_fn) = left_type.kind else { unreachable!() };
+        Ok(left_type.kind)
+    }
+
+    pub fn infer_call(&mut self, call: &mut AstCall, target_type: Type, start: usize, end: usize, check_errable: bool) -> Result<Type, AnalyzerError> {
+        if call.left.err {
+            return Ok(Type::error());
+        }
+
+        let fn_kind: TypeKind = self.infer_call_left(call, target_type, start, end)?;
+
+        let TypeKind::Fn(type_fn) = fn_kind else { unreachable!() };
         self.infer_call_args(call, *type_fn.clone());
         call.return_type = type_fn.return_type.clone();
 
-        if type_fn.errable {
+        if type_fn.errable && check_errable {
             // 当前 fn 必须允许 is_errable 或者当前位于 be_caught 中
             let current_fn = self.current_fn_mutex.lock().unwrap();
             if self.be_caught == 0 && !current_fn.is_errable {
@@ -2750,10 +3380,23 @@ impl<'a> Typesys<'a> {
         self.break_target_types.pop();
     }
 
+    pub fn interface_throwable(&mut self) -> Type {
+        let mut result = Type::ident_new("throwable".to_string(), TypeIdentKind::Interface);
+
+        // find symbol id from global
+        let symbol_id = self.symbol_table.find_symbol_id("throwable", self.symbol_table.global_scope_id).unwrap();
+        result.symbol_id = symbol_id;
+        return self.reduction_type(result).unwrap();
+    }
+
     pub fn infer_stmt(&mut self, stmt: &mut Box<Stmt>) -> Result<(), AnalyzerError> {
         match &mut stmt.node {
             AstNode::Fake(expr) => {
                 self.infer_right_expr(expr, Type::default())?;
+                if matches!(expr.node, AstNode::Match(..)) && expr.type_.kind.is_unknown() {
+                    expr.type_ = Type::new(TypeKind::Void);
+                    expr.target_type = Type::new(TypeKind::Void);
+                }
             }
             AstNode::VarDef(var_decl_mutex, expr) => {
                 self.infer_vardef(var_decl_mutex, expr)?;
@@ -2775,7 +3418,7 @@ impl<'a> Typesys<'a> {
             }
             AstNode::Assign(left, right) => match self.infer_left_expr(left) {
                 Ok(left_type) => {
-                    if !matches!(left_type.kind, TypeKind::Param(..)) && matches!(left_type.kind, TypeKind::Void) {
+                    if left_type.ident_kind != TypeIdentKind::Param && left_type.kind == TypeKind::Void {
                         return Err(AnalyzerError {
                             start: left.start,
                             end: left.end,
@@ -2791,7 +3434,7 @@ impl<'a> Typesys<'a> {
             },
             AstNode::FnDef(_) => {}
             AstNode::Call(call) => {
-                self.infer_call(call, Type::new(TypeKind::Void), stmt.start, stmt.end)?;
+                self.infer_call(call, Type::new(TypeKind::Void), stmt.start, stmt.end, true)?;
             }
             AstNode::TryCatch(try_body, catch_err_mutex, catch_body) => {
                 self.infer_try_catch(try_body, catch_err_mutex, catch_body)?;
@@ -2802,7 +3445,7 @@ impl<'a> Typesys<'a> {
             AstNode::Select(cases, _has_default, _send_count, _recv_count) => {
                 for case in cases.iter_mut() {
                     if let Some(on_call) = &mut case.on_call {
-                        if let Err(e) = self.infer_call(on_call, Type::default(), case.start, case.end) {
+                        if let Err(e) = self.infer_call(on_call, Type::default(), case.start, case.end, true) {
                             self.errors_push(e.start, e.end, e.message);
                         }
                     }
@@ -2887,6 +3530,8 @@ impl<'a> Typesys<'a> {
                             ),
                         );
                     }
+                    let target_type = self.interface_throwable();
+                    self.infer_right_expr(expr, target_type)?;
                 }
             }
             AstNode::Return(expr_option) => {
@@ -2928,7 +3573,7 @@ impl<'a> Typesys<'a> {
                     }
                 }
             }
-            AstNode::TypeAlias(type_alias_mutex) => {
+            AstNode::Typedef(type_alias_mutex) => {
                 self.rewrite_type_alias(type_alias_mutex);
             }
             _ => {}
@@ -2999,16 +3644,16 @@ impl<'a> Typesys<'a> {
     }
 
     pub fn type_compare_with_generics(&mut self, dst: &Type, src: &Type, generics_param_table: &mut HashMap<String, Type>) -> bool {
-        let mut dst = dst.clone();
+        let dst = dst.clone();
         if dst.err || src.err {
             return false;
         }
 
         // 检查类型状态
-        if !matches!(dst.kind, TypeKind::Param(..)) {
+        if !Type::ident_is_parm(&dst) {
             assert!(dst.status == ReductionStatus::Done, "type '{}' not reduction", dst);
         }
-        if !matches!(src.kind, TypeKind::Param(..)) {
+        if !Type::ident_is_parm(&src) {
             assert!(src.status == ReductionStatus::Done, "type '{}' not reduction", src);
         }
 
@@ -3017,18 +3662,25 @@ impl<'a> Typesys<'a> {
             "type unknown cannot infer"
         );
 
-        // all_t 可以匹配任何类型
-        if matches!(dst.kind, TypeKind::AllT) {
+        if dst.ident_kind == TypeIdentKind::Builtin && dst.ident == "all_t".to_string() {
             return true;
         }
 
         // fn_t 可以匹配所有函数类型
-        if matches!(dst.kind, TypeKind::FnT) && matches!(src.kind, TypeKind::Fn(..)) {
+        if dst.ident_kind == TypeIdentKind::Builtin && dst.ident == "fn_t" && matches!(src.kind, TypeKind::Fn(..)) {
             return true;
         }
 
-        // raw_ptr<t> 可以赋值为 null 以及 ptr<t>
-        if let TypeKind::RawPtr(dst_value_type) = &dst.kind {
+        if dst.ident_kind == TypeIdentKind::Builtin && dst.ident == "integer_t" && Type::is_integer(&src.kind) {
+            return true;
+        }
+
+        if dst.ident_kind == TypeIdentKind::Builtin && dst.ident == "floater_t" && Type::is_float(&src.kind) {
+            return true;
+        }
+
+        // rawptr<t> 可以赋值为 null 以及 ptr<t>
+        if let TypeKind::Rawptr(dst_value_type) = &dst.kind {
             match &src.kind {
                 TypeKind::Null => return true,
                 TypeKind::Ptr(src_value_type) => {
@@ -3039,17 +3691,19 @@ impl<'a> Typesys<'a> {
         }
 
         // 处理泛型参数
-        if let TypeKind::Param(param_ident) = &dst.kind {
+        if Type::ident_is_parm(&dst) {
             assert!(src.status == ReductionStatus::Done);
             // let generics_param_table = generics_param_table.as_mut().unwrap();
-
-            if let Some(target_type) = generics_param_table.get(param_ident) {
-                dst = target_type.clone();
+            let param_ident = dst.ident.clone();
+            if let Some(_target_type) = generics_param_table.get(&param_ident) {
+                // dst = _target_type.clone();
             } else {
                 let target_type = src.clone();
                 generics_param_table.insert(param_ident.clone(), target_type.clone());
-                dst = target_type;
+                // dst = _target_type;
             }
+
+            return true;
         }
 
         // 如果类型不同则返回false
@@ -3057,9 +3711,34 @@ impl<'a> Typesys<'a> {
             return false;
         }
 
+        // 即使 reduction 后，也需要通过 ident kind 进行判断, 其中 union_type 不受 type def 限制, TODO 无法区分这是 type_compare 还是 generics param handle!
+        if dst.ident_kind == TypeIdentKind::Def && !matches!(dst.kind, TypeKind::Union(..)) {
+            assert!(!dst.ident.is_empty());
+            if src.ident.is_empty() {
+                return false;
+            }
+
+            if dst.ident != src.ident {
+                return false;
+            }
+
+            // ident 相同时也应该继续推导原始 kind 比较推导
+        }
+        if src.ident_kind == TypeIdentKind::Def && !matches!(src.kind, TypeKind::Union(..)) {
+            assert!(!src.ident.is_empty());
+            if dst.ident.is_empty() {
+                return false;
+            }
+
+            if dst.ident != src.ident {
+                return false;
+            }
+            // ident 相同时也应该继续推导原始 kind 比较推导
+        }
+
         // 根据不同类型进行比较
         match (&dst.kind, &src.kind) {
-            (TypeKind::Union(left_any, left_types), TypeKind::Union(right_any, right_types)) => {
+            (TypeKind::Union(left_any, _, left_types), TypeKind::Union(right_any, _, right_types)) => {
                 if *left_any {
                     return true;
                 }
@@ -3123,7 +3802,7 @@ impl<'a> Typesys<'a> {
                     .all(|(left, right)| left.key == right.key && self.type_compare_with_generics(&left.type_, &right.type_, generics_param_table))
             }
 
-            (TypeKind::Ptr(left_value), TypeKind::Ptr(right_value)) | (TypeKind::RawPtr(left_value), TypeKind::RawPtr(right_value)) => {
+            (TypeKind::Ptr(left_value), TypeKind::Ptr(right_value)) | (TypeKind::Rawptr(left_value), TypeKind::Rawptr(right_value)) => {
                 self.type_compare_with_generics(left_value, right_value, generics_param_table)
             }
 
@@ -3132,53 +3811,85 @@ impl<'a> Typesys<'a> {
         }
     }
 
-    pub fn infer_fn_decl(&mut self, fndef_mutex: Arc<Mutex<AstFnDef>>) -> Result<Type, AnalyzerError> {
-        // 如果已经完成类型推导，直接返回
-        let mut fndef = fndef_mutex.lock().unwrap();
+    pub fn infer_fn_decl(&mut self, fndef_mutex: Arc<Mutex<AstFnDef>>, target_type: Type) -> Result<Type, AnalyzerError> {
+        let fndef = {
+            // 如果已经完成类型推导，直接返回
+            let mut fndef = fndef_mutex.lock().unwrap();
+            if fndef.type_.kind.is_exist() && fndef.type_.status == ReductionStatus::Done {
+                if target_type.kind.is_exist() {
+                    fndef.type_.ident = target_type.ident.clone();
+                    fndef.type_.ident_kind = target_type.ident_kind.clone();
+                    fndef.type_.args = target_type.args.clone();
+                }
 
-        if fndef.type_.kind.is_exist() && fndef.type_.status == ReductionStatus::Done {
-            return Ok(fndef.type_.clone());
-        }
+                return Ok(fndef.type_.clone());
+            }
+
+            fndef.clone()
+        };
 
         // 对返回类型进行还原
-        match self.reduction_type(fndef.return_type.clone()) {
+        let return_type = match self.reduction_type(fndef.return_type) {
             Ok(return_type) => {
-                fndef.return_type = return_type.clone();
+                // mutex
+                {
+                    let mut temp_fn = fndef_mutex.lock().unwrap();
+                    temp_fn.return_type = return_type.clone();
+                }
+
+                return_type
             }
             Err(e) => {
                 return Err(e);
             }
-        }
+        };
 
         // 处理参数类型
         let mut param_types = Vec::new();
 
         for (i, param_mutex) in fndef.params.iter().enumerate() {
-            let mut param = param_mutex.lock().unwrap();
-            dbg!(&param.type_);
+            let param_type = {
+                let temp = param_mutex.lock().unwrap();
+                temp.type_.clone()
+            };
 
             // 对参数类型进行还原
-            param.type_ = self.reduction_type(param.type_.clone())?;
+            let mut param_type = self.reduction_type(param_type)?;
+            assert!(param_type.kind != TypeKind::Ident);
 
             // 为什么要在这里进行 ptr of, 只有在 infer 之后才能确定 alias 的具体类型，从而进一步判断是否需要 ptrof
-            if fndef.impl_type.kind.is_exist() && i == 0 && param.type_.is_stack_impl() {
-                param.type_ = Type::ptr_of(param.type_.clone());
+            if fndef.impl_type.kind.is_exist() && i == 0 && param_type.is_stack_impl() {
+                param_type = Type::ptr_of(param_type);
             }
 
-            param_types.push(param.type_.clone());
+            {
+                let mut temp = param_mutex.lock().unwrap();
+                temp.type_ = param_type.clone();
+            }
+
+            param_types.push(param_type);
         }
 
         // type done
-        let result = Type::new(TypeKind::Fn(Box::new(TypeFn {
+        let mut result = Type::new(TypeKind::Fn(Box::new(TypeFn {
+            return_type,
             name: fndef.fn_name.clone(),
             tpl: fndef.is_tpl,
             errable: fndef.is_errable,
             rest: fndef.rest_param,
             param_types,
-            return_type: fndef.return_type.clone(),
         })));
 
-        fndef.type_ = result.clone();
+        if target_type.kind.is_exist() {
+            result.ident = target_type.ident.clone();
+            result.ident_kind = target_type.ident_kind.clone();
+            result.args = target_type.args.clone();
+        }
+
+        {
+            let mut temp_fn = fndef_mutex.lock().unwrap();
+            temp_fn.type_ = result.clone();
+        }
 
         Ok(result)
     }
@@ -3217,7 +3928,7 @@ impl<'a> Typesys<'a> {
     /**
      * rewrite 的核心目的就是如果当前 type 定义在泛型函数作用域中，那么需要对其进行泛型的 special
      */
-    pub fn rewrite_type_alias(&mut self, type_alias_mutex: &Arc<Mutex<TypeAliasStmt>>) {
+    pub fn rewrite_type_alias(&mut self, type_alias_mutex: &Arc<Mutex<TypedefStmt>>) {
         // 如果不存在 params_hash 表示当前 fndef 不存在基于泛型的重写，所以 alias 也不需要进行重写
         if let Some(hash) = self.current_fn_mutex.lock().unwrap().generics_args_hash {
             // alias.ident@hash
@@ -3230,7 +3941,7 @@ impl<'a> Typesys<'a> {
 
             match self.symbol_table.define_symbol_in_scope(
                 type_alias.ident.clone(),
-                SymbolKind::TypeAlias(type_alias_mutex.clone()),
+                SymbolKind::Type(type_alias_mutex.clone()),
                 type_alias.symbol_start,
                 original_symbol_defined_in,
             ) {
@@ -3350,38 +4061,316 @@ impl<'a> Typesys<'a> {
         return true;
     }
 
-    fn infer_generics_param_constraints(&mut self, impl_type: Type, generics_params: &mut Vec<GenericsParam>) -> Result<(), String> {
-        if let TypeKind::Alias(alias) = impl_type.kind {
-            // 这里的 symbol_id 是 type alias 的 symbol_id
-            let (impl_ident, symbol_id, _impl_args) = impl_type._impl;
-            assert!(alias.ident == impl_ident);
+    fn generics_constraints_compare(&mut self, left: &GenericsParam, right: &GenericsParam) -> bool {
+        if left.constraints.1 {
+            // any can match any type
+            return true;
+        }
 
-            let symbol = self.symbol_table.get_symbol(symbol_id).unwrap();
+        // any
+        if right.constraints.1 && !left.constraints.1 {
+            return false;
+        }
 
-            // symbol.kind 为 TypeAlias
-            if let SymbolKind::TypeAlias(type_alias_mutex) = symbol.kind.clone() {
-                let mut type_alias = type_alias_mutex.lock().unwrap();
+        // and
+        if right.constraints.2 && !left.constraints.2 {
+            return false;
+        }
 
-                // params.length == generics_params.length
-                if type_alias.params.len() != generics_params.len() {
-                    return Err(format!("type alias '{}' params length mismatch", impl_ident));
+        // or
+        if right.constraints.3 && !left.constraints.3 {
+            return false;
+        }
+
+        // 创建一个标记数组，用于标记left中的类型是否已经匹配
+        // 遍历right中的类型，确保每个类型都存在于left中
+        for right_type in &right.constraints.0 {
+            let mut type_found = false;
+
+            for left_type in &left.constraints.0 {
+                if self.type_compare(left_type, right_type) {
+                    type_found = true;
+                    break;
                 }
+            }
 
-                for (i, type_generics_param) in type_alias.params.iter_mut().enumerate() {
-                    if !type_generics_param.constraints.0 {
-                        for constraint in &mut type_generics_param.constraints.1 {
-                            *constraint = self.reduction_type(constraint.clone()).map_err(|e| e.message)?;
+            if !type_found {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    /**
+     * 为了能够和 impl 中声明的 fn 进行 compare, 需要将 fn 将 self 参数暂时去除, 并且不改变 fndef 中的 ident/return_type/type 等
+     */
+    fn infer_impl_fn_decl(&mut self, fndef: &AstFnDef) -> Result<Type, AnalyzerError> {
+        assert!(fndef.impl_type.kind.is_exist());
+
+        let mut type_fn = TypeFn {
+            name: fndef.fn_name.clone(),
+            tpl: fndef.is_tpl,
+            errable: fndef.is_errable,
+            rest: fndef.rest_param,
+            param_types: Vec::new(),
+            return_type: self.reduction_type(fndef.return_type.clone())?,
+        };
+
+        // 跳过 self, self index = 1
+        for (i, param) in fndef.params.iter().enumerate() {
+            if i == 0 {
+                continue;
+            }
+            let mut param_type = {
+                let mut temp_param = param.lock().unwrap();
+                temp_param.type_.clone()
+            };
+
+            param_type = self.reduction_type(param_type)?;
+
+            type_fn.param_types.push(param_type.clone());
+
+            {
+                let mut temp_param = param.lock().unwrap();
+                temp_param.type_ = param_type.clone();
+            }
+        }
+
+        Ok(Type::new(TypeKind::Fn(Box::new(type_fn))))
+    }
+
+    fn check_typedef_impl(&mut self, impl_interface: &Type, typedef_ident: String, typedef_stmt: &TypedefStmt) -> Result<(), String> {
+        // 确保接口类型正确
+        assert!(impl_interface.ident_kind == TypeIdentKind::Interface);
+        assert!(impl_interface.status == ReductionStatus::Done);
+
+        // 获取接口中定义的所有方法
+        if let TypeKind::Interface(elements) = &impl_interface.kind {
+            // 检查接口中的每个方法是否被实现
+            for expect_type in elements {
+                assert!(expect_type.status == ReductionStatus::Done);
+
+                if let TypeKind::Fn(interface_fn_type) = &expect_type.kind {
+                    // 构造实现方法的标识符
+                    let fn_ident = format_impl_ident(typedef_ident.clone(), interface_fn_type.name.clone());
+
+                    // 从 typedef_stmt 的 method_table 中查找对应的方法实现
+                    let ast_fndef_option = typedef_stmt.method_table.get(&fn_ident);
+
+                    if ast_fndef_option.is_none() {
+                        return Err(format!(
+                            "type '{}' not impl fn '{}' for interface '{}'",
+                            typedef_ident, interface_fn_type.name, impl_interface.ident
+                        ));
+                    }
+
+                    let ast_fndef = {
+                        let temp = ast_fndef_option.unwrap().lock().unwrap();
+                        temp.clone()
+                    };
+
+                    // 获取实现方法的类型
+                    let actual_type = self.infer_impl_fn_decl(&ast_fndef).map_err(|e| e.message)?;
+
+                    // 比较接口方法类型和实现方法类型是否匹配
+                    // 注意：实现方法的第一个参数是 self，而接口方法没有
+                    if !self.type_compare(expect_type, &actual_type) {
+                        return Err(format!(
+                            "the fn '{}' of type '{}' mismatch interface '{}'",
+                            interface_fn_type.name, typedef_ident, impl_interface.ident
+                        ));
+                    }
+                } else {
+                    return Err(format!("interface element must be function type"));
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    fn generics_constrains_check(&mut self, param: &mut GenericsParam, src: &Type) -> Result<(), String> {
+        let len = param.constraints.0.len();
+        for constraint in &mut param.constraints.0 {
+            match self.reduction_type(constraint.clone()) {
+                Ok(t) => *constraint = t,
+                Err(e) => return Err(e.message),
+            }
+
+            if len == 1 {
+                if matches!(constraint.kind, TypeKind::Interface(..)) {
+                    param.constraints.2 = true;
+                } else if !matches!(constraint.kind, TypeKind::Union(..)) {
+                    param.constraints.3 = true;
+                }
+            }
+
+            if param.constraints.2 {
+                if !matches!(constraint.kind, TypeKind::Interface(..)) {
+                    return Err(format!("only type 'interface' can be combination with '&'"));
+                }
+            } else if param.constraints.3 {
+                if matches!(constraint.kind, TypeKind::Union(..)) {
+                    return Err(format!("cannot use type 'union' combination"));
+                }
+                if matches!(constraint.kind, TypeKind::Interface(..)) {
+                    return Err(format!("cannot use type 'interface' combination"));
+                }
+            }
+        }
+
+        if param.constraints.1 {
+            // any
+            return Ok(());
+        }
+
+        // 处理 OR 约束
+        if param.constraints.3 {
+            for constraint in &param.constraints.0 {
+                if self.type_compare(constraint, src) {
+                    return Ok(());
+                }
+            }
+            return Err(format!("type '{}' does not match any of the constraints", src));
+        }
+
+        // 处理接口约束 (AND)
+        if param.constraints.2 {
+            for constraint in &param.constraints.0 {
+                if let TypeKind::Interface(elements) = &constraint.kind {
+                    let temp_target_type = if matches!(src.kind, TypeKind::Ptr(_) | TypeKind::Rawptr(_)) {
+                        match &src.kind {
+                            TypeKind::Ptr(value_type) | TypeKind::Rawptr(value_type) => *value_type.clone(),
+                            _ => unreachable!(),
                         }
+                    } else {
+                        src.clone()
+                    };
+                    assert!(!temp_target_type.ident.is_empty());
+
+                    // get symbol from symbol table
+                    let symbol = match self.symbol_table.find_global_symbol(&temp_target_type.ident) {
+                        Some(s) => s,
+                        None => {
+                            // 如果是内置类型且接口没有任何方法要求,则跳过检查
+                            if elements.len() > 0 {
+                                return Err(format!("type '{}' not impl '{}' interface", temp_target_type.ident, constraint));
+                            }
+                            continue;
+                        }
+                    };
+
+                    if let SymbolKind::Type(typedef_mutex) = symbol.kind.clone() {
+                        let typedef = typedef_mutex.lock().unwrap();
+                        let mut found = false;
+                        for interface in &typedef.impl_interfaces {
+                            assert!(interface.ident_kind == TypeIdentKind::Interface);
+
+                            // str check
+                            if interface.ident == constraint.ident {
+                                found = true;
+                                break;
+                            }
+                        }
+
+                        // 禁止制鸭子类型
+                        if !found {
+                            return Err(format!("type '{}' not impl '{}' interface", temp_target_type.ident, constraint));
+                        }
+
+                        self.check_typedef_impl(constraint, temp_target_type.ident.clone(), &typedef)?;
+                    } else {
+                        unreachable!();
                     }
+                } else {
+                    unreachable!();
+                }
+            }
+            return Ok(());
+        }
 
-                    let impl_generics_param = &generics_params[i];
+        // union check
+        assert!(param.constraints.0.len() == 1);
+        let union_constraint = param.constraints.0[0].clone();
+        if let TypeKind::Union(any, _, elements) = union_constraint.kind {
+            if !self.union_type_contains(&(any, elements), src) {
+                return Err(format!("type '{}' does not match any of the constraints", src));
+            }
+        } else {
+            unreachable!();
+        }
 
-                    if !self.type_union_compare(&type_generics_param.constraints, &impl_generics_param.constraints) {
-                        return Err(format!("type alias '{}' param constraint mismatch", impl_ident));
+        return Ok(());
+    }
+
+    fn infer_generics_param_constraints(&mut self, impl_type: Type, generics_params: &mut Vec<GenericsParam>) -> Result<(), String> {
+        assert!(impl_type.kind == TypeKind::Ident);
+        assert!(impl_type.ident_kind == TypeIdentKind::Def);
+
+        let impl_ident = impl_type.ident.clone();
+
+        let symbol_id = impl_type.symbol_id;
+        if symbol_id == 0 {
+            return Err(format!("type '{}' symbol not found", impl_ident));
+        }
+        let symbol = self
+            .symbol_table
+            .get_symbol(symbol_id)
+            .ok_or_else(|| format!("typedef {} not found", impl_ident))?;
+
+        let SymbolKind::Type(typedef_mutex) = symbol.kind.clone() else {
+            return Err(format!("symbol '{}' is not typedef", impl_ident));
+        };
+
+        let mut typedef = typedef_mutex.lock().unwrap();
+        // params.length == generics_params.length
+        if typedef.params.len() != generics_params.len() {
+            return Err(format!("typedef '{}' params length mismatch", impl_ident));
+        }
+
+        if generics_params.len() == 0 {
+            return Ok(());
+        }
+
+        for (i, type_generics_param) in &mut typedef.params.iter_mut().enumerate() {
+            // constraints
+            for constraint in &mut type_generics_param.constraints.0 {
+                *constraint = self.reduction_type(constraint.clone()).map_err(|e| e.message)?;
+            }
+
+            for constraint in type_generics_param.constraints.0.clone() {
+                if type_generics_param.constraints.0.len() == 1 {
+                    if matches!(constraint.kind, TypeKind::Interface(..)) {
+                        type_generics_param.constraints.2 = true; // and
+                    } else if !matches!(constraint.kind, TypeKind::Union(..)) {
+                        type_generics_param.constraints.3 = true; // or
                     }
                 }
-            } else {
-                return Err(format!("'{}' is not a type alias", impl_ident));
+
+                // 添加约束检查
+                if type_generics_param.constraints.2 {
+                    // 与组合(&)的情况
+                    if !matches!(constraint.kind, TypeKind::Interface(..)) {
+                        return Err(format!("only type 'interface' can be combination with '&'"));
+                    }
+                } else if type_generics_param.constraints.3 {
+                    // 或组合(|)的情况
+                    if matches!(constraint.kind, TypeKind::Union(..)) {
+                        return Err(format!("cannot use type 'union' combination"));
+                    }
+
+                    if matches!(constraint.kind, TypeKind::Interface(..)) {
+                        return Err(format!("cannot use type 'interface' combination"));
+                    }
+                }
+            }
+
+            let impl_generics_param = &mut generics_params[i];
+
+            let compare = self.generics_constraints_compare(&type_generics_param, &impl_generics_param);
+            if !compare {
+                return Err(format!("type '{}' param constraint mismatch", impl_ident));
             }
         }
 
@@ -3392,33 +4381,56 @@ impl<'a> Typesys<'a> {
      * 返回基于类型参数组合 hash 值, 从而可以实现简单的函数重载, impl_type 存在则说明这是基于 impl 的泛型函数
      */
     pub fn generics_constraints_product(&mut self, impl_type: Type, generics_params: &mut Vec<GenericsParam>) -> Result<Vec<u64>, String> {
-        let mut any_count = 0;
         let generics_params_len = generics_params.len();
+        let mut hash_list: Vec<u64> = Vec::new();
 
         for param in &mut *generics_params {
-            if param.constraints.0 {
-                any_count += 1;
-            } else {
-                for element_type in &mut param.constraints.1 {
-                    *element_type = self.reduction_type(element_type.clone()).map_err(|e| e.message)?;
+            // for temp in &mut param.constraints.0 {
+            //     *temp = self.reduction_type(temp.clone()).map_err(|e| e.message)?;
+            // }
+            let constraints_len = param.constraints.0.len();
+            for temp in &mut param.constraints.0 {
+                *temp = self.reduction_type(temp.clone()).map_err(|e| e.message)?;
+
+                if constraints_len == 1 {
+                    if matches!(temp.kind, TypeKind::Interface(..)) {
+                        param.constraints.2 = true; // and
+                    } else if !matches!(temp.kind, TypeKind::Union(..)) {
+                        param.constraints.3 = true; // or
+                    }
                 }
+
+                // 添加约束检查
+                if param.constraints.2 {
+                    // 与组合(&)的情况
+                    if !matches!(temp.kind, TypeKind::Interface(..)) {
+                        return Err(format!("only type 'interface' can be combination with '&'"));
+                    }
+                } else if param.constraints.3 {
+                    // 或组合(|)的情况
+                    if matches!(temp.kind, TypeKind::Union(..)) {
+                        return Err(format!("cannot use type 'union' combination"));
+                    }
+
+                    if matches!(temp.kind, TypeKind::Interface(..)) {
+                        return Err(format!("cannot use type 'interface' combination"));
+                    }
+                }
+            }
+
+            if param.constraints.1 {
+                // 存在 any 则无法进行具体数量的组合约束
+                return Ok(hash_list);
+            }
+
+            // and 表示这是 interface, 同样无法进行类型约束
+            if param.constraints.2 {
+                return Ok(hash_list);
             }
         }
 
-        if any_count != 0 && any_count != generics_params_len {
-            return Err("all generics params must have constraints or all none".to_string());
-        }
-
-        // 如果impl_type是类型别名，需要处理泛型参数约束
-        if matches!(impl_type.kind, TypeKind::Alias(..)) {
-            self.infer_generics_param_constraints(impl_type, generics_params)?;
-        }
-
-        let mut hash_list = Vec::new();
-
-        // 如果所有参数都是any，直接返回空列表
-        if any_count == generics_params_len {
-            return Ok(hash_list);
+        if Type::ident_is_def_or_alias(&impl_type) {
+            self.infer_generics_param_constraints(impl_type, generics_params)?
         }
 
         // 生成所有可能的类型组合
@@ -3434,7 +4446,7 @@ impl<'a> Typesys<'a> {
             hash_list.push(hash);
         }
 
-        Ok(hash_list)
+        return Ok(hash_list);
     }
 
     // 辅助方法：生成笛卡尔积
@@ -3449,7 +4461,7 @@ impl<'a> Typesys<'a> {
         } else {
             let param = &params[depth];
             // 遍历当前参数的所有可能类型
-            for element_type in &param.constraints.1 {
+            for element_type in &param.constraints.0 {
                 assert!(element_type.status == ReductionStatus::Done);
                 current_product[depth] = element_type.clone();
                 self.cartesian_product(params, depth + 1, current_product, result);
@@ -3479,12 +4491,12 @@ impl<'a> Typesys<'a> {
 
             // 不是泛型函数
             if !is_generics {
-                if let Err(e) = self.infer_fn_decl(fndef_mutex.clone()) {
+                if let Err(e) = self.infer_fn_decl(fndef_mutex.clone(), Type::default()) {
                     self.errors_push(e.start, e.end, e.message);
                 }
 
                 for child_fndef_mutex in local_children {
-                    if let Err(e) = self.infer_fn_decl(child_fndef_mutex) {
+                    if let Err(e) = self.infer_fn_decl(child_fndef_mutex, Type::default()) {
                         self.errors_push(e.start, e.end, e.message);
                     }
                 }
@@ -3531,7 +4543,11 @@ impl<'a> Typesys<'a> {
                                     Err(_e) => {
                                         // panic!("{}", e); // TODO 测试代码
                                         // 与次同时，可以进行泛型的冲突检测, 避免相同的类型约束重复声明
-                                        self.errors_push(fndef.start, fndef.end, format!("generics fn {} param constraint redeclared", fndef.symbol_name));
+                                        self.errors_push(
+                                            fndef.symbol_start,
+                                            fndef.symbol_end,
+                                            format!("generics fn {} param constraint redeclared", fndef.symbol_name),
+                                        );
                                     }
                                 }
                             }
@@ -3554,7 +4570,7 @@ impl<'a> Typesys<'a> {
             return;
         }
 
-        self.errors.push(AnalyzerError { start, end, message });
+        errors_push(self.module, AnalyzerError { start, end, message });
     }
 
     pub fn infer(&mut self) -> Vec<AnalyzerError> {

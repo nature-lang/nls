@@ -2,7 +2,7 @@ use log::debug;
 
 use crate::utils::format_global_ident;
 
-use super::common::{AstFnDef, TypeAliasStmt, VarDeclExpr};
+use super::common::{AstFnDef, TypedefStmt, VarDeclExpr};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
@@ -49,7 +49,7 @@ impl<T> Arena<T> {
 pub enum SymbolKind {
     Var(Arc<Mutex<VarDeclExpr>>), // 变量原始定义
     Fn(Arc<Mutex<AstFnDef>>),
-    TypeAlias(Arc<Mutex<TypeAliasStmt>>),
+    Type(Arc<Mutex<TypedefStmt>>),
 }
 
 // symbol table 可以同时处理多个文件的 scope, 存在一个 global scope 管理所有的全局 scope, 符号注册到 global scope 时，define_ident 需要携带 package_name 保证符号的唯一性
@@ -254,7 +254,7 @@ impl SymbolTable {
         let symbol = Symbol {
             ident: global_ident.clone(),
             kind,
-            defined_in: defined_in, // global ident 的 defined_in 指向 module scope id
+            defined_in, // global ident 的 defined_in 指向 module scope id
             is_local: false,
             pos,
             is_capture: false,

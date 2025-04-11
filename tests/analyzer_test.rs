@@ -14,6 +14,8 @@ fn test_rope() {
 
 #[tokio::test]
 async fn test_project() {
+    env_logger::init();
+
     let project_root = "/Users/weiwenhao/Code/nature-test";
 
     let mut project = Project::new(project_root.to_string()).await;

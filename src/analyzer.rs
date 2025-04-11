@@ -9,8 +9,8 @@ use std::path::Path;
 
 use crate::package::parse_package;
 use crate::project::{Module, DEFAULT_NATURE_ROOT};
-use crate::utils::{format_global_ident, format_impl_ident};
-use common::{AnalyzerError, AstNode, ImportStmt, PackageConfig, Stmt, Type};
+use crate::utils::{errors_push, format_global_ident};
+use common::{AnalyzerError, AstNode, ImportStmt, PackageConfig, Stmt};
 use lazy_static::lazy_static;
 use log::debug;
 use std::collections::HashSet;
@@ -269,7 +269,12 @@ pub fn module_unique_ident(root: &str, full_path: &str) -> String {
  * import 'xxx/xxx.n' 只支持相对于当前 源文件路径导入
  * import project.test.mod
  */
-pub fn analyze_import(project_root: String, package_config_mutex: &Arc<Mutex<Option<PackageConfig>>>, m: &mut Module, import: &mut ImportStmt) -> Result<(), AnalyzerError> {
+pub fn analyze_import(
+    project_root: String,
+    package_config_mutex: &Arc<Mutex<Option<PackageConfig>>>,
+    m: &mut Module,
+    import: &mut ImportStmt,
+) -> Result<(), AnalyzerError> {
     if let Some(file) = &import.file {
         // file 不能以 . 或者 / 开头
         if file.starts_with(".") || file.starts_with("/") {
@@ -391,7 +396,12 @@ pub fn analyze_import(project_root: String, package_config_mutex: &Arc<Mutex<Opt
     return Ok(());
 }
 
-pub fn analyze_imports(project_root: String, package_config: &Arc<Mutex<Option<PackageConfig>>>, m: &mut Module, stmts: &mut Vec<Box<Stmt>>) -> Vec<ImportStmt> {
+pub fn analyze_imports(
+    project_root: String,
+    package_config: &Arc<Mutex<Option<PackageConfig>>>,
+    m: &mut Module,
+    stmts: &mut Vec<Box<Stmt>>,
+) -> Vec<ImportStmt> {
     let mut imports: Vec<ImportStmt> = Vec::new();
 
     for stmt in stmts {
@@ -414,8 +424,7 @@ pub fn analyze_imports(project_root: String, package_config: &Arc<Mutex<Option<P
  * 在 main module 进行 analyze 之前，需要将 import 关联的所有的模块的 global symbol 都注册到符号表中, ast 暂时不用进行解析
  *  后续的统一 analyzer 时会全部进行解析, 是对原始 nature 编译器的 can_import_symbol_table 字段的优化
  */
-pub fn register_global_symbol(m: &Module, symbol_table: &mut SymbolTable, stmts: &Vec<Box<Stmt>>) -> Vec<AnalyzerError> {
-    let mut errors = Vec::new();
+pub fn register_global_symbol(m: &mut Module, symbol_table: &mut SymbolTable, stmts: &Vec<Box<Stmt>>) {
 
     for stmt in stmts {
         match &stmt.node {
@@ -435,7 +444,7 @@ pub fn register_global_symbol(m: &Module, symbol_table: &mut SymbolTable, stmts:
                         var_decl.symbol_id = symbol_id;
                     }
                     Err(e) => {
-                        errors.push(AnalyzerError {
+                        errors_push(m, AnalyzerError {
                             start: var_decl.symbol_start,
                             end: var_decl.symbol_end,
                             message: e,
@@ -451,80 +460,49 @@ pub fn register_global_symbol(m: &Module, symbol_table: &mut SymbolTable, stmts:
                     m.scope_id,
                 );
             }
-            AstNode::TypeAlias(type_alias_mutex) => {
-                let mut type_alias = type_alias_mutex.lock().unwrap();
-                type_alias.ident = format_global_ident(m.ident.clone(), type_alias.ident.clone());
+            AstNode::Typedef(typedef_mutex) => {
+                let mut typedef = typedef_mutex.lock().unwrap();
+                typedef.ident = format_global_ident(m.ident.clone(), typedef.ident.clone());
 
-                match symbol_table.define_symbol_in_scope(
-                    type_alias.ident.clone(),
-                    SymbolKind::TypeAlias(type_alias_mutex.clone()),
-                    type_alias.symbol_start,
-                    m.scope_id,
-                ) {
+                match symbol_table.define_symbol_in_scope(typedef.ident.clone(), SymbolKind::Type(typedef_mutex.clone()), typedef.symbol_start, m.scope_id) {
                     Ok(symbol_id) => {
-                        type_alias.symbol_id = symbol_id;
+                        typedef.symbol_id = symbol_id;
                     }
                     Err(e) => {
-                        debug!("define module type alias {} failed: {}, in scope {}", type_alias.ident, e, m.scope_id);
-                        errors.push(AnalyzerError {
-                            start: type_alias.symbol_start,
-                            end: type_alias.symbol_end,
+                        debug!("define module typedef {} failed: {}, in scope {}", typedef.ident, e, m.scope_id);
+                        errors_push(m, AnalyzerError {
+                            start: typedef.symbol_start,
+                            end: typedef.symbol_end,
                             message: e,
                         });
                     }
                 }
 
-                let _ = symbol_table.define_global_symbol(
-                    type_alias.ident.clone(),
-                    SymbolKind::TypeAlias(type_alias_mutex.clone()),
-                    type_alias.symbol_start,
-                    m.scope_id,
-                );
+                let _ = symbol_table.define_global_symbol(typedef.ident.clone(), SymbolKind::Type(typedef_mutex.clone()), typedef.symbol_start, m.scope_id);
             }
             AstNode::FnDef(fndef_mutex) => {
                 let mut fndef = fndef_mutex.lock().unwrap();
+                let symbol_name = fndef.symbol_name.clone();
 
-                let mut symbol_name = fndef.symbol_name.clone();
-
-                // fn string<T>.len() -> fn <T>.string_len to symbol_table
-                if !fndef.impl_type.kind.is_unknown() {
-                    assert!(!fndef.impl_type._impl.0.is_empty());
-                    symbol_name = format_impl_ident(fndef.impl_type._impl.0.clone(), symbol_name);
-                }
-                if Type::is_impl_builtin_type(&fndef.impl_type.kind) {
-                    fndef.symbol_name = symbol_name;
-                } else {
+                if fndef.impl_type.kind.is_unknown() {
                     fndef.symbol_name = format_global_ident(m.ident.clone(), symbol_name.clone());
-                }
 
-                // let global_ident = format_global_ident(m.ident.clone(), fndef.symbol_name.clone());
-                match symbol_table.define_symbol_in_scope(fndef.symbol_name.clone(), SymbolKind::Fn(fndef_mutex.clone()), fndef.symbol_start, m.scope_id) {
-                    Ok(symbol_id) => {
-                        fndef.symbol_id = symbol_id;
-                    }
-                    Err(e) => {
-                        debug!("define module symbol failed {}", e);
-                        // 因为允许泛型函数重载，所以此处会有同名 symbol 的情况，pre_infer 会进行二次处理，此处忽略相关错误
-                        // 在 typesys 的 pre_infer 会专门处理此情况
-                        if fndef.generics_params.is_none() {
-                            errors.push(AnalyzerError {
+                    match symbol_table.define_symbol_in_scope(fndef.symbol_name.clone(), SymbolKind::Fn(fndef_mutex.clone()), fndef.symbol_start, m.scope_id) {
+                        Ok(symbol_id) => {
+                            fndef.symbol_id = symbol_id;
+                        }
+                        Err(_e) => {
+                            errors_push(m, AnalyzerError {
                                 start: fndef.symbol_start,
                                 end: fndef.symbol_end,
-                                message: e,
+                                message: format!("ident '{}' redeclared", fndef.symbol_name),
                             });
-                        } else {
-                            // if let Some(symbol_id) = symbol_table.find_symbol_id(&fndef.symbol_name, m.scope_id) {
-                            //     fndef.symbol_id = 0;
-                            // }
                         }
                     }
-                }
 
-                if let Err(e) =
-                    symbol_table.define_global_symbol(fndef.symbol_name.clone(), SymbolKind::Fn(fndef_mutex.clone()), fndef.symbol_start, m.scope_id)
-                {
-                    // 仅提示，不进行报错
-                    debug!("define global symbol failed {}", e)
+                    let _ = symbol_table.define_global_symbol(fndef.symbol_name.clone(), SymbolKind::Fn(fndef_mutex.clone()), fndef.symbol_start, m.scope_id);
+                } else {
+                    // dealy semantic analyze
                 }
             }
             _ => {
@@ -533,6 +511,4 @@ pub fn register_global_symbol(m: &Module, symbol_table: &mut SymbolTable, stmts:
             }
         }
     }
-
-    return errors;
 }

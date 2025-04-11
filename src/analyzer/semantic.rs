@@ -1,10 +1,10 @@
 use log::debug;
 
 use crate::project::Module;
-use crate::utils::format_global_ident;
+use crate::utils::{errors_push, format_global_ident, format_impl_ident};
 
-use super::symbol::{NodeId, ScopeKind, SymbolKind, SymbolTable};
 use super::common::*;
+use super::symbol::{NodeId, ScopeKind, SymbolKind, SymbolTable};
 use std::sync::{Arc, Mutex};
 
 #[derive(Debug)]
@@ -41,21 +41,23 @@ impl<'a> Semantic<'a> {
     }
 
     fn analyze_special_type_rewrite(&mut self, t: &mut Type) -> bool {
-        assert!(matches!(t.kind, TypeKind::Alias(..)));
-        let TypeKind::Alias(type_alias) = t.kind.clone() else { unreachable!() };
+        assert!(t.import_as.is_empty());
 
         // void ptr rewrite
-        if type_alias.ident == TypeKind::VoidPtr.to_string() {
-            t.kind = TypeKind::VoidPtr;
-            t.origin_ident = None;
-            t.origin_type_kind = TypeKind::Unknown;
+        if t.ident == "anyptr" {
+            t.kind = TypeKind::Anyptr;
+            t.ident = "".to_string();
+            t.ident_kind = TypeIdentKind::Unknown;
 
-            if type_alias.args.is_some() {
-                self.errors.push(AnalyzerError {
-                    start: t.start,
-                    end: t.end,
-                    message: format!("void_ptr cannot contains arg"),
-                });
+            if t.args.len() > 0 {
+                errors_push(
+                    self.module,
+                    AnalyzerError {
+                        start: t.start,
+                        end: t.end,
+                        message: format!("anyptr cannot contains arg"),
+                    },
+                );
                 t.err = true;
             }
 
@@ -63,70 +65,118 @@ impl<'a> Semantic<'a> {
         }
 
         // raw ptr rewrite
-        if type_alias.ident == TypeKind::RawPtr(Box::new(Type::default())).to_string() {
+        if t.ident == "rawptr".to_string() {
             // extract first args to type_
-            if let Some(args) = type_alias.args {
-                let mut first_arg_type = args[0].clone();
+            if t.args.len() > 0 {
+                let mut first_arg_type = t.args[0].clone();
                 self.analyze_type(&mut first_arg_type);
-                t.kind = TypeKind::RawPtr(Box::new(first_arg_type));
+                t.kind = TypeKind::Rawptr(Box::new(first_arg_type));
             } else {
-                self.errors.push(AnalyzerError {
-                    start: t.start,
-                    end: t.end,
-                    message: format!("raw_ptr must contains one arg"),
-                });
+                errors_push(
+                    self.module,
+                    AnalyzerError {
+                        start: t.start,
+                        end: t.end,
+                        message: format!("rawptr must contains one arg"),
+                    },
+                );
             }
 
-            t.origin_ident = None;
-            t.origin_type_kind = TypeKind::Unknown;
+            t.ident = "".to_string();
+            t.ident_kind = TypeIdentKind::Unknown;
             return true;
         }
 
         // ptr rewrite
-        if type_alias.ident == TypeKind::Ptr(Box::new(Type::default())).to_string() {
-            if let Some(args) = type_alias.args {
-                let mut first_arg_type = args[0].clone();
+        if t.ident == "ptr".to_string() {
+            if t.args.len() > 0 {
+                let mut first_arg_type = t.args[0].clone();
                 self.analyze_type(&mut first_arg_type);
                 t.kind = TypeKind::Ptr(Box::new(first_arg_type));
             } else {
-                self.errors.push(AnalyzerError {
-                    start: t.start,
-                    end: t.end,
-                    message: format!("ptr must contains one arg"),
-                });
+                errors_push(
+                    self.module,
+                    AnalyzerError {
+                        start: t.start,
+                        end: t.end,
+                        message: format!("ptr must contains one arg"),
+                    },
+                );
             }
 
-            t.origin_ident = None;
-            t.origin_type_kind = TypeKind::Unknown;
+            t.ident = "".to_string();
+            t.ident_kind = TypeIdentKind::Unknown;
             return true;
         }
 
         // all_t rewrite
-        if type_alias.ident == TypeKind::AllT.to_string() {
-            t.kind = TypeKind::AllT;
-            t.origin_ident = None;
-            t.origin_type_kind = TypeKind::Unknown;
-            if type_alias.args.is_some() {
-                self.errors.push(AnalyzerError {
-                    start: t.start,
-                    end: t.end,
-                    message: format!("all_type cannot contains arg"),
-                });
+        if t.ident == "all_t".to_string() {
+            t.kind = TypeKind::Anyptr; // 底层类型
+            t.ident = "all_t".to_string();
+            t.ident_kind = TypeIdentKind::Builtin;
+            if t.args.len() > 0 {
+                errors_push(
+                    self.module,
+                    AnalyzerError {
+                        start: t.start,
+                        end: t.end,
+                        message: format!("all_type cannot contains arg"),
+                    },
+                );
             }
             return true;
         }
 
         // fn_t rewrite
-        if type_alias.ident == TypeKind::FnT.to_string() {
-            t.kind = TypeKind::FnT;
-            t.origin_ident = None;
-            t.origin_type_kind = TypeKind::Unknown;
-            if type_alias.args.is_some() {
-                self.errors.push(AnalyzerError {
-                    start: t.start,
-                    end: t.end,
-                    message: format!("fn_t cannot contains arg"),
-                });
+        if t.ident == "fn_t".to_string() {
+            t.kind = TypeKind::Anyptr;
+            t.ident = "fn_t".to_string();
+            t.ident_kind = TypeIdentKind::Builtin;
+            if t.args.len() > 0 {
+                errors_push(
+                    self.module,
+                    AnalyzerError {
+                        start: t.start,
+                        end: t.end,
+                        message: format!("fn_t cannot contains arg"),
+                    },
+                );
+            }
+            return true;
+        }
+
+        if t.ident == "integer_t".to_string() {
+            t.kind = TypeKind::Int;
+            t.ident = "integer_t".to_string();
+            t.ident_kind = TypeIdentKind::Builtin;
+
+            if t.args.len() > 0 {
+                errors_push(
+                    self.module,
+                    AnalyzerError {
+                        start: t.start,
+                        end: t.end,
+                        message: format!("fn_t cannot contains arg"),
+                    },
+                );
+            }
+            return true;
+        }
+
+        if t.ident == "floater_t".to_string() {
+            t.kind = TypeKind::Int;
+            t.ident = "floater_t".to_string();
+            t.ident_kind = TypeIdentKind::Builtin;
+
+            if t.args.len() > 0 {
+                errors_push(
+                    self.module,
+                    AnalyzerError {
+                        start: t.start,
+                        end: t.end,
+                        message: format!("fn_t cannot contains arg"),
+                    },
+                );
             }
             return true;
         }
@@ -135,73 +185,115 @@ impl<'a> Semantic<'a> {
     }
 
     fn analyze_type(&mut self, t: &mut Type) {
-        match &mut t.kind {
-            TypeKind::Alias(type_alias) => {
-                let ident = type_alias.ident.clone();
-
-                // 处理导入的全局模式别名，例如  package.foo_t
-                if let Some(import_as) = &type_alias.import_as {
-                    // 只要存在 import as, 就必须能够在 imports 中找到对应的 import
-                    let import_stmt = self.imports.iter().find(|i| i.as_name == *import_as);
-                    if import_stmt.is_none() {
-                        self.errors.push(AnalyzerError {
+        if Type::ident_is_def_or_alias(t) || t.ident_kind == TypeIdentKind::Interface {
+            // 处理导入的全局模式别名，例如  package.foo_t
+            if !t.import_as.is_empty() {
+                // 只要存在 import as, 就必须能够在 imports 中找到对应的 import
+                let import_stmt = self.imports.iter().find(|i| i.as_name == t.import_as);
+                if import_stmt.is_none() {
+                    errors_push(
+                        self.module,
+                        AnalyzerError {
                             start: t.start,
                             end: t.end,
-                            message: format!("import type alias '{}' undeclared", ident),
-                        });
-                        t.err = true;
-                        return;
-                    }
-
-                    let import_stmt = import_stmt.unwrap();
-
-                    // 从 symbol table 中查找相关的 global symbol id
-                    if let Some(symbol_id) = self.symbol_table.find_module_symbol_id(&import_stmt.module_ident, &ident) {
-                        type_alias.import_as = None;
-                        type_alias.ident = format_global_ident(import_stmt.module_ident.clone(), ident);
-                        type_alias.symbol_id = symbol_id;
-                        dbg!(&type_alias);
-                    } else {
-                        self.errors.push(AnalyzerError {
-                            start: t.start,
-                            end: t.end,
-                            message: format!("type '{}' undeclared in {} module", ident, import_stmt.module_ident),
-                        });
-                        t.err = true;
-                        return;
-                    }
-                } else {
-                    // no import as, maybe local ident or parent indet
-                    if let Some(symbol_id) = self.resolve_type_alias(&mut type_alias.ident) {
-                        type_alias.symbol_id = symbol_id;
-                    } else {
-                        // maybe check is special type ident
-                        if self.analyze_special_type_rewrite(t) {
-                            return;
-                        }
-
-                        self.errors.push(AnalyzerError {
-                            start: t.start,
-                            end: t.end,
-                            message: format!("type '{}' undeclared", ident),
-                        });
-                        t.err = true;
-                        return;
-                    }
+                            message: format!("import '{}' undeclared", t.import_as),
+                        },
+                    );
+                    t.err = true;
+                    return;
                 }
 
-                // 处理泛型参数
-                if let Some(args) = &mut type_alias.args {
-                    for arg in args {
-                        self.analyze_type(arg);
+                let import_stmt = import_stmt.unwrap();
+
+                // 从 symbol table 中查找相关的 global symbol id
+                if let Some(symbol_id) = self.symbol_table.find_module_symbol_id(&import_stmt.module_ident, &t.ident) {
+                    t.import_as = "".to_string();
+                    t.ident = format_global_ident(import_stmt.module_ident.clone(), t.ident.clone());
+                    t.symbol_id = symbol_id;
+                } else {
+                    errors_push(
+                        self.module,
+                        AnalyzerError {
+                            start: t.start,
+                            end: t.end,
+                            message: format!("type '{}' undeclared in {} module", t.ident, import_stmt.module_ident),
+                        },
+                    );
+                    t.err = true;
+                    return;
+                }
+            } else {
+                // no import as, maybe local ident or parent indet
+                if let Some(symbol_id) = self.resolve_typedef(&mut t.ident) {
+                    t.symbol_id = symbol_id;
+                } else {
+                    // maybe check is special type ident
+                    if self.analyze_special_type_rewrite(t) {
+                        return;
+                    }
+
+                    errors_push(
+                        self.module,
+                        AnalyzerError {
+                            start: t.start,
+                            end: t.end,
+                            message: format!("type '{}' undeclared", t.ident),
+                        },
+                    );
+                    t.err = true;
+                    return;
+                }
+            }
+
+            if let Some(symbol) = self.symbol_table.get_symbol(t.symbol_id) {
+                let SymbolKind::Type(typedef_mutex) = &symbol.kind else { unreachable!() };
+                let (is_alias, is_interface) ={
+                    let typedef_stmt = typedef_mutex.lock().unwrap();
+                    (typedef_stmt.is_alias, typedef_stmt.is_interface)
+                };
+
+                // 确认具体类型
+                if t.ident_kind == TypeIdentKind::Unknown {
+                    if is_alias {
+                        t.ident_kind = TypeIdentKind::Alias;
+                        if t.args.len() > 0 {
+                            errors_push(
+                                self.module,
+                                AnalyzerError {
+                                    start: t.start,
+                                    end: t.end,
+                                    message: format!("alias '{}' cannot contains generics type args", t.ident),
+                                },
+                            );
+                            return;
+                        }
+                    } else if is_interface {
+                        t.ident_kind = TypeIdentKind::Interface;
+                    } else {
+                        t.ident_kind = TypeIdentKind::Def;
                     }
                 }
             }
-            TypeKind::Union(any, elements) => {
-                if !*any {
-                    for element in elements.iter_mut() {
-                        self.analyze_type(element);
-                    }
+
+            // analyzer args
+            if t.args.len() > 0 {
+                for arg_type in &mut t.args {
+                    self.analyze_type(arg_type);
+                }
+            }
+
+            return;
+        }
+
+        match &mut t.kind {
+            TypeKind::Interface(elements) => {
+                for element in elements {
+                    self.analyze_type(element);
+                }
+            }
+            TypeKind::Union(_, _, elements) => {
+                for element in elements.iter_mut() {
+                    self.analyze_type(element);
                 }
             }
             TypeKind::Map(key_type, value_type) => {
@@ -228,7 +320,7 @@ impl<'a> Semantic<'a> {
             TypeKind::Ptr(value_type) => {
                 self.analyze_type(value_type);
             }
-            TypeKind::RawPtr(value_type) => {
+            TypeKind::Rawptr(value_type) => {
                 self.analyze_type(value_type);
             }
             TypeKind::Fn(fn_type) => {
@@ -248,11 +340,14 @@ impl<'a> Semantic<'a> {
 
                         // value kind cannot is fndef
                         if let AstNode::FnDef(..) = value.node {
-                            self.errors.push(AnalyzerError {
-                                start: value.start,
-                                end: value.end,
-                                message: format!("struct field default value cannot be a fn def, use fn def ident instead"),
-                            });
+                            errors_push(
+                                self.module,
+                                AnalyzerError {
+                                    start: value.start,
+                                    end: value.end,
+                                    message: format!("struct field default value cannot be a fn def, use fn def ident instead"),
+                                },
+                            );
                             t.err = true;
                         }
                     }
@@ -284,10 +379,69 @@ impl<'a> Semantic<'a> {
             match &mut stmt.node {
                 AstNode::Import(..) => continue,
                 AstNode::FnDef(fndef_mutex) => {
-                    // let mut fndef = fndef_mutex.lock().unwrap();
-                    // let mut symbol_name = fndef.symbol_name.clone();
+                    let mut fndef = fndef_mutex.lock().unwrap();
+                    let symbol_name = fndef.symbol_name.clone();
+
+                    if fndef.impl_type.kind.is_exist() {
+                        // 非 builtin type 则进行 resolve type 查找
+                        if !Type::is_impl_builtin_type(&fndef.impl_type.kind) {
+                            // resolve global ident
+                            if let Some(symbol_id) = self.resolve_typedef(&mut fndef.impl_type.ident) {
+                                // ident maybe change
+                                fndef.impl_type.symbol_id = symbol_id
+                            } else {
+                                errors_push(
+                                    self.module,
+                                    AnalyzerError {
+                                        start: fndef.symbol_start,
+                                        end: fndef.symbol_end,
+                                        message: format!("type '{}' undeclared", fndef.impl_type.symbol_id),
+                                    },
+                                );
+                            }
+                        }
+
+
+                        fndef.symbol_name = format_impl_ident(fndef.impl_type.ident.clone(), symbol_name);
+
+                        // register to global symbol table
+                        match self.symbol_table.define_symbol_in_scope(
+                            fndef.symbol_name.clone(),
+                            SymbolKind::Fn(fndef_mutex.clone()),
+                            fndef.symbol_start,
+                            self.module.scope_id,
+                        ) {
+                            Ok(symbol_id) => {
+                                fndef.symbol_id = symbol_id;
+                            }
+                            Err(e) => {
+                                // 因为允许泛型函数重载，所以此处会有同名 symbol 的情况，pre_infer 会进行二次处理，此处忽略相关错误
+                                if fndef.generics_params.is_none() {
+                                    errors_push(
+                                        self.module,
+                                        AnalyzerError {
+                                            start: fndef.symbol_start,
+                                            end: fndef.symbol_end,
+                                            message: e,
+                                        },
+                                    );
+                                }
+                            }
+                        }
+
+                        // register to global symbol
+                        let _ = self.symbol_table.define_global_symbol(fndef.symbol_name.clone(), SymbolKind::Fn(fndef_mutex.clone()), fndef.symbol_start, self.module.scope_id);
+                    }
 
                     global_fn_stmt_list.push(fndef_mutex.clone());
+
+                    if let Some(generics_params) = &mut fndef.generics_params {
+                        for generics_param in generics_params {
+                            for constraint in &mut generics_param.constraints.0 {
+                                self.analyze_type(constraint);
+                            }
+                        }
+                    }
                 }
                 AstNode::VarDef(var_decl_mutex, right_expr) => {
                     let mut var_decl = var_decl_mutex.lock().unwrap();
@@ -312,24 +466,41 @@ impl<'a> Semantic<'a> {
                     var_assign_list.push(assign_stmt);
                 }
 
-                AstNode::TypeAlias(type_alias_mutex) => {
-                    let mut type_alias = type_alias_mutex.lock().unwrap();
-                    assert!(type_alias.symbol_id > 0, "type alias {} symbol_id empty", type_alias.ident);
+                AstNode::Typedef(type_alias_mutex) => {
+                    let mut type_expr = {
+                        let mut typedef = type_alias_mutex.lock().unwrap();
 
-                    // 处理 params constraints, type foo<T:int|float, E:int:bool> = ...
-                    if type_alias.params.len() > 0 {
-                        for param in type_alias.params.iter_mut() {
-                            if !param.constraints.0 {
+                        // 处理 params constraints, type foo<T:int|float, E:int:bool> = ...
+                        if typedef.params.len() > 0 {
+                            for param in typedef.params.iter_mut() {
                                 // 遍历所有 constraints 类型 进行 analyze
-                                for constraint in &mut param.constraints.1 {
+                                for constraint in &mut param.constraints.0 {
+                                    // TODO constraint 不能是自身
                                     self.analyze_type(constraint);
                                 }
                             }
                         }
-                    }
 
-                    // analyzer type expr, symbol table 中存储的是 type_expr 的 arc clone, 所以这里的修改会同步到 symbol table 中
-                    self.analyze_type(&mut type_alias.type_expr);
+                        if typedef.impl_interfaces.len() > 0 {
+                            for impl_interface in &mut typedef.impl_interfaces {
+                                assert!(impl_interface.kind == TypeKind::Ident && impl_interface.ident_kind == TypeIdentKind::Interface);
+                                self.analyze_type(impl_interface);
+                            }
+                        }
+
+
+                        // analyzer type expr, symbol table 中存储的是 type_expr 的 arc clone, 所以这里的修改会同步到 symbol table 中
+                        // 递归依赖处理
+                        typedef.type_expr.clone()
+                    };
+
+
+                    self.analyze_type(&mut type_expr);
+
+                    {
+                        let mut typedef = type_alias_mutex.lock().unwrap();
+                        typedef.type_expr = type_expr;
+                    }
                 }
                 _ => {
                     // 语义分析中包含许多错误
@@ -362,7 +533,7 @@ impl<'a> Semantic<'a> {
         for node in &mut global_vardefs {
             match node {
                 AstNode::VarDef(_, right_expr) => {
-                    if let AstNode::FnDef(fndef_mutex) = &right_expr.node  {
+                    if let AstNode::FnDef(_) = &right_expr.node {
                         // fn def 会自动 arc 引用传递, 所以不需要进行单独的 analyze handle, 只有在 fn init 中进行 analyzer 即可注册相关符号，然后再 infer 阶段进行 global var 自动 check
                     } else {
                         self.analyze_expr(right_expr);
@@ -380,12 +551,12 @@ impl<'a> Semantic<'a> {
         self.module.analyzer_errors.extend(self.errors.clone());
     }
 
-    pub fn resolve_type_alias(&mut self, ident: &mut String) -> Option<NodeId> {
+    pub fn resolve_typedef(&mut self, ident: &mut String) -> Option<NodeId> {
         // 首先尝试在当前作用域和父级作用域中直接查找该符号, 最终会找到 m.scope_id, 这里包含当前 module 的全局符号
         if let Some(symbol_id) = self.symbol_table.lookup_symbol(ident, self.current_scope_id) {
             return Some(symbol_id);
         }
-        
+
         // 首先尝试在当前 module 中查找该符号
         if let Some(symbol_id) = self.symbol_table.find_module_symbol_id(&self.module.ident, ident) {
             let current_module_ident = format_global_ident(self.module.ident.clone(), ident.to_string());
@@ -409,6 +580,21 @@ impl<'a> Semantic<'a> {
         return self.symbol_table.find_symbol_id(ident, self.symbol_table.global_scope_id);
     }
 
+    pub fn symbol_typedef_add_method(&mut self, typedef_ident: String, method_ident: String, fndef: Arc<Mutex<AstFnDef>>) -> Result<(), String> {
+        // get typedef from symbol table(global symbol)
+        let symbol = self
+            .symbol_table
+            .find_global_symbol(&typedef_ident)
+            .ok_or_else(|| format!("symbol {} not found", typedef_ident))?;
+        let SymbolKind::Type(typedef_mutex) = &symbol.kind else {
+            return Err(format!("symbol {} is not typedef", typedef_ident));
+        };
+        let mut typedef = typedef_mutex.lock().unwrap();
+        typedef.method_table.insert(method_ident, fndef);
+
+        return Ok(());
+    }
+
     pub fn analyze_global_fn(&mut self, fndef_mutex: Arc<Mutex<AstFnDef>>) {
         {
             let mut fndef = fndef_mutex.lock().unwrap();
@@ -429,22 +615,6 @@ impl<'a> Semantic<'a> {
             // fn vec<T>.len() -> fn vec_len(vec<T> self)
             // impl 是 type alias 时，只能是 fn person_t.len() 而不能是 fn pkg.person_t.len()
             if fndef.impl_type.kind.is_exist() {
-                if matches!(fndef.impl_type.kind, TypeKind::Alias(..)) { // is type alias
-                    assert!(!fndef.impl_type._impl.0.is_empty());
-                    let mut impl_ident = fndef.impl_type._impl.0.clone();
-
-                    if let Some(symbol_id) = self.resolve_type_alias(&mut impl_ident) {
-                        // 成功定位 impl_ident 的出生点, 直接进行更新
-                        fndef.impl_type._impl.1 = symbol_id;
-                    } else {
-                        self.errors.push(AnalyzerError {
-                            start: fndef.symbol_start,
-                            end: fndef.symbol_end,
-                            message: format!("type alias '{}' undeclared", impl_ident),
-                        });
-                    };
-                }
-
                 // 重构 params 的位置, 新增 self param
                 let mut new_params = Vec::new();
                 let param_type = fndef.impl_type.clone();
@@ -461,6 +631,21 @@ impl<'a> Semantic<'a> {
                 new_params.push(Arc::new(Mutex::new(self_vardecl)));
                 new_params.extend(fndef.params.iter().cloned());
                 fndef.params = new_params;
+
+                // builtin type 没有注册在符号表，不能添加 method
+                if !Type::is_impl_builtin_type(&fndef.impl_type.kind) {
+                    self.symbol_typedef_add_method(fndef.impl_type.ident.clone(), fndef.symbol_name.clone(), fndef_mutex.clone())
+                        .unwrap_or_else(|e| {
+                            errors_push(
+                                self.module,
+                                AnalyzerError {
+                                    start: fndef.symbol_start,
+                                    end: fndef.symbol_end,
+                                    message: e,
+                                },
+                            );
+                        });
+                }
             }
 
             self.enter_scope(ScopeKind::GlobalFn(fndef_mutex.clone()));
@@ -481,11 +666,14 @@ impl<'a> Semantic<'a> {
                         param.symbol_id = symbol_id;
                     }
                     Err(e) => {
-                        self.errors.push(AnalyzerError {
-                            start: param.symbol_start,
-                            end: param.symbol_end,
-                            message: e,
-                        });
+                        errors_push(
+                            self.module,
+                            AnalyzerError {
+                                start: param.symbol_start,
+                                end: param.symbol_end,
+                                message: e,
+                            },
+                        );
                     }
                 }
             }
@@ -575,11 +763,14 @@ impl<'a> Semantic<'a> {
                     expr.node = AstNode::Ident(format_global_ident(import_stmt.module_ident.clone(), key.clone()), id);
                     return;
                 } else {
-                    self.errors.push(AnalyzerError {
-                        start: expr.start,
-                        end: expr.end,
-                        message: format!("identifier '{}' undeclared in '{}' module", key, left_ident),
-                    });
+                    errors_push(
+                        self.module,
+                        AnalyzerError {
+                            start: expr.start,
+                            end: expr.end,
+                            message: format!("identifier '{}' undeclared in '{}' module", key, left_ident),
+                        },
+                    );
                     expr.err = true;
                     return;
                 }
@@ -592,11 +783,14 @@ impl<'a> Semantic<'a> {
                 return;
             }
 
-            self.errors.push(AnalyzerError {
-                start: expr.start,
-                end: expr.end,
-                message: format!("identifier '{}.{}' undeclared", left_ident, key),
-            });
+            errors_push(
+                self.module,
+                AnalyzerError {
+                    start: expr.start,
+                    end: expr.end,
+                    message: format!("identifier '{}.{}' undeclared", left_ident, key),
+                },
+            );
             expr.err = true;
 
             return;
@@ -654,25 +848,33 @@ impl<'a> Semantic<'a> {
                 if let AstNode::Ident(ident, _symbol_id) = &cond.node {
                     if ident == "_" {
                         if cond_list_len != 1 {
-                            self.errors.push(AnalyzerError {
-                                start: cond.start,
-                                end: cond.end,
-                                message: "default case '_' conflict in a 'match' expression".to_string(),
-                            });
+                            errors_push(
+                                self.module,
+                                AnalyzerError {
+                                    start: cond.start,
+                                    end: cond.end,
+                                    message: "default case '_' conflict in a 'match' expression".to_string(),
+                                },
+                            );
                         }
 
                         if i != cases_len - 1 {
-                            self.errors.push(AnalyzerError {
-                                start: cond.start,
-                                end: cond.end,
-                                message: "default case '_' must be the last one in a 'match' expression".to_string(),
-                            });
+                            errors_push(
+                                self.module,
+                                AnalyzerError {
+                                    start: cond.start,
+                                    end: cond.end,
+                                    message: "default case '_' must be the last one in a 'match' expression".to_string(),
+                                },
+                            );
                         }
 
                         case.is_default = true;
                         continue;
                     }
-                } else if let AstNode::MatchIs(..) = &cond.node {
+                } else if let AstNode::MatchIs(t) = &mut cond.node {
+                    self.analyze_type(t);
+
                     is_cond = true;
                 }
 
@@ -759,10 +961,16 @@ impl<'a> Semantic<'a> {
                 self.analyze_type(left_type);
                 self.analyze_type(right_type);
             }
-            AstNode::New(type_, properties) => {
+            AstNode::New(type_, properties, default_expr) => {
                 self.analyze_type(type_);
-                for property in properties {
-                    self.analyze_expr(&mut property.value);
+                if properties.len() > 0 {
+                    for property in properties {
+                        self.analyze_expr(&mut property.value);
+                    }
+                }
+
+                if let Some(expr) = default_expr {
+                    self.analyze_expr(expr);
                 }
             }
             AstNode::StructNew(_ident, type_, properties) => {
@@ -797,6 +1005,10 @@ impl<'a> Semantic<'a> {
                     self.analyze_expr(element);
                 }
             }
+            AstNode::VecRepeatNew(default_element, len_expr) => {
+                self.analyze_expr(default_element);
+                self.analyze_expr(len_expr);
+            }
             AstNode::AccessExpr(left, key) => {
                 self.analyze_expr(left);
                 self.analyze_expr(key);
@@ -804,11 +1016,14 @@ impl<'a> Semantic<'a> {
             AstNode::SelectExpr(..) => self.rewrite_select_expr(expr),
             AstNode::Ident(ident, symbol_id) => {
                 if !self.analyze_ident(ident, symbol_id) {
-                    self.errors.push(AnalyzerError {
-                        start: expr.start,
-                        end: expr.end,
-                        message: format!("identifier '{}' undeclared", ident),
-                    });
+                    errors_push(
+                        self.module,
+                        AnalyzerError {
+                            start: expr.start,
+                            end: expr.end,
+                            message: format!("identifier '{}' undeclared", ident),
+                        },
+                    );
                     expr.err = true;
                 }
             }
@@ -838,11 +1053,14 @@ impl<'a> Semantic<'a> {
                 self.analyze_var_tuple_destr(elements);
             }
             _ => {
-                self.errors.push(AnalyzerError {
-                    start: item.start,
-                    end: item.end,
-                    message: "var tuple destr expr type exception".to_string(),
-                });
+                errors_push(
+                    self.module,
+                    AnalyzerError {
+                        start: item.start,
+                        end: item.end,
+                        message: "var tuple destr expr type exception".to_string(),
+                    },
+                );
             }
         }
     }
@@ -884,28 +1102,37 @@ impl<'a> Semantic<'a> {
 
         // local fn 作为闭包函数, 不能进行类型扩展和泛型参数
         if fndef.impl_type.kind.is_exist() || fndef.generics_params.is_some() {
-            self.errors.push(AnalyzerError {
-                start: fndef.symbol_start,
-                end: fndef.symbol_end,
-                message: "closure fn cannot be generics or impl type alias".to_string(),
-            });
+            errors_push(
+                self.module,
+                AnalyzerError {
+                    start: fndef.symbol_start,
+                    end: fndef.symbol_end,
+                    message: "closure fn cannot be generics or impl type alias".to_string(),
+                },
+            );
         }
 
         // 闭包不能包含 macro ident
         if fndef.linkid.is_some() {
-            self.errors.push(AnalyzerError {
-                start: fndef.symbol_start,
-                end: fndef.symbol_end,
-                message: "closure fn cannot have #linkid label".to_string(),
-            });
+            errors_push(
+                self.module,
+                AnalyzerError {
+                    start: fndef.symbol_start,
+                    end: fndef.symbol_end,
+                    message: "closure fn cannot have #linkid label".to_string(),
+                },
+            );
         }
 
         if fndef.is_tpl {
-            self.errors.push(AnalyzerError {
-                start: fndef.symbol_start,
-                end: fndef.symbol_end,
-                message: "closure fn cannot be template".to_string(),
-            });
+            errors_push(
+                self.module,
+                AnalyzerError {
+                    start: fndef.symbol_start,
+                    end: fndef.symbol_end,
+                    message: "closure fn cannot be template".to_string(),
+                },
+            );
         }
 
         self.analyze_type(&mut fndef.return_type);
@@ -918,19 +1145,24 @@ impl<'a> Semantic<'a> {
             self.analyze_type(&mut param.type_);
 
             // 将参数添加到符号表中
-            match self
-                .symbol_table
-                .define_symbol_in_scope(param.ident.clone(), SymbolKind::Var(param_mutex.clone()), param.symbol_start, self.current_scope_id)
-            {
+            match self.symbol_table.define_symbol_in_scope(
+                param.ident.clone(),
+                SymbolKind::Var(param_mutex.clone()),
+                param.symbol_start,
+                self.current_scope_id,
+            ) {
                 Ok(symbol_id) => {
                     param.symbol_id = symbol_id;
                 }
                 Err(e) => {
-                    self.errors.push(AnalyzerError {
-                        start: param.symbol_start,
-                        end: param.symbol_end,
-                        message: e,
-                    });
+                    errors_push(
+                        self.module,
+                        AnalyzerError {
+                            start: param.symbol_start,
+                            end: param.symbol_end,
+                            message: e,
+                        },
+                    );
                 }
             }
         }
@@ -954,19 +1186,24 @@ impl<'a> Semantic<'a> {
         }
 
         // 将 fndef lambda 添加到 symbol table 中
-        match self
-            .symbol_table
-            .define_symbol_in_scope(fndef.symbol_name.clone(), SymbolKind::Fn(fndef_mutex.clone()), fndef.symbol_start, self.current_scope_id)
-        {
+        match self.symbol_table.define_symbol_in_scope(
+            fndef.symbol_name.clone(),
+            SymbolKind::Fn(fndef_mutex.clone()),
+            fndef.symbol_start,
+            self.current_scope_id,
+        ) {
             Ok(symbol_id) => {
                 fndef.symbol_id = symbol_id;
             }
             Err(e) => {
-                self.errors.push(AnalyzerError {
-                    start: fndef.symbol_start,
-                    end: fndef.symbol_end,
-                    message: e,
-                });
+                errors_push(
+                    self.module,
+                    AnalyzerError {
+                        start: fndef.symbol_start,
+                        end: fndef.symbol_end,
+                        message: e,
+                    },
+                );
             }
         }
     }
@@ -987,11 +1224,14 @@ impl<'a> Semantic<'a> {
 
                 // condition expr cannot contains multiple is expr
                 if left_is.is_some() && right_is.is_some() {
-                    self.errors.push(AnalyzerError {
-                        start: cond.start,
-                        end: cond.end,
-                        message: "condition expr cannot contains multiple is expr".to_string(),
-                    });
+                    errors_push(
+                        self.module,
+                        AnalyzerError {
+                            start: cond.start,
+                            end: cond.end,
+                            message: "condition expr cannot contains multiple is expr".to_string(),
+                        },
+                    );
                 }
 
                 return if left_is.is_some() { left_is } else { right_is };
@@ -1112,11 +1352,14 @@ impl<'a> Semantic<'a> {
 
                     if case.is_default && i != len - 1 {
                         // push error
-                        self.errors.push(AnalyzerError {
-                            start: case.handle_body[0].start,
-                            end: case.handle_body[0].end,
-                            message: "default case must be the last case".to_string(),
-                        });
+                        errors_push(
+                            self.module,
+                            AnalyzerError {
+                                start: case.handle_body[0].start,
+                                end: case.handle_body[0].end,
+                                message: "default case must be the last case".to_string(),
+                            },
+                        );
                     }
                 }
             }
@@ -1161,34 +1404,52 @@ impl<'a> Semantic<'a> {
                     self.analyze_expr(expr);
                 }
             }
-            AstNode::TypeAlias(type_alias_mutex) => {
-                let mut type_alias = type_alias_mutex.lock().unwrap();
+            AstNode::Typedef(type_alias_mutex) => {
+                let mut typedef = type_alias_mutex.lock().unwrap();
                 // local type alias 不允许携带 param
-                if type_alias.params.len() > 0 {
-                    self.errors.push(AnalyzerError {
-                        start: type_alias.symbol_start,
-                        end: type_alias.symbol_end,
-                        message: "local type alias cannot have params".to_string(),
-                    });
+                if typedef.params.len() > 0 {
+                    errors_push(
+                        self.module,
+                        AnalyzerError {
+                            start: typedef.symbol_start,
+                            end: typedef.symbol_end,
+                            message: "local type alias cannot have params".to_string(),
+                        },
+                    );
                 }
 
-                self.analyze_type(&mut type_alias.type_expr);
+                // interface type alias 不允许携带 impl
+                if typedef.impl_interfaces.len() > 0 {
+                    errors_push(
+                        self.module,
+                        AnalyzerError {
+                            start: typedef.symbol_start,
+                            end: typedef.symbol_end,
+                            message: "local typedef cannot with impls".to_string(),
+                        },
+                    );
+                }
+
+                self.analyze_type(&mut typedef.type_expr);
 
                 match self.symbol_table.define_symbol_in_scope(
-                    type_alias.ident.clone(),
-                    SymbolKind::TypeAlias(type_alias_mutex.clone()),
-                    type_alias.symbol_start,
+                    typedef.ident.clone(),
+                    SymbolKind::Type(type_alias_mutex.clone()),
+                    typedef.symbol_start,
                     self.current_scope_id,
                 ) {
                     Ok(symbol_id) => {
-                        type_alias.symbol_id = symbol_id;
+                        typedef.symbol_id = symbol_id;
                     }
                     Err(e) => {
-                        self.errors.push(AnalyzerError {
-                            start: type_alias.symbol_start,
-                            end: type_alias.symbol_end,
-                            message: e,
-                        });
+                        errors_push(
+                            self.module,
+                            AnalyzerError {
+                                start: typedef.symbol_start,
+                                end: typedef.symbol_end,
+                                message: e,
+                            },
+                        );
                     }
                 }
             }
@@ -1204,19 +1465,24 @@ impl<'a> Semantic<'a> {
         self.analyze_type(&mut var_decl.type_);
 
         // 添加到符号表，返回值 sysmbol_id 添加到 var_decl 中, 已经包含了 redeclare check
-        match self
-            .symbol_table
-            .define_symbol_in_scope(var_decl.ident.clone(), SymbolKind::Var(var_decl_mutex.clone()), var_decl.symbol_start, self.current_scope_id)
-        {
+        match self.symbol_table.define_symbol_in_scope(
+            var_decl.ident.clone(),
+            SymbolKind::Var(var_decl_mutex.clone()),
+            var_decl.symbol_start,
+            self.current_scope_id,
+        ) {
             Ok(symbol_id) => {
                 var_decl.symbol_id = symbol_id;
             }
             Err(e) => {
-                self.errors.push(AnalyzerError {
-                    start: var_decl.symbol_start,
-                    end: var_decl.symbol_end,
-                    message: e,
-                });
+                errors_push(
+                    self.module,
+                    AnalyzerError {
+                        start: var_decl.symbol_start,
+                        end: var_decl.symbol_end,
+                        message: e,
+                    },
+                );
             }
         }
     }

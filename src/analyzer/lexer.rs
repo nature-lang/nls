@@ -3,33 +3,57 @@ use strum_macros::Display;
 use tower_lsp::lsp_types::SemanticTokenType;
 
 pub const LEGEND_TYPE: &[SemanticTokenType] = &[
-    SemanticTokenType::FUNCTION, // fn ident
-    SemanticTokenType::VARIABLE, // variable ident
-    SemanticTokenType::STRING, // string literal
-    SemanticTokenType::COMMENT, // comment
-    SemanticTokenType::NUMBER, // number literal
-    SemanticTokenType::KEYWORD, //  所有的语法关键字，比如 var, if, then, else, fn ...
-    SemanticTokenType::OPERATOR, // 运算符
+    SemanticTokenType::FUNCTION,  // fn ident
+    SemanticTokenType::VARIABLE,  // variable ident
+    SemanticTokenType::STRING,    // string literal
+    SemanticTokenType::COMMENT,   // comment
+    SemanticTokenType::NUMBER,    // number literal
+    SemanticTokenType::KEYWORD,   //  所有的语法关键字，比如 var, if, then, else, fn ...
+    SemanticTokenType::OPERATOR,  // 运算符
     SemanticTokenType::PARAMETER, // function parameter ident
-    SemanticTokenType::TYPE,          // 用于类型名称（如 int, float, string 等）
-    SemanticTokenType::MACRO,         // 用于宏标识符
-    SemanticTokenType::PROPERTY,      // struct property ident
-    SemanticTokenType::NAMESPACE,     // package ident
+    SemanticTokenType::TYPE,      // 用于类型名称（如 int, float, string 等）
+    SemanticTokenType::MACRO,     // 用于宏标识符
+    SemanticTokenType::PROPERTY,  // struct property ident
+    SemanticTokenType::NAMESPACE, // package ident
 ];
 
 pub fn semantic_token_type_index(token_type: SemanticTokenType) -> usize {
-    if token_type == SemanticTokenType::FUNCTION { return 0; }
-    if token_type == SemanticTokenType::VARIABLE { return 1; }
-    if token_type == SemanticTokenType::STRING { return 2; }
-    if token_type == SemanticTokenType::COMMENT { return 3; }
-    if token_type == SemanticTokenType::NUMBER { return 4; }
-    if token_type == SemanticTokenType::KEYWORD { return 5; }
-    if token_type == SemanticTokenType::OPERATOR { return 6; }
-    if token_type == SemanticTokenType::PARAMETER { return 7; }
-    if token_type == SemanticTokenType::TYPE { return 8; }
-    if token_type == SemanticTokenType::MACRO { return 9; }
-    if token_type == SemanticTokenType::PROPERTY { return 10; }
-    if token_type == SemanticTokenType::NAMESPACE { return 11; }
+    if token_type == SemanticTokenType::FUNCTION {
+        return 0;
+    }
+    if token_type == SemanticTokenType::VARIABLE {
+        return 1;
+    }
+    if token_type == SemanticTokenType::STRING {
+        return 2;
+    }
+    if token_type == SemanticTokenType::COMMENT {
+        return 3;
+    }
+    if token_type == SemanticTokenType::NUMBER {
+        return 4;
+    }
+    if token_type == SemanticTokenType::KEYWORD {
+        return 5;
+    }
+    if token_type == SemanticTokenType::OPERATOR {
+        return 6;
+    }
+    if token_type == SemanticTokenType::PARAMETER {
+        return 7;
+    }
+    if token_type == SemanticTokenType::TYPE {
+        return 8;
+    }
+    if token_type == SemanticTokenType::MACRO {
+        return 9;
+    }
+    if token_type == SemanticTokenType::PROPERTY {
+        return 10;
+    }
+    if token_type == SemanticTokenType::NAMESPACE {
+        return 11;
+    }
 
     panic!("unknown semantic token type: {:?}", token_type)
 }
@@ -218,6 +242,7 @@ pub enum TokenType {
     Null,
     #[strum(serialize = "void")]
     Void,
+
     #[strum(serialize = "any")]
     Any,
     #[strum(serialize = "struct")]
@@ -262,19 +287,29 @@ pub enum TokenType {
     Fn,
     #[strum(serialize = "import")]
     Import,
+
     #[strum(serialize = "return")]
     Return,
+
+    #[strum(serialize = "interface")]
+    Interface,
+
     #[strum(serialize = "go")]
     Go,
+
     #[strum(serialize = ";")]
     StmtEof,
-    #[strum(serialize = "\0")]
+    // #[strum(serialize = "\0")]
+
     #[strum(serialize = "line_comment")]
     LineComment,
+
     #[strum(serialize = "block_comment")]
     BlockComment,
+
     #[strum(serialize = "whitespace")]
     Whitespace,
+
     #[strum(serialize = "EOF")]
     Eof,
 }
@@ -516,7 +551,7 @@ impl Lexer {
             "map" => TokenType::Map,
             "match" => TokenType::Match,
             "select" => TokenType::Select,
-            "new" => TokenType::New,
+            // "new" => TokenType::New, // new 可用于关键字
             "null" => TokenType::Null,
             "ptr" => TokenType::Ptr,
             "return" => TokenType::Return,
@@ -532,6 +567,7 @@ impl Lexer {
             "var" => TokenType::Var,
             "vec" => TokenType::Vec,
             "void" => TokenType::Void,
+            "interface" => TokenType::Interface,
             // 数字类型
             "f32" => TokenType::F32,
             "f64" => TokenType::F64,
@@ -635,14 +671,39 @@ impl Lexer {
         matches!(s, '"' | '`' | '\'')
     }
 
-    fn is_float(&self, word: &str) -> bool {
+    fn is_float(&mut self, word: &str) -> bool {
         let dot_count = word.chars().filter(|&c| c == '.').count();
+        let has_e = word.chars().any(|c| c == 'e' || c == 'E');
 
-        if word.ends_with('.') || dot_count > 1 {
-            false
-        } else {
-            dot_count == 1
+        // 结尾不能是 .
+        if word.ends_with('.') {
+            self.errors.push(AnalyzerError {
+                start: self.offset,
+                end: self.guard,
+                message: String::from("floating-point numbers cannot end with '.'"),
+            });
+            return false;
         }
+
+        // 如果有科学计数法标记，则认为是浮点数
+        if has_e {
+            return true;
+        }
+
+        if dot_count == 0 {
+            return false;
+        }
+
+        if dot_count > 1 {
+            self.errors.push(AnalyzerError {
+                start: self.offset,
+                end: self.guard,
+                message: String::from("floating-point number contains multiple '.'"),
+            });
+            return false;
+        }
+
+        true
     }
 
     fn is_alpha(&self, c: char) -> bool {
@@ -728,40 +789,48 @@ impl Lexer {
 
         // 检查数字
         if self.is_number(self.peek_guard()) {
-            let word: String;
+            let mut word: String;
+
+            let mut may_be_float = false;
 
             // 处理 0 开头的特殊数字格式
             if self.peek_guard() == '0' {
                 if let Some(next_char) = self.peek_next() {
                     match next_char {
-                        'x' => {
+                        'x'|'X' => {
                             word = self.hex_number_advance();
+                            word = format!("0x{}", &word[2..]);
                         }
-                        'o' => {
+                        'o'|'O' => {
                             let num = self.oct_number_advance();
                             // let decimal = self.number_convert(&num, 8);
                             // word = decimal.to_string();
                             word = num;
+                            word = format!("0o{}", &word[2..]);
                         }
-                        'b' => {
+                        'b'|'B' => {
                             let num = self.bin_number_advance();
                             // let decimal = self.number_convert(&num, 2);
                             // word = decimal.to_string();
                             word = num;
+                            word = format!("0b{}", &word[2..]);
                         }
                         _ => {
                             word = self.number_advance();
+                            may_be_float = true;
                         }
                     }
                 } else {
                     word = self.number_advance();
+                    may_be_float = true;
                 }
             } else {
                 word = self.number_advance();
+                may_be_float = true;
             }
 
             // 判断数字类型
-            let token_type = if self.is_float(&word) {
+            let token_type = if may_be_float && self.is_float(&word) {
                 TokenType::FloatLiteral
             } else {
                 TokenType::IntLiteral
@@ -896,7 +965,7 @@ impl Lexer {
             '>' => {
                 if self.match_char('=') {
                     return TokenType::GreaterEqual;
-                } 
+                }
 
                 if self.peek_guard_optional() == Some('>') && self.peek_next() == Some('=') {
                     self.guard_advance();
@@ -998,7 +1067,7 @@ impl Lexer {
             }
 
             result.push(guard_char);
-            self.guard_advance(); 
+            self.guard_advance();
 
             // 结束判断
             if self.at_eof() {
@@ -1049,9 +1118,11 @@ impl Lexer {
                 | TokenType::U32
                 | TokenType::U64
                 | TokenType::String
-                | TokenType::Null
                 | TokenType::Void
+                | TokenType::Null
                 | TokenType::Not
+                | TokenType::Question
+                | TokenType::Label
         )
     }
 
@@ -1060,7 +1131,6 @@ impl Lexer {
         // 跳过开始的 0x
         self.guard_advance();
         self.guard_advance();
-
 
         while !self.at_eof() && self.is_hex_number(self.peek_guard()) {
             self.guard_advance();
@@ -1092,9 +1162,46 @@ impl Lexer {
     }
 
     fn number_advance(&mut self) -> String {
-        while !self.at_eof() && (self.is_number(self.peek_guard()) || self.peek_guard() == '.') {
+        // 处理整数部分
+        while !self.at_eof() && self.is_number(self.peek_guard()) {
             self.guard_advance();
         }
+
+        // 处理小数点部分
+        if !self.at_eof() && self.peek_guard() == '.' &&
+            self.peek_next().map_or(false, |c| self.is_number(c)) {
+            self.guard_advance(); // 跳过小数点
+
+            // 处理小数点后的数字
+            while !self.at_eof() && self.is_number(self.peek_guard()) {
+                self.guard_advance();
+            }
+        }
+
+        // 处理科学计数法部分
+        if !self.at_eof() && (self.peek_guard() == 'e' || self.peek_guard() == 'E') {
+            let has_exponent =
+                // 下一个字符是数字
+                self.peek_next().map_or(false, |c| self.is_number(c)) ||
+                    // 或者下一个字符是+/-，且再下一个字符是数字
+                    (self.peek_next().map_or(false, |c| c == '+' || c == '-') &&
+                        self.source.get(self.guard + 2).map_or(false, |&c| self.is_number(c)));
+
+            if has_exponent {
+                self.guard_advance(); // 跳过 'e' 或 'E'
+
+                // 处理可能的正负号
+                if !self.at_eof() && (self.peek_guard() == '+' || self.peek_guard() == '-') {
+                    self.guard_advance();
+                }
+
+                // 处理指数部分的数字
+                while !self.at_eof() && self.is_number(self.peek_guard()) {
+                    self.guard_advance();
+                }
+            }
+        }
+
         self.gen_word()
     }
 

@@ -6,11 +6,12 @@ use crate::analyzer::syntax::Syntax;
 use crate::analyzer::typesys::Typesys;
 use crate::analyzer::{analyze_imports, register_global_symbol};
 use crate::package::parse_package;
+use crate::utils::errors_push;
+use log::debug;
 use ropey::Rope;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
-use log::debug;
 
 pub const DEFAULT_NATURE_ROOT: &str = "/usr/local/nature";
 // pub const DEFAULT_NATURE_ROOT: &str = "/Users/weiwenhao/Code/nature";
@@ -103,7 +104,6 @@ impl Default for Module {
     }
 }
 
-
 #[derive(Debug, Clone)]
 pub struct QueueItem {
     pub path: String,
@@ -114,7 +114,7 @@ pub struct QueueItem {
 pub struct Project {
     pub nature_root: String,
     pub root: String,
-    pub module_db: Arc<Mutex<Vec<Module>>>,                             // key = uri, 记录所有已经编译的 module
+    pub module_db: Arc<Mutex<Vec<Module>>>,                 // key = uri, 记录所有已经编译的 module
     pub module_handled: Arc<Mutex<HashMap<String, usize>>>, // key = path, 记录所有已经编译的 module, usize 指向 module db
     // queue 中的每一个 module 都可以视为 main.n 来编译，主要是由于用户打开文件 A import B or C 产生的 B 和 C 注册到 queue 中进行处理
     pub queue: Arc<Mutex<Vec<QueueItem>>>,
@@ -154,12 +154,8 @@ impl Project {
 
         let package_path = Path::new(&project_root).join("package.toml").to_str().unwrap().to_string();
         let package_config = match parse_package(&package_path) {
-            Ok(package_config) => {
-                Arc::new(Mutex::new(Some(package_config)))
-            }
-            Err(_e) => {
-                Arc::new(Mutex::new(None))
-            }
+            Ok(package_config) => Arc::new(Mutex::new(Some(package_config))),
+            Err(_e) => Arc::new(Mutex::new(None)),
         };
 
         let mut project = Self {
@@ -239,12 +235,12 @@ impl Project {
 
             let module_db = self.module_db.lock().unwrap();
             let current_module = &module_db[current_index];
-            
+
             // 遍历所有引用当前模块的模块
             for &ref_index in &current_module.references {
                 let ref_module = &module_db[ref_index];
                 result.push(ref_module.path.clone());
-                
+
                 // 将引用模块加入工作列表，以便递归查找
                 worklist.push(ref_index);
             }
@@ -267,7 +263,7 @@ impl Project {
         worklist.push(main_import);
         handled.insert(main_path.to_string());
 
-        dbg!("{} handle work list", main_path);
+        debug!("{} handle work list", main_path);
         while let Some(import_stmt) = worklist.pop() {
             let module_handled = self.module_handled.lock().unwrap();
             let index_option = module_handled.get(&import_stmt.full_path).copied();
@@ -293,7 +289,6 @@ impl Project {
                 }
                 let content = content_option.unwrap();
 
-
                 // push to module_db get index lock
                 let mut module_handled = self.module_handled.lock().unwrap();
                 let mut module_db = self.module_db.lock().unwrap();
@@ -315,7 +310,6 @@ impl Project {
             let mut module_db = self.module_db.lock().unwrap();
             let m = &mut module_db[index];
 
-
             debug!("build, m.path {}, module_dir {}, project root {}", m.path, m.dir, self.root);
 
             // clean module symbol table
@@ -328,7 +322,7 @@ impl Project {
             m.analyzer_errors = lexer_errors; // 清空 error 从 analyzer 起重新计算
 
             // - parser
-            let (mut stmts, sem_token_db, syntax_errors) = Syntax::new(token_db, token_indexes).parser();
+            let (mut stmts, sem_token_db, syntax_errors) = Syntax::new(m.clone(), token_db, token_indexes).parser();
             m.sem_token_db = sem_token_db.clone();
             // m.stmts = stmts;
             m.analyzer_errors.extend(syntax_errors);
@@ -338,10 +332,9 @@ impl Project {
 
             // analyzer global ast to symbol table
             let mut symbol_table = self.symbol_table.lock().unwrap();
-            register_global_symbol(&m, &mut symbol_table, &stmts);
+            register_global_symbol(m, &mut symbol_table, &stmts);
             drop(symbol_table);
 
-            dbg!(&self.package_config);
             // analyzer imports to worklist
             let imports = analyze_imports(self.root.clone(), &self.package_config, m, &mut stmts);
             m.stmts = stmts;
@@ -352,14 +345,18 @@ impl Project {
             for import in imports {
                 // handle 重复进入表示 build module 发生了循环引用, 发送错误并跳过该 import 处理。
                 if handled.contains(&import.full_path) {
-                    m.analyzer_errors.push(AnalyzerError {
-                        start: import.start,
-                        end: import.end,
-                        message: format!("circular import"),
-                    });
+                    // TODO 暂时不做处理
+                    // errors_push(
+                    //     m,
+                    //     AnalyzerError {
+                    //         start: import.start,
+                    //         end: import.end,
+                    //         message: format!("circular import"),
+                    //     },
+                    // );
 
                     dbg!("circular import");
-                    continue;
+                    // continue;
                 }
 
                 filter_imports.push(import.clone());
@@ -372,7 +369,7 @@ impl Project {
             self.update_module_dep(index, filter_imports);
         }
 
-        dbg!("{} will semantic handle, module_indexes: {:?}", main_path, &module_indexes);
+        debug!("{} will semantic handle, module_indexes: {:?}", main_path, &module_indexes);
 
         for index in module_indexes.clone() {
             let mut module_db = self.module_db.lock().unwrap();

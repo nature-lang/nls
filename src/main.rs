@@ -7,7 +7,6 @@ use nls::project::Project;
 use nls::utils::offset_to_position;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::sync::{Arc, Mutex};
 use tower_lsp::jsonrpc::Result;
 use tower_lsp::lsp_types::notification::Notification;
 use tower_lsp::lsp_types::*;
@@ -500,7 +499,7 @@ impl LanguageServer for Backend {
 
         for param in params.changes {
             let file_path = param.uri.path();
-            let Some(mut project) = self.get_file_project(&file_path) else {
+            let Some(project) = self.get_file_project(&file_path) else {
                 unreachable!()
             };
 

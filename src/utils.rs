@@ -1,7 +1,9 @@
-use tower_lsp::lsp_types::Position;
+use crate::analyzer::common::AnalyzerError;
+use crate::project::Module;
 use ropey::Rope;
-use std::hash::{Hash, Hasher};
 use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
+use tower_lsp::lsp_types::Position;
 
 pub fn offset_to_position(offset: usize, rope: &Rope) -> Option<Position> {
     let line = rope.try_char_to_line(offset).ok()?;
@@ -16,7 +18,7 @@ pub fn position_to_offset(position: Position, rope: &Rope) -> Option<usize> {
     Some(slice.len_bytes())
 }
 
-pub fn format_global_ident(prefix: String, ident: String)->String {
+pub fn format_global_ident(prefix: String, ident: String) -> String {
     // 如果 prefix 为空，则直接返回 ident
     if prefix.is_empty() {
         return ident;
@@ -26,7 +28,7 @@ pub fn format_global_ident(prefix: String, ident: String)->String {
 }
 
 pub fn format_impl_ident(impl_ident: String, key: String) -> String {
-    format!("{impl_ident}_{key}")
+    format!("{impl_ident}.{key}")
 }
 
 pub fn format_generics_ident(ident: String, hash: u64) -> String {
@@ -46,4 +48,11 @@ pub fn align_up(n: u64, align: u64) -> u64 {
         return n;
     }
     (n + align - 1) & !(align - 1)
+}
+
+pub fn errors_push(m: &mut Module, e: AnalyzerError) {
+    // if m.index == 16 {
+    //     panic!("TODO analyzer error");
+    // }
+    m.analyzer_errors.push(e);
 }
