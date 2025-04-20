@@ -1163,6 +1163,8 @@ impl<'a> Typesys<'a> {
         &mut self,
         type_properties: &mut Vec<TypeStructProperty>,
         properties: &mut Vec<StructNewProperty>,
+        start: usize,
+        end: usize,
     ) -> Result<Vec<StructNewProperty>, AnalyzerError> {
         // 用于跟踪已经处理过的属性
         let mut exists = HashMap::new();
@@ -1218,8 +1220,8 @@ impl<'a> Typesys<'a> {
             // 检查是否是必须赋值的类型
             if Type::must_assign_value(&type_prop.type_.kind) {
                 return Err(AnalyzerError {
-                    start: type_prop.start,
-                    end: type_prop.end,
+                    start: start,
+                    end: end,
                     message: format!("struct filed '{}' must be assigned default value", type_prop.key),
                 });
             }
@@ -2086,7 +2088,7 @@ impl<'a> Typesys<'a> {
                 *type_ = self.reduction_type(type_.clone())?;
 
                 if let TypeKind::Struct(_, _, type_properties) = &mut type_.kind {
-                    *properties = self.infer_struct_properties(type_properties, properties)?;
+                    *properties = self.infer_struct_properties(type_properties, properties, expr.start, expr.end)?;
                 } else {
                     // check scala type or arr
                     if !Type::is_scala_type(&type_.kind) && !matches!(type_.kind, TypeKind::Arr(..)) {
@@ -2141,7 +2143,7 @@ impl<'a> Typesys<'a> {
                 *type_ = self.reduction_type(type_.clone())?;
 
                 if let TypeKind::Struct(_, _, type_properties) = &mut type_.kind {
-                    *properties = self.infer_struct_properties(type_properties, properties)?;
+                    *properties = self.infer_struct_properties(type_properties, properties, expr.start, expr.end)?;
                 } else {
                     return Err(AnalyzerError {
                         start: expr.start,

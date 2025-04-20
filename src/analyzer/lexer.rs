@@ -371,6 +371,7 @@ impl Token {
             TokenType::String
             | TokenType::Bool
             | TokenType::Int
+            | TokenType::Uint
             | TokenType::Float
             | TokenType::U8
             | TokenType::U16
