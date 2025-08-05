@@ -460,6 +460,28 @@ pub fn register_global_symbol(m: &mut Module, symbol_table: &mut SymbolTable, st
                     m.scope_id,
                 );
             }
+            AstNode::ConstDef(constdef_mutex) => {
+                let mut constdef = constdef_mutex.lock().unwrap();
+                constdef.ident = format_global_ident(m.ident.clone(), constdef.ident.clone());
+
+                match symbol_table.define_symbol_in_scope(
+                    constdef.ident.clone(),
+                    SymbolKind::Const(constdef_mutex.clone()),
+                    constdef.symbol_start,
+                    m.scope_id,
+                ) {
+                    Ok(symbol_id) => {
+                        constdef.symbol_id = symbol_id;
+                    }
+                    Err(e) => {
+                        errors_push(m, AnalyzerError {
+                            start: constdef.symbol_start,
+                            end: constdef.symbol_end,
+                            message: e,
+                        });
+                    }
+                }
+            }
             AstNode::Typedef(typedef_mutex) => {
                 let mut typedef = typedef_mutex.lock().unwrap();
                 typedef.ident = format_global_ident(m.ident.clone(), typedef.ident.clone());

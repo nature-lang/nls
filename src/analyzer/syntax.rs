@@ -742,24 +742,10 @@ impl<'a> Syntax {
         // [type;size]
         if self.consume(TokenType::LeftSquare) {
             let element_type = self.parser_type()?;
-            if self.consume(TokenType::StmtEof) {
-                let length_token = self.must(TokenType::IntLiteral)?.clone();
+            if self.consume(TokenType::StmtEof) { // ;
+                let length_expr = self.parser_expr()?;
                 self.must(TokenType::RightSquare)?;
-
-                let length = length_token
-                    .literal
-                    .parse::<u64>()
-                    .map_err(|_| SyntaxError(length_token.start, length_token.end, "array length must be a valid integer".to_string()))?;
-
-                if length == 0 {
-                    return Err(SyntaxError(
-                        length_token.start,
-                        length_token.end,
-                        "array length must be greater than 0".to_string(),
-                    ));
-                }
-
-                t.kind = TypeKind::Arr(length, Box::new(element_type));
+                t.kind = TypeKind::Arr(length_expr,0, Box::new(element_type));
                 t.end = self.prev().unwrap().end;
                 return Ok(t);
             }
@@ -1015,7 +1001,7 @@ impl<'a> Syntax {
     }
 
     fn parser_typedef_stmt(&mut self) -> Result<Box<Stmt>, SyntaxError> {
-        let mut stmt = self.stmt_new();
+        let mut stmt: Box<Stmt> = self.stmt_new();
 
         self.must(TokenType::Type)?;
 
@@ -2580,6 +2566,27 @@ impl<'a> Syntax {
         Ok(stmt)
     }
 
+    fn parser_constdef_stmt(&mut self) -> Result<Box<Stmt>, SyntaxError> {
+        let mut stmt: Box<Stmt> = self.stmt_new();
+
+        self.must(TokenType::Const)?;
+        let const_ident = self.must(TokenType::Ident)?.clone();
+        self.must(TokenType::Equal)?;
+        let right = self.parser_expr()?;
+
+        stmt.node = AstNode::ConstDef(Arc::new(Mutex::new(AstConstDef {
+            ident: const_ident.literal.clone(),
+            type_: Type::unknown(),
+            right,
+            processing: false,
+            symbol_start: const_ident.start,
+            symbol_end: const_ident.end,
+            symbol_id: 0,
+        })));
+
+        Ok(stmt)
+    }
+
     fn is_impl_fn(&self) -> bool {
         if self.is_basic_type() {
             return true;
@@ -2963,6 +2970,8 @@ impl<'a> Syntax {
             self.parser_import_stmt()?
         } else if self.is(TokenType::Type) {
             self.parser_typedef_stmt()?
+        } else if self.is(TokenType::Const) {
+            self.parser_constdef_stmt()?
         } else {
             return Err(SyntaxError(
                 self.peek().start,
@@ -3029,6 +3038,8 @@ impl<'a> Syntax {
             self.parser_import_stmt()?
         } else if self.is(TokenType::Type) {
             self.parser_typedef_stmt()?
+        } else if self.is(TokenType::Const) {
+            self.parser_constdef_stmt()?
         } else if self.is(TokenType::Continue) {
             self.parser_continue_stmt()?
         } else if self.is(TokenType::Break) {

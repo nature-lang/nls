@@ -2,7 +2,7 @@ use log::debug;
 
 use crate::utils::format_global_ident;
 
-use super::common::{AstFnDef, TypedefStmt, VarDeclExpr};
+use super::common::{AstFnDef, TypedefStmt, VarDeclExpr, AstConstDef};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
@@ -50,6 +50,7 @@ pub enum SymbolKind {
     Var(Arc<Mutex<VarDeclExpr>>), // 变量原始定义
     Fn(Arc<Mutex<AstFnDef>>),
     Type(Arc<Mutex<TypedefStmt>>),
+    Const(Arc<Mutex<AstConstDef>>),
 }
 
 // symbol table 可以同时处理多个文件的 scope, 存在一个 global scope 管理所有的全局 scope, 符号注册到 global scope 时，define_ident 需要携带 package_name 保证符号的唯一性

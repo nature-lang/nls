@@ -211,7 +211,7 @@ impl Type {
             TypeKind::Chan(element_type) => {
                 format!("chan<{}>", element_type)
             }
-            TypeKind::Arr(length, element_type) => {
+            TypeKind::Arr(_, length, element_type) => {
                 format!("[{};{}]", element_type, length)
             }
             TypeKind::Map(key_type, value_type) => {
@@ -301,8 +301,8 @@ impl Type {
         Self::is_number(kind) || matches!(kind, TypeKind::Bool)
     }
 
-    pub fn is_scala_type(kind : &TypeKind) -> bool {
-        Self::is_number(kind) || matches!(kind, TypeKind::Bool)    
+    pub fn is_scala_type(kind: &TypeKind) -> bool {
+        Self::is_number(kind) || matches!(kind, TypeKind::Bool)
     }
 
     pub fn is_number(kind: &TypeKind) -> bool {
@@ -376,7 +376,7 @@ impl Type {
     pub fn sizeof(kind: &TypeKind) -> u64 {
         match &kind {
             TypeKind::Struct(..) => Self::type_struct_sizeof(kind),
-            TypeKind::Arr(len, element_type) => len * Self::sizeof(&element_type.kind),
+            TypeKind::Arr(_, len, element_type) => len * Self::sizeof(&element_type.kind),
             _ => kind.sizeof(),
         }
     }
@@ -384,7 +384,7 @@ impl Type {
     pub fn alignof(kind: &TypeKind) -> u8 {
         match &kind {
             TypeKind::Struct(_, align, _) => *align as u8,
-            TypeKind::Arr(_, element_type) => Self::alignof(&element_type.kind),
+            TypeKind::Arr(_, _, element_type) => Self::alignof(&element_type.kind),
             _ => kind.sizeof() as u8,
         }
     }
@@ -448,7 +448,7 @@ impl Type {
                 format!("{}_{}", self.kind.to_string(), element_hash).hash(&mut hasher);
                 hasher.finish()
             }
-            TypeKind::Arr(length, element_type) => {
+            TypeKind::Arr(_, length, element_type) => {
                 let element_hash = element_type.hash();
                 let mut hasher = DefaultHasher::new();
                 format!("{}_{length}_{}", self.kind.to_string(), element_hash).hash(&mut hasher);
@@ -642,7 +642,7 @@ pub enum TypeKind {
     Vec(Box<Type>), // element type
 
     #[strum(serialize = "arr")]
-    Arr(u64, Box<Type>), // (length, element_type)
+    Arr(Box<Expr>, u64, Box<Type>), // (length_expr, length, element_type)
 
     #[strum(serialize = "map")]
     Map(Box<Type>, Box<Type>), // (key_type, value_type)
@@ -894,6 +894,7 @@ pub enum AstNode {
     VarDef(Arc<Mutex<VarDeclExpr>>, Box<Expr>), // (var_decl, right)
     Typedef(Arc<Mutex<TypedefStmt>>),
     FnDef(Arc<Mutex<AstFnDef>>),
+    ConstDef(Arc<Mutex<AstConstDef>>),
 }
 
 impl AstNode {
@@ -964,6 +965,17 @@ pub struct VarDeclExpr {
     pub type_: Type,
     pub be_capture: bool,
     pub heap_ident: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct AstConstDef {
+    pub ident: String,
+    pub type_: Type,
+    pub right: Box<Expr>,
+    pub processing: bool,
+    pub symbol_id: NodeId,
+    pub symbol_start: usize,
+    pub symbol_end: usize,
 }
 
 #[derive(Debug, Clone)]

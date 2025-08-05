@@ -184,6 +184,197 @@ impl<'a> Semantic<'a> {
         return false;
     }
 
+    // 常量折叠 - 在编译时计算常量表达式的值
+    fn constant_folding(&mut self, expr: &mut Box<Expr>) {
+        match &mut expr.node {
+            AstNode::Binary(op, left, right) => {
+                // 递归处理左右操作数
+                self.constant_folding(left);
+                self.constant_folding(right);
+
+                // 检查是否都是字面量
+                if let (AstNode::Literal(left_kind, left_literal), AstNode::Literal(right_kind, right_literal)) = (&left.node, &right.node) {
+                    // 处理字符串连接
+                    if matches!(left_kind, TypeKind::String) && matches!(right_kind, TypeKind::String) && *op == ExprOp::Add {
+                        let result_str = format!("{}{}", left_literal, right_literal);
+                        expr.node = AstNode::Literal(TypeKind::String, result_str);
+                        return;
+                    }
+
+                    // 处理数字运算
+                    if Type::is_number(&left_kind) && Type::is_number(&right_kind) {
+                        let has_float = Type::is_float(&left_kind) || Type::is_float(&right_kind);
+                        if has_float {
+                            // 浮点数运算
+                            if let (Ok(left_val), Ok(right_val)) = (left_literal.parse::<f64>(), right_literal.parse::<f64>()) {
+                                let result = match op {
+                                    ExprOp::Add => Some(left_val + right_val),
+                                    ExprOp::Sub => Some(left_val - right_val),
+                                    ExprOp::Mul => Some(left_val * right_val),
+                                    ExprOp::Div => {
+                                        if right_val != 0.0 {
+                                            Some(left_val / right_val)
+                                        } else {
+                                            None // 除零错误，不进行折叠
+                                        }
+                                    }
+                                    ExprOp::Rem => {
+                                        if right_val != 0.0 {
+                                            Some(left_val % right_val)
+                                        } else {
+                                            None
+                                        }
+                                    }
+                                    _ => None, // 浮点数不支持位运算
+                                };
+
+                                if let Some(result_float) = result {
+                                    expr.node = AstNode::Literal(TypeKind::Float, format!("{}", result_float));
+                                }
+                            }
+                        } else {
+                            // 整数运算
+                            if let (Ok(left_val), Ok(right_val)) = (left_literal.parse::<i64>(), right_literal.parse::<i64>()) {
+                                let result = match op {
+                                    ExprOp::Add => Some(left_val.wrapping_add(right_val)),
+                                    ExprOp::Sub => Some(left_val.wrapping_sub(right_val)),
+                                    ExprOp::Mul => Some(left_val.wrapping_mul(right_val)),
+                                    ExprOp::Div => {
+                                        if right_val != 0 {
+                                            Some(left_val / right_val)
+                                        } else {
+                                            None // 除零错误
+                                        }
+                                    }
+                                    ExprOp::Rem => {
+                                        if right_val != 0 {
+                                            Some(left_val % right_val)
+                                        } else {
+                                            None
+                                        }
+                                    }
+                                    ExprOp::And => Some(left_val & right_val),
+                                    ExprOp::Or => Some(left_val | right_val),
+                                    ExprOp::Xor => Some(left_val ^ right_val),
+                                    ExprOp::Lshift => Some(left_val << right_val),
+                                    ExprOp::Rshift => Some(left_val >> right_val),
+                                    _ => None,
+                                };
+
+                                if let Some(result_val) = result {
+                                    expr.node = AstNode::Literal(TypeKind::Int, result_val.to_string());
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            AstNode::Unary(op, operand) => {
+                // 递归处理操作数
+                self.constant_folding(operand);
+
+                if let AstNode::Literal(operand_kind, operand_value) = &operand.node {
+                    if Type::is_number(operand_kind) {
+                        if Type::is_float(operand_kind) {
+                            // 浮点数一元运算
+                            if let Ok(operand_val) = operand_value.parse::<f64>() {
+                                let result = match op {
+                                    ExprOp::Neg => Some(-operand_val),
+                                    _ => None, // 浮点数不支持位运算
+                                };
+
+                                if let Some(result_val) = result {
+                                    expr.node = AstNode::Literal(TypeKind::Float64, result_val.to_string());
+                                }
+                            }
+                        } else {
+                            // 整数一元运算
+                            if let Ok(operand_val) = operand_value.parse::<i64>() {
+                                let result = match op {
+                                    ExprOp::Neg => Some(-operand_val),
+                                    ExprOp::Bnot => Some(!operand_val),
+                                    _ => None,
+                                };
+
+                                if let Some(result_val) = result {
+                                    expr.node = AstNode::Literal(TypeKind::Int64, result_val.to_string());
+                                }
+                            }
+                        }
+                    } else if matches!(operand_kind, TypeKind::Bool) && *op == ExprOp::Not {
+                        // 布尔值取反
+                        let operand_val = operand_value == "true";
+                        let result = !operand_val;
+
+                        expr.node = AstNode::Literal(TypeKind::Bool, if result { "true".to_string() } else { "false".to_string() });
+                    }
+                }
+            }
+
+            _ => {
+                // 其他表达式类型不需要特殊处理
+            }
+        }
+    }
+
+    fn constant_propagation(&mut self, expr: &mut Box<Expr>) {
+        // 检查表达式是否为标识符
+        let AstNode::Ident(_, symbol_id) = &expr.node else {
+            return;
+        };
+
+        // 从符号表中获取符号
+        let Some(symbol) = self.symbol_table.get_symbol(*symbol_id) else {
+            return;
+        };
+
+        // 检查符号是否为常量
+        let SymbolKind::Const(const_def_mutex) = &symbol.kind.clone() else {
+            return;
+        };
+
+        let mut const_def = const_def_mutex.lock().unwrap();
+
+        // 检查是否存在循环初始化
+        if const_def.processing {
+            errors_push(
+                self.module,
+                AnalyzerError {
+                    start: expr.start,
+                    end: expr.end,
+                    message: "const initialization cycle detected".to_string(),
+                },
+            );
+            return;
+        }
+
+        // 设置处理标志，防止循环引用
+        const_def.processing = true;
+
+        // 递归分析常量的右值表达式
+        self.analyze_expr(&mut const_def.right);
+
+        // 重置处理标志
+        const_def.processing = false;
+
+        // 检查右值是否为字面量
+        let AstNode::Literal(literal_kind, literal_value) = &const_def.right.node else {
+            errors_push(
+                self.module,
+                AnalyzerError {
+                    start: expr.start,
+                    end: expr.end,
+                    message: "const cannot be initialized with non-literal value".to_string(),
+                },
+            );
+            return;
+        };
+
+        // 创建新的字面量表达式替换原标识符表达式
+        expr.node = AstNode::Literal(literal_kind.clone(), literal_value.clone());
+    }
+
     fn analyze_type(&mut self, t: &mut Type) {
         if Type::ident_is_def_or_alias(t) || t.ident_kind == TypeIdentKind::Interface {
             // 处理导入的全局模式别名，例如  package.foo_t
@@ -247,7 +438,7 @@ impl<'a> Semantic<'a> {
 
             if let Some(symbol) = self.symbol_table.get_symbol(t.symbol_id) {
                 let SymbolKind::Type(typedef_mutex) = &symbol.kind else { unreachable!() };
-                let (is_alias, is_interface) ={
+                let (is_alias, is_interface) = {
                     let typedef_stmt = typedef_mutex.lock().unwrap();
                     (typedef_stmt.is_alias, typedef_stmt.is_interface)
                 };
@@ -309,7 +500,44 @@ impl<'a> Semantic<'a> {
             TypeKind::Chan(element_type) => {
                 self.analyze_type(element_type);
             }
-            TypeKind::Arr(_, element_type) => {
+            TypeKind::Arr(length_expr, length, element_type) => {
+                self.analyze_expr(length_expr);
+                if let AstNode::Literal(literal_kind, literal_value) = &mut length_expr.node {
+                    if Type::is_integer(literal_kind) {
+                        if let Ok(parsed_length) = literal_value.parse::<i64>() {
+                            *length = parsed_length as u64;
+                        } else {
+                            errors_push(
+                                self.module,
+                                AnalyzerError {
+                                    start: t.start,
+                                    end: t.end,
+                                    message: "array length must be constans or integer literal".to_string(),
+                                },
+                            );
+                        }
+                    } else {
+                        errors_push(
+                            self.module,
+                            AnalyzerError {
+                                start: t.start,
+                                end: t.end,
+                                message: "array length must be constans or integer literal".to_string(),
+                            },
+                        );
+                    }
+                } else {
+                    // error push
+                    errors_push(
+                        self.module,
+                        AnalyzerError {
+                            start: t.start,
+                            end: t.end,
+                            message: "array length must be constans or integer literal".to_string(),
+                        },
+                    );
+                }
+
                 self.analyze_type(element_type);
             }
             TypeKind::Tuple(elements, _align) => {
@@ -401,7 +629,6 @@ impl<'a> Semantic<'a> {
                             }
                         }
 
-
                         fndef.symbol_name = format_impl_ident(fndef.impl_type.ident.clone(), symbol_name);
 
                         // register to global symbol table
@@ -430,7 +657,12 @@ impl<'a> Semantic<'a> {
                         }
 
                         // register to global symbol
-                        let _ = self.symbol_table.define_global_symbol(fndef.symbol_name.clone(), SymbolKind::Fn(fndef_mutex.clone()), fndef.symbol_start, self.module.scope_id);
+                        let _ = self.symbol_table.define_global_symbol(
+                            fndef.symbol_name.clone(),
+                            SymbolKind::Fn(fndef_mutex.clone()),
+                            fndef.symbol_start,
+                            self.module.scope_id,
+                        );
                     }
 
                     global_fn_stmt_list.push(fndef_mutex.clone());
@@ -488,18 +720,32 @@ impl<'a> Semantic<'a> {
                             }
                         }
 
-
                         // analyzer type expr, symbol table 中存储的是 type_expr 的 arc clone, 所以这里的修改会同步到 symbol table 中
                         // 递归依赖处理
                         typedef.type_expr.clone()
                     };
-
 
                     self.analyze_type(&mut type_expr);
 
                     {
                         let mut typedef = type_alias_mutex.lock().unwrap();
                         typedef.type_expr = type_expr;
+                    }
+                }
+
+                AstNode::ConstDef(const_mutex) => {
+                    let mut constdef = const_mutex.lock().unwrap();
+                    self.analyze_expr(&mut constdef.right);
+
+                    if !matches!(constdef.right.node, AstNode::Literal(..)) {
+                        errors_push(
+                            self.module,
+                            AnalyzerError {
+                                start: constdef.symbol_start,
+                                end: constdef.symbol_end,
+                                message: format!("const cannot be initialized"),
+                            },
+                        );
                     }
                 }
                 _ => {
@@ -928,9 +1174,13 @@ impl<'a> Semantic<'a> {
             AstNode::Binary(_op, left, right) => {
                 self.analyze_expr(left);
                 self.analyze_expr(right);
+
+                self.constant_folding(expr);
             }
             AstNode::Unary(_op, expr) => {
                 self.analyze_expr(expr);
+
+                self.constant_folding(expr);
             }
             AstNode::Catch(try_expr, catch_err, catch_body) => {
                 self.analyze_expr(try_expr);
@@ -1013,7 +1263,13 @@ impl<'a> Semantic<'a> {
                 self.analyze_expr(left);
                 self.analyze_expr(key);
             }
-            AstNode::SelectExpr(..) => self.rewrite_select_expr(expr),
+            AstNode::SelectExpr(..) => {
+                self.rewrite_select_expr(expr);
+
+                if matches!(expr.node, AstNode::Ident(..)) {
+                    self.constant_propagation(expr);
+                }
+            }
             AstNode::Ident(ident, symbol_id) => {
                 if !self.analyze_ident(ident, symbol_id) {
                     errors_push(
@@ -1026,6 +1282,9 @@ impl<'a> Semantic<'a> {
                     );
                     expr.err = true;
                 }
+
+                // propagation
+                self.constant_propagation(expr);
             }
             AstNode::Match(subject, cases) => self.analyze_match(subject, cases),
             AstNode::Call(call) => self.analyze_call(call),
@@ -1296,6 +1555,34 @@ impl<'a> Semantic<'a> {
         self.exit_scope();
     }
 
+    // local constdef
+    fn analyze_constdef(&mut self, constdef_mutex: Arc<Mutex<AstConstDef>>) {
+        let mut constdef = constdef_mutex.lock().unwrap();
+
+        self.analyze_expr(&mut constdef.right);
+
+        // 添加 local constdef 到符号表
+        match self.symbol_table.define_symbol_in_scope(
+            constdef.ident.clone(),
+            SymbolKind::Const(constdef_mutex.clone()),
+            constdef.symbol_start,
+            self.current_scope_id,
+        ) {
+            Ok(symbol_id) => {
+                constdef.symbol_id = symbol_id;
+            }
+            Err(e) => {
+                errors_push(
+                    self.module,
+                    AnalyzerError {
+                        start: constdef.symbol_start,
+                        end: constdef.symbol_end,
+                        message: e,
+                    },
+                );
+            }
+        }
+    }
     pub fn analyze_stmt(&mut self, stmt: &mut Box<Stmt>) {
         match &mut stmt.node {
             AstNode::Fake(expr) => {
@@ -1307,6 +1594,9 @@ impl<'a> Semantic<'a> {
             AstNode::VarDef(var_decl_mutex, expr) => {
                 self.analyze_expr(expr);
                 self.analyze_var_decl(var_decl_mutex);
+            }
+            AstNode::ConstDef(constdef_mutex) => {
+                self.analyze_constdef(constdef_mutex.clone());
             }
             AstNode::VarTupleDestr(elements, expr) => {
                 self.analyze_expr(expr);

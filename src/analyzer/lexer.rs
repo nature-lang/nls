@@ -273,6 +273,10 @@ pub enum TokenType {
     ElseIf,
     #[strum(serialize = "var")]
     Var,
+
+    #[strum(serialize = "const")]
+    Const,
+
     #[strum(serialize = "let")]
     Let,
     #[strum(serialize = "is")]
@@ -403,6 +407,7 @@ impl Token {
             | TokenType::Return
             | TokenType::Let
             | TokenType::Var
+            | TokenType::Const
             | TokenType::Fn
             | TokenType::Import
             | TokenType::True
@@ -566,6 +571,7 @@ impl Lexer {
             "type" => TokenType::Type,
             "uint" => TokenType::Uint,
             "var" => TokenType::Var,
+            "const" => TokenType::Const,
             "vec" => TokenType::Vec,
             "void" => TokenType::Void,
             "interface" => TokenType::Interface,

@@ -591,7 +591,7 @@ impl<'a> Typesys<'a> {
             }
 
             // 处理数组类型
-            TypeKind::Arr(_, element_type) => {
+            TypeKind::Arr(_, _, element_type) => {
                 *element_type = Box::new(self.reduction_type(*element_type.clone())?);
             }
 
@@ -1489,12 +1489,12 @@ impl<'a> Typesys<'a> {
         let AstNode::VecNew(elements, _, _) = &mut expr.node else { unreachable!() };
 
         // 如果目标类型是数组，则将 VecNew 重写为 ArrayNew
-        if let TypeKind::Arr(length, element_type) = &infer_target_type.kind {
+        if let TypeKind::Arr(_, length, element_type) = &infer_target_type.kind {
             // 重写表达式节点为 ArrayNew
             expr.node = AstNode::ArrayNew(elements.clone());
             let AstNode::ArrayNew(elements) = &mut expr.node else { unreachable!() };
 
-            let mut result = Type::undo_new(TypeKind::Arr(length.clone(), element_type.clone()));
+            let mut result = Type::undo_new(TypeKind::Arr(Box::new(Expr::default()), length.clone(), element_type.clone()));
             result.ident = infer_target_type.ident.clone();
             result.ident_kind = infer_target_type.ident_kind.clone();
             result.args = infer_target_type.args.clone();
@@ -1716,7 +1716,7 @@ impl<'a> Typesys<'a> {
         };
 
         // 如果目标类型是数组，将表达式重写为数组重复初始化
-        if let TypeKind::Arr(_, element_type) = &infer_target_type.kind {
+        if let TypeKind::Arr(_, _, element_type) = &infer_target_type.kind {
             // 重写为数组重复初始化节点
             expr.node = AstNode::ArrRepeatNew(default_element.clone(), length_expr.clone());
 
@@ -1757,7 +1757,7 @@ impl<'a> Typesys<'a> {
                 });
             }
 
-            let result = Type::undo_new(TypeKind::Arr(length as u64, element_type.clone()));
+            let result = Type::undo_new(TypeKind::Arr(Box::new(Expr::default()), length as u64, element_type.clone()));
 
             return self.reduction_type(result);
         }
@@ -1820,7 +1820,7 @@ impl<'a> Typesys<'a> {
         }
 
         // 处理 Array 类型访问
-        if let TypeKind::Arr(_, element_type) = &left_type.kind {
+        if let TypeKind::Arr(_, _, element_type) = &left_type.kind {
             // key 必须是整数类型
             self.infer_right_expr(key, Type::integer_t_new())?;
 
@@ -3764,7 +3764,7 @@ impl<'a> Typesys<'a> {
 
             (TypeKind::Vec(left_element), TypeKind::Vec(right_element)) => self.type_compare_with_generics(left_element, right_element, generics_param_table),
 
-            (TypeKind::Arr(left_len, left_element), TypeKind::Arr(right_len, right_element)) => {
+            (TypeKind::Arr(_, left_len, left_element), TypeKind::Arr(_, right_len, right_element)) => {
                 left_len == right_len && self.type_compare_with_generics(left_element, right_element, generics_param_table)
             }
 
