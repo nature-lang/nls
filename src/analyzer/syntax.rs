@@ -2840,7 +2840,7 @@ impl<'a> Syntax {
             fndef.return_type.end = self.peek().end;
         }
 
-        if self.consume(TokenType::Not) {
+        if self.consume(TokenType::Not) || fndef.fn_name == "main" {
             fndef.is_errable = true;
         }
 

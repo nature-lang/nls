@@ -1,6 +1,6 @@
 use dashmap::DashMap;
 use log::debug;
-use nls::analyzer::lexer::LEGEND_TYPE;
+use nls::analyzer::lexer::{TokenType, LEGEND_TYPE};
 use nls::analyzer::module_unique_ident;
 use nls::package::parse_package;
 use nls::project::Project;
@@ -271,19 +271,35 @@ impl LanguageServer for Backend {
             // im_complete_tokens.sort_by(|a, b| a.start.cmp(&b.start));
 
             let mut pre_line = 0;
+            let mut pre_line_start = 0;
             let mut pre_start = 0;
             let semantic_tokens: Vec<SemanticToken> = im_complete_tokens
                 .iter()
                 .filter_map(|token| {
-                    // dbg!(token.clone(), pre_line, pre_start);
-
                     let line = rope.try_char_to_line(token.start).ok()? as u32;
-                    let first = rope.try_line_to_char(line as usize).ok()? as u32;
-                    let start = token.start as u32 - first;
-                    let delta_line = line - pre_line;
-                    let delta_start = if delta_line == 0 { start - pre_start } else { start };
+                    let end_line = rope.try_char_to_line(token.end).ok()? as u32;
+                    let line_first = rope.try_line_to_char(line as usize).ok()? as u32;
+                    let line_start = token.start as u32 - line_first;
 
-                    // dbg!(line, first, start, delta_line, delta_start, "--------------------------------");
+                    // dbg!(
+                    //     "--------------",
+                    //     token.clone(),
+                    //     line,
+                    //     end_line,
+                    //     pre_line,
+                    //     pre_line_start,
+                    //     line_start,
+                    //     line_start < pre_line_start,
+                    //     "-------------"
+                    // );
+
+                    if token.start < pre_start && token.token_type == TokenType::StringLiteral {
+                        // 多行字符串跳过
+                        return None;
+                    }
+
+                    let delta_line = line - pre_line;
+                    let delta_start = if delta_line == 0 { line_start - pre_line_start } else { line_start };
 
                     let ret = Some(SemanticToken {
                         delta_line,
@@ -293,7 +309,8 @@ impl LanguageServer for Backend {
                         token_modifiers_bitset: 0,
                     });
                     pre_line = line;
-                    pre_start = start;
+                    pre_line_start = line_start;
+                    pre_start = token.start;
                     ret
                 })
                 .collect::<Vec<_>>();
@@ -499,9 +516,7 @@ impl LanguageServer for Backend {
 
         for param in params.changes {
             let file_path = param.uri.path();
-            let Some(project) = self.get_file_project(&file_path) else {
-                unreachable!()
-            };
+            let Some(project) = self.get_file_project(&file_path) else { unreachable!() };
 
             if !file_path.ends_with("package.toml") {
                 panic!("unexpected package file '{}'", file_path);
@@ -565,15 +580,15 @@ impl Backend {
     fn get_file_project(&self, file_path: &str) -> Option<Project> {
         // 遍历所有项目，找到最匹配（路径最长）的项目
         let mut best_match: Option<(usize, Project)> = None;
-        
+
         for entry in self.projects.iter() {
             let workspace_uri = entry.key();
-            
+
             // 检查文件是否属于这个项目
             if file_path.starts_with(workspace_uri) {
                 // 如果文件属于这个项目，检查这是否是最佳匹配（路径最长）
                 let uri_len = workspace_uri.len();
-                
+
                 if let Some((best_len, _)) = &best_match {
                     if uri_len > *best_len {
                         // 找到更长的匹配，更新最佳匹配
@@ -585,7 +600,7 @@ impl Backend {
                 }
             }
         }
-        
+
         // 返回最佳匹配的项目
         best_match.map(|(_, project)| project)
     }

@@ -304,7 +304,6 @@ pub enum TokenType {
     #[strum(serialize = ";")]
     StmtEof,
     // #[strum(serialize = "\0")]
-
     #[strum(serialize = "line_comment")]
     LineComment,
 
@@ -804,18 +803,18 @@ impl Lexer {
             if self.peek_guard() == '0' {
                 if let Some(next_char) = self.peek_next() {
                     match next_char {
-                        'x'|'X' => {
+                        'x' | 'X' => {
                             word = self.hex_number_advance();
                             word = format!("0x{}", &word[2..]);
                         }
-                        'o'|'O' => {
+                        'o' | 'O' => {
                             let num = self.oct_number_advance();
                             // let decimal = self.number_convert(&num, 8);
                             // word = decimal.to_string();
                             word = num;
                             word = format!("0o{}", &word[2..]);
                         }
-                        'b'|'B' => {
+                        'b' | 'B' => {
                             let num = self.bin_number_advance();
                             // let decimal = self.number_convert(&num, 2);
                             // word = decimal.to_string();
@@ -1016,10 +1015,15 @@ impl Lexer {
     }
 
     fn string_advance(&mut self, close_char: char) -> String {
-        // 跳过开始的 "
-        self.guard_advance();
+        // 添加这两个变量定义（参考块注释的处理方式）
+        let mut line_start = self.guard;
+        let mut current_line = self.line;
 
+        // 跳过开始的 " ' `
+        self.guard_advance();
         let mut result = String::new();
+
+        let is_raw_string = close_char == '`';
 
         // 结束判断
         if self.at_eof() {
@@ -1037,16 +1041,27 @@ impl Lexer {
             let mut guard_char = self.peek_guard(); // utf8 char
 
             if guard_char == '\n' {
-                self.errors.push(AnalyzerError {
-                    start: self.offset,
-                    end: self.guard,
-                    message: String::from("string not terminated"),
-                });
-                return result; // 返回已经解析的字符串
+                if is_raw_string {
+                    // 为当前行生成字符串token
+                    let line_content: String = self.source[line_start..self.guard].iter().collect();
+
+                    self.token_db
+                        .push(Token::new(TokenType::StringLiteral, line_content, line_start, self.guard, current_line));
+
+                    line_start = self.guard + 1; // 跳过 /n
+                    current_line = self.line + 1; // 跳过 /n
+                } else {
+                    self.errors.push(AnalyzerError {
+                        start: self.offset,
+                        end: self.guard,
+                        message: String::from("string not terminated"),
+                    });
+                    return result; // 返回已经解析的字符串
+                }
             }
 
             // 处理转义字符
-            if guard_char == escape_char {
+            if guard_char == escape_char && !is_raw_string {
                 self.guard_advance();
 
                 guard_char = self.peek_guard();
@@ -1087,9 +1102,17 @@ impl Lexer {
             }
         }
 
+        // 处理最后一行（如果是原始字符串）
+        if is_raw_string && line_start < self.guard {
+            let line_content: String = self.source[line_start..self.guard].iter().collect();
+            self.token_db
+                .push(Token::new(TokenType::StringLiteral, line_content, line_start, self.guard, current_line));
+        }
+
         // must close char, 跳过结束引号，但不计入 token 长度
         self.guard_advance();
 
+        dbg!(&result);
         result
     }
 
@@ -1175,8 +1198,7 @@ impl Lexer {
         }
 
         // 处理小数点部分
-        if !self.at_eof() && self.peek_guard() == '.' &&
-            self.peek_next().map_or(false, |c| self.is_number(c)) {
+        if !self.at_eof() && self.peek_guard() == '.' && self.peek_next().map_or(false, |c| self.is_number(c)) {
             self.guard_advance(); // 跳过小数点
 
             // 处理小数点后的数字
