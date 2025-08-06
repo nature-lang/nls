@@ -524,8 +524,12 @@ impl LanguageServer for Backend {
 
             match parse_package(&file_path) {
                 Ok(package_conf) => {
-                    let mut package_option = project.package_config.lock().unwrap();
-                    *package_option = Some(package_conf);
+                    {
+                        let mut package_option = project.package_config.lock().unwrap();
+                        *package_option = Some(package_conf);
+                    }
+
+                    self.client.publish_diagnostics(param.uri.clone(), vec![], None).await;
                 }
                 Err(e) => {
                     // read file content
