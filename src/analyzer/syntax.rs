@@ -742,10 +742,11 @@ impl<'a> Syntax {
         // [type;size]
         if self.consume(TokenType::LeftSquare) {
             let element_type = self.parser_type()?;
-            if self.consume(TokenType::StmtEof) { // ;
+            if self.consume(TokenType::StmtEof) {
+                // ;
                 let length_expr = self.parser_expr()?;
                 self.must(TokenType::RightSquare)?;
-                t.kind = TypeKind::Arr(length_expr,0, Box::new(element_type));
+                t.kind = TypeKind::Arr(length_expr, 0, Box::new(element_type));
                 t.end = self.prev().unwrap().end;
                 return Ok(t);
             }
@@ -3517,7 +3518,7 @@ impl<'a> Syntax {
             origin_call: if let AstNode::Call(call) = &call_expr.node {
                 Box::new(call.clone())
             } else {
-                panic!("go expr must be call")
+                return Err(SyntaxError(call_expr.start, call_expr.end, "go expr must be call".to_string()));
             },
             closure_fn: Arc::new(Mutex::new(self.coroutine_fn_closure(&call_expr))),
             closure_fn_void: Arc::new(Mutex::new(self.coroutine_fn_void_closure(&call_expr))),
@@ -3533,11 +3534,11 @@ impl<'a> Syntax {
         self.must(TokenType::LeftParen)?;
 
         let call_expr = self.parser_expr()?;
-        let mut r#async = MacroAsyncExpr {
+        let mut async_expr = MacroAsyncExpr {
             origin_call: if let AstNode::Call(call) = &call_expr.node {
                 Box::new(call.clone())
             } else {
-                panic!("async expr must be call")
+                return Err(SyntaxError(call_expr.start, call_expr.end, "macro async expr must be call".to_string()));
             },
             closure_fn: Arc::new(Mutex::new(self.coroutine_fn_closure(&call_expr))),
             closure_fn_void: Arc::new(Mutex::new(self.coroutine_fn_void_closure(&call_expr))),
@@ -3546,11 +3547,11 @@ impl<'a> Syntax {
         };
 
         if self.consume(TokenType::Comma) {
-            r#async.flag_expr = Some(self.parser_expr()?);
+            async_expr.flag_expr = Some(self.parser_expr()?);
         }
         self.must(TokenType::RightParen)?;
 
-        expr.node = AstNode::MacroAsync(r#async);
+        expr.node = AstNode::MacroAsync(async_expr);
         expr.end = self.prev().unwrap().end;
         Ok(expr)
     }
