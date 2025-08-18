@@ -2,6 +2,7 @@
 
 This is the LSP (Language Server Protocol) server implementation for the [nature](https://github.com/nature-lang/nature) programming language, which includes both the server (nls) and VSCode client components.
 
+> The current repository is archived, the code is moved to the main nature repository, and the related PRs and issues are done directly in the main repository [https://github.com/nature-lang/nature](https://github.com/nature-lang/nature)
 
 ## Features
 
